@@ -1,6 +1,6 @@
 # Launchpad — Rockit Standard Library
 
-The standard library for the [Rockit](https://github.com/rockit-engine) programming language. 15 modules covering core utilities, I/O, networking, encoding, testing, and more.
+The standard library for the [Rockit](https://github.com/dark-matter-tech) programming language. 15 modules covering core utilities, I/O, networking, encoding, testing, and more.
 
 ## Usage
 
@@ -38,7 +38,7 @@ import rockit.test.probe
 The standard library ships with Rockit. When building the compiler from source, launchpad is included as a git submodule at `RockitCompiler/Stage1/stdlib`.
 
 ```bash
-git clone --recurse-submodules https://github.com/rockit-engine/moon.git
+git clone --recurse-submodules https://github.com/dark-matter-tech/moon.git
 ```
 
 ## Structure
@@ -70,7 +70,7 @@ rockit/
 
 ## Contributing
 
-Contributions are welcome. Please open an issue or pull request on [GitHub](https://github.com/rockit-engine/launchpad).
+Contributions are welcome. Please open an issue or pull request on [GitHub](https://github.com/dark-matter-tech/launchpad).
 
 ## License
 
