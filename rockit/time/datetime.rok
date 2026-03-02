@@ -1,6 +1,19 @@
 // rockit.time.datetime — Date and time utilities
-// Uses currentTimeMillis and epochToComponents builtins
+//
+// Date/time operations including epoch conversion, formatting (ISO 8601 and
+// locale patterns), leap year detection, and day-of-week calculation using
+// Tomohiko Sakamoto's algorithm.
+//
+// Standards: ISO 8601:2019; RFC 3339 — Date and Time on the Internet
+//
+// Usage:
+//   import rockit.time.datetime
+//   val d = dateFromEpoch(now())
+//   println(formatDateTime(d))  // "2026-03-02T14:30:00"
 
+// == Epoch Functions =========================================================
+
+// Return current time in milliseconds since Unix epoch
 fun now(): Int {
     return currentTimeMillis()
 }

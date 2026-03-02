@@ -1,5 +1,11 @@
 // rockit.encoding.xml — XML encoder / decoder
 //
+// Full XML parser supporting elements, attributes, text, CDATA, comments,
+// and processing instructions. Includes serialization, pretty-printing,
+// and bidirectional JSON conversion.
+//
+// Standards: W3C XML 1.0 Fifth Edition (November 2008)
+//
 // Usage:
 //   import rockit.encoding.xml
 //   val doc = xmlParse("<root><item id=\"1\">Hello</item></root>")

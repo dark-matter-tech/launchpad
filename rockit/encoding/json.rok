@@ -1,7 +1,13 @@
-// rockit.json — JSON encoder / decoder
+// rockit.encoding.json — JSON encoder / decoder
+//
+// Full-featured JSON parser, serializer, and pretty-printer. Supports all
+// JSON types (null, bool, number, string, array, object), deep equality,
+// auto-wrapping of native Rockit values, and unwrapping back to native types.
+//
+// Standards: RFC 8259 — The JSON Data Interchange Format (also ECMA-404, ISO/IEC 21778:2017)
 //
 // Usage:
-//   import rockit.json
+//   import rockit.encoding.json
 //   val obj = jsonParse("{\"name\": \"Rockit\", \"version\": 1}")
 //   println(jsonGetString(jsonObjectGet(obj, "name")))  // Rockit
 //   println(jsonStringify(obj))

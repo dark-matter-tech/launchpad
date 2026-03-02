@@ -1,5 +1,16 @@
-// moon.io.file — File I/O utility functions
+// rockit.filesystem.file — File I/O operations
+//
+// Wrappers around Rockit's built-in file builtins (fileRead, fileWrite,
+// fileExists, fileDelete) with convenience functions for line-based I/O.
+//
+// Usage:
+//   import rockit.filesystem.file
+//   writeFile("out.txt", "hello")
+//   val content = readFile("out.txt")
 
+// == File Operations =========================================================
+
+// Read the entire contents of a file as a string
 fun readFile(path: String): String {
     return toString(fileRead(path))
 }

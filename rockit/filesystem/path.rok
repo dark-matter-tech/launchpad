@@ -1,5 +1,14 @@
-// rockit.io.path — Path manipulation utilities
-// Pure string manipulation, no additional builtins needed
+// rockit.filesystem.path — File path manipulation
+//
+// Pure string-based path operations for joining, normalizing, and extracting
+// components from file paths. No filesystem access is performed.
+//
+// Usage:
+//   import rockit.filesystem.path
+//   val p = pathJoin("/usr", "local/bin")  // "/usr/local/bin"
+//   val ext = pathExt("file.rok")          // ".rok"
+
+// == Path Operations =========================================================
 
 fun pathJoin(a: String, b: String): String {
     val aLen = stringLength(a)
