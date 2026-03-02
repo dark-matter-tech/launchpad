@@ -1,10 +1,23 @@
-// moon.core.result — Result type for error handling
+// rockit.core.result — Result type for error handling
+//
+// A sealed class hierarchy representing the outcome of an operation that
+// may fail. Use Success to wrap a value and Failure to wrap an error message.
+// Inspired by Kotlin's Result and Rust's Result<T, E>.
+//
+// Usage:
+//   import rockit.core.result
+//   val r = Success(42)
+//   val v = resultOrElse(r, 0)  // 42
+
+// == Types ===================================================================
 
 sealed class Result(val isSuccess: Bool)
 
 class Success(val value: Int) : Result(true)
 
 class Failure(val error: String) : Result(false)
+
+// == Operations ==============================================================
 
 // Unwrap a Success value, or return the default if Failure
 fun resultOrElse(r: Result, default: Int): Int {
@@ -24,7 +37,7 @@ fun resultError(r: Result): String {
     return ""
 }
 
-// Map a function over a Result value
+// Map a function over a Success value; pass Failure through unchanged
 fun resultMap(r: Result, transform: (Int) -> Int): Result {
     when (r) {
         is Success -> return Success(transform(r.value))
@@ -33,12 +46,12 @@ fun resultMap(r: Result, transform: (Int) -> Int): Result {
     return r
 }
 
-// Check if a Result is successful
+// Return true if the Result is a Success
 fun isSuccess(r: Result): Bool {
     return r.isSuccess
 }
 
-// Check if a Result is a failure
+// Return true if the Result is a Failure
 fun isFailure(r: Result): Bool {
     return !r.isSuccess
 }

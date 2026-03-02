@@ -1,73 +1,92 @@
-// rockit.net.http — HTTP/1.1 client
-// Uses tcpConnect/tcpSend/tcpRecv/tcpClose builtins for HTTP,
-// systemExec + curl for HTTPS fallback.
+// rockit.networking.http — HTTP/1.1 client
+//
+// Provides HTTP request methods (GET, POST, PUT, DELETE) over plain TCP
+// for HTTP, with automatic HTTPS fallback via curl. Response parsing
+// extracts status code, headers, and body.
+//
+// Standards: RFC 9110 — HTTP Semantics; RFC 9112 — HTTP/1.1
+//
+// Usage:
+//   import rockit.networking.http
+//   import rockit.networking.url
+//   val resp = httpGet("http://example.com/api")
+//   println(httpStatus(resp))
+//   println(httpBody(resp))
 
-// ── Core Request ────────────────────────────────────────────────────────
+// == Core Request ============================================================
 
+// Send an HTTP request, auto-detecting HTTP vs HTTPS
 fun httpRequest(method: String, url: String, headers: Map, body: String): Map {
-    // Auto-detect scheme
-    val scheme = httpParseScheme(url)
+    val scheme = urlExtractScheme(url)
     if (scheme == "https") {
         return httpRequestSecure(method, url, headers, body)
     }
     return httpRequestRaw(method, url, headers, body)
 }
 
-// ── Convenience Methods ─────────────────────────────────────────────────
+// == Convenience Methods =====================================================
 
+// Send a GET request
 fun httpGet(url: String): Map {
     val headers = mapCreate()
     return httpRequest("GET", url, headers, "")
 }
 
+// Send a POST request with body and content type
 fun httpPost(url: String, body: String, contentType: String): Map {
     val headers = mapCreate()
     mapPut(headers, "Content-Type", contentType)
     return httpRequest("POST", url, headers, body)
 }
 
+// Send a POST request with JSON body
 fun httpPostJson(url: String, jsonBody: String): Map {
     return httpPost(url, jsonBody, "application/json")
 }
 
+// Send a PUT request with body and content type
 fun httpPut(url: String, body: String, contentType: String): Map {
     val headers = mapCreate()
     mapPut(headers, "Content-Type", contentType)
     return httpRequest("PUT", url, headers, body)
 }
 
+// Send a DELETE request
 fun httpDelete(url: String): Map {
     val headers = mapCreate()
     return httpRequest("DELETE", url, headers, "")
 }
 
-// ── Response Accessors ──────────────────────────────────────────────────
+// == Response Accessors ======================================================
 
+// Return the HTTP status code
 fun httpStatus(r: Map): Int {
     val v = mapGet(r, "status")
     if (v == null) { return 0 }
     return toInt(v)
 }
 
+// Return the response body
 fun httpBody(r: Map): String {
     val v = mapGet(r, "body")
     if (v == null) { return "" }
     return toString(v)
 }
 
+// Return the value of a response header (case-insensitive lookup)
 fun httpHeader(r: Map, name: String): String {
     val hdrs = mapGet(r, "headers")
     if (hdrs == null) { return "" }
-    // Case-insensitive lookup: try exact, then lowercase
+    // Try exact match first
     val v = mapGet(hdrs, name)
     if (v != null) { return toString(v) }
-    // Try lowercased key
-    val lowerName = httpToLower(name)
+    // Fall back to case-insensitive search
+    val lowerName = urlToLower(name)
     val keys = mapKeys(hdrs)
     var i: Int = 0
     while (i < listSize(keys)) {
         val k = toString(listGet(keys, i))
-        if (httpToLower(k) == lowerName) {
+        if (urlToLower(k) == lowerName) {
             val val2 = mapGet(hdrs, k)
             if (val2 != null) { return toString(val2) }
         }
@@ -76,12 +95,14 @@ fun httpHeader(r: Map, name: String): String {
     return ""
 }
 
+// Return all response headers as a Map
 fun httpHeaders(r: Map): Map {
     val v = mapGet(r, "headers")
     if (v == null) { return mapCreate() }
     return v
 }
 
+// Return true if the response is an error
 fun httpIsError(r: Map): Bool {
     val v = mapGet(r, "error")
     if (v == null) { return false }
@@ -89,23 +110,25 @@ fun httpIsError(r: Map): Bool {
     return stringLength(msg) > 0
 }
 
+// Return the error message (empty string if no error)
 fun httpErrorMessage(r: Map): String {
     val v = mapGet(r, "error")
     if (v == null) { return "" }
     return toString(v)
 }
 
-// ── Raw HTTP (TCP) ──────────────────────────────────────────────────────
+// == Raw HTTP (TCP) ==========================================================
 
+// Send an HTTP request over raw TCP
 fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map {
     val result = mapCreate()
     val respHeaders = mapCreate()
     mapPut(result, "headers", respHeaders)
 
-    // Parse URL
-    val host = httpParseHost(url)
-    val port = httpParsePort(url)
-    val path = httpParsePath(url)
+    // Parse URL using shared url.rok functions
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val path = urlExtractPath(url)
 
     if (stringLength(host) == 0) {
         mapPut(result, "status", 0)
@@ -156,7 +179,7 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
         return result
     }
 
-    // Receive response (accumulate chunks)
+    // Receive response
     var response: String = ""
     var done: Bool = false
     while (done == false) {
@@ -174,8 +197,9 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
     return result
 }
 
-// ── HTTPS via curl ──────────────────────────────────────────────────────
+// == HTTPS via curl ==========================================================
 
+// Send an HTTPS request by shelling out to curl
 fun httpRequestSecure(method: String, url: String, headers: Map, body: String): Map {
     val result = mapCreate()
     val respHeaders = mapCreate()
@@ -217,8 +241,9 @@ fun httpRequestSecure(method: String, url: String, headers: Map, body: String): 
     return result
 }
 
-// ── Response Parsing ────────────────────────────────────────────────────
+// == Response Parsing ========================================================
 
+// Parse a raw HTTP response string into result and header maps
 fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
     val len = stringLength(response)
     if (len == 0) {
@@ -273,13 +298,13 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
     mapPut(result, "error", "")
 }
 
+// Parse a block of HTTP headers into a Map
 fun httpParseHeaders(block: String, headers: Map): Unit {
     val len = stringLength(block)
     var pos: Int = 0
 
     while (pos < len) {
-        // Find \r\n — scan and record first occurrence
-        var lineEnd: Int = len  // default: line extends to end
+        var lineEnd: Int = len
         var i: Int = pos
         while (i < len - 1) {
             if (lineEnd == len) {
@@ -303,125 +328,7 @@ fun httpParseHeaders(block: String, headers: Map): Unit {
         if (lineEnd < len) {
             pos = lineEnd + 2  // skip \r\n
         } else {
-            pos = len  // done
+            pos = len
         }
     }
-}
-
-// ── Internal URL Parsing (minimal, inline) ──────────────────────────────
-
-fun httpParseScheme(url: String): String {
-    val idx = stringIndexOf(url, "://")
-    if (idx < 0) { return "http" }
-    return substring(url, 0, idx)
-}
-
-fun httpParseHost(url: String): String {
-    val idx = stringIndexOf(url, "://")
-    var start: Int = 0
-    if (idx >= 0) { start = idx + 3 }
-
-    val len = stringLength(url)
-    var hostEnd: Int = len  // default: rest is host
-    var i: Int = start
-    while (i < len) {
-        if (hostEnd == len) {
-            val ch = charCodeAt(url, i)
-            if (ch == 47) { hostEnd = i }
-            else { if (ch == 58) { hostEnd = i }
-            else { if (ch == 63) { hostEnd = i } } }
-        }
-        i = i + 1
-    }
-    return substring(url, start, hostEnd)
-}
-
-fun httpParsePort(url: String): Int {
-    val idx = stringIndexOf(url, "://")
-    var start: Int = 0
-    if (idx >= 0) { start = idx + 3 }
-
-    val len = stringLength(url)
-    // Find positions of first ':', '/', '?' in authority
-    var colonPos: Int = 0 - 1
-    var endPos: Int = len  // first '/' or '?' after start
-    var i: Int = start
-    while (i < len) {
-        val ch = charCodeAt(url, i)
-        if (ch == 58) { if (colonPos < 0) { colonPos = i } }
-        if (ch == 47) { if (endPos == len) { endPos = i } }
-        if (ch == 63) { if (endPos == len) { endPos = i } }
-        i = i + 1
-    }
-
-    if (colonPos < 0) {
-        val scheme = httpParseScheme(url)
-        if (scheme == "https") { return 443 }
-        return 80
-    }
-    if (colonPos >= endPos) {
-        // Colon is in path/query, not authority
-        val scheme = httpParseScheme(url)
-        if (scheme == "https") { return 443 }
-        return 80
-    }
-
-    val portStr = substring(url, colonPos + 1, endPos)
-    if (stringLength(portStr) == 0) { return 80 }
-    return toInt(portStr)
-}
-
-fun httpParsePath(url: String): String {
-    val idx = stringIndexOf(url, "://")
-    var start: Int = 0
-    if (idx >= 0) { start = idx + 3 }
-
-    val len = stringLength(url)
-    // Find first '/' after authority
-    var slashPos: Int = 0 - 1
-    var i: Int = start
-    while (i < len) {
-        if (charCodeAt(url, i) == 47) {
-            if (slashPos < 0) { slashPos = i }
-        }
-        i = i + 1
-    }
-
-    if (slashPos < 0) { return "/" }
-
-    // Find end of path (first '?' or '#' after slash)
-    var pathEnd: Int = len
-    i = slashPos
-    while (i < len) {
-        val ch = charCodeAt(url, i)
-        if (ch == 63) { if (pathEnd == len) { pathEnd = i } }
-        if (ch == 35) { if (pathEnd == len) { pathEnd = i } }
-        i = i + 1
-    }
-
-    return substring(url, slashPos, pathEnd)
-}
-
-// ── Helper ──────────────────────────────────────────────────────────────
-
-fun httpToLower(s: String): String {
-    val len = stringLength(s)
-    var result: String = ""
-    var i: Int = 0
-    while (i < len) {
-        val ch = charCodeAt(s, i)
-        if (ch >= 65) {
-            if (ch <= 90) {
-                result = stringConcat(result, intToChar(ch + 32))
-                i = i + 1
-            } else {
-                result = stringConcat(result, charAt(s, i))
-                i = i + 1
-            }
-        } else {
-            result = stringConcat(result, charAt(s, i))
-            i = i + 1
-        }
-    }
-    return result
 }

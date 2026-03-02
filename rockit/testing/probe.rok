@@ -1,6 +1,15 @@
-// rockit.test.probe — Probe Test Framework
-// Assertion library for Rockit test files.
-// Use with @Test annotation and `rockit test` command.
+// rockit.testing.probe — Probe test framework
+//
+// Assertion library for Rockit test files. Provides 20+ assertion functions
+// for equality, comparison, string matching, and range checks. Supports both
+// fail-fast (panic) and recording mode for detailed test reporting.
+//
+// Usage:
+//   import rockit.testing.probe
+//   @Test fun testMath() {
+//       assertEquals(4, 2 + 2)
+//       assertEqualsStr("hello", "hello")
+//   }
 
 // ── Recording mode (used by --detailed flag) ──────────────────────────
 // When __probeRecording == 1, assertions record P/F instead of panicking.

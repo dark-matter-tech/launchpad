@@ -1,12 +1,25 @@
-// moon.core.collections — Collection utility functions
+// rockit.core.collections — List utility functions
+//
+// Higher-order collection operations for Rockit's built-in List type.
+// Provides map, filter, fold, sort, and other common transformations.
+// All functions operate on Lists of Int unless otherwise noted.
+//
+// Usage:
+//   import rockit.core.collections
+//   val nums = listOf3(3, 1, 2)
+//   listSort(nums)
+//   val sum = listFold(nums, 0, fun(a: Int, b: Int): Int { return a + b })
 
-// Create a list from variable number of items
+// == List Constructors =======================================================
+
+// Create a list with 1 item
 fun listOf1(a: Int): List {
     val list = listCreate()
     listAppend(list, a)
     return list
 }
 
+// Create a list with 2 items
 fun listOf2(a: Int, b: Int): List {
     val list = listCreate()
     listAppend(list, a)
@@ -14,6 +27,7 @@ fun listOf2(a: Int, b: Int): List {
     return list
 }
 
+// Create a list with 3 items
 fun listOf3(a: Int, b: Int, c: Int): List {
     val list = listCreate()
     listAppend(list, a)
@@ -22,7 +36,30 @@ fun listOf3(a: Int, b: Int, c: Int): List {
     return list
 }
 
-// Map a function name over a list (calls the function for each element)
+// Create a list with 4 items
+fun listOf4(a: Int, b: Int, c: Int, d: Int): List {
+    val list = listCreate()
+    listAppend(list, a)
+    listAppend(list, b)
+    listAppend(list, c)
+    listAppend(list, d)
+    return list
+}
+
+// Create a list with 5 items
+fun listOf5(a: Int, b: Int, c: Int, d: Int, e: Int): List {
+    val list = listCreate()
+    listAppend(list, a)
+    listAppend(list, b)
+    listAppend(list, c)
+    listAppend(list, d)
+    listAppend(list, e)
+    return list
+}
+
+// == Basic Operations ========================================================
+
+// Print each element in the list
 fun listForEach(list: List, action: String): Unit {
     var i: Int = 0
     while (i < listSize(list)) {
@@ -104,7 +141,36 @@ fun listJoin(list: List, sep: String): String {
     return result
 }
 
-// ── Higher-Order Collection Functions ────────────────────────────────────
+// Check if a list is empty
+fun listIsEmpty(list: List): Bool {
+    return listSize(list) == 0
+}
+
+// Get the first element (or -1 if empty)
+fun listFirst(list: List): Int {
+    if (listSize(list) == 0) { return -1 }
+    return toInt(listGet(list, 0))
+}
+
+// Get the last element (or -1 if empty)
+fun listLast(list: List): Int {
+    val size = listSize(list)
+    if (size == 0) { return -1 }
+    return toInt(listGet(list, size - 1))
+}
+
+// Create a sublist from start (inclusive) to end (exclusive)
+fun listSlice(list: List, start: Int, end: Int): List {
+    val result = listCreate()
+    var i: Int = start
+    while (i < end && i < listSize(list)) {
+        listAppend(result, listGet(list, i))
+        i = i + 1
+    }
+    return result
+}
+
+// == Higher-Order Functions ==================================================
 
 // Transform each element of a list
 fun listMap(list: List, transform: (Int) -> Int): List {
@@ -162,56 +228,6 @@ fun listAll(list: List, predicate: (Int) -> Bool): Bool {
     return true
 }
 
-// Get the first element (or -1 if empty)
-fun listFirst(list: List): Int {
-    if (listSize(list) == 0) { return -1 }
-    return toInt(listGet(list, 0))
-}
-
-// Get the last element (or -1 if empty)
-fun listLast(list: List): Int {
-    val size = listSize(list)
-    if (size == 0) { return -1 }
-    return toInt(listGet(list, size - 1))
-}
-
-// Check if a list is empty
-fun listIsEmpty(list: List): Bool {
-    return listSize(list) == 0
-}
-
-// Create a sublist from start (inclusive) to end (exclusive)
-fun listSlice(list: List, start: Int, end: Int): List {
-    val result = listCreate()
-    var i: Int = start
-    while (i < end && i < listSize(list)) {
-        listAppend(result, listGet(list, i))
-        i = i + 1
-    }
-    return result
-}
-
-// Create a list with 4 items
-fun listOf4(a: Int, b: Int, c: Int, d: Int): List {
-    val list = listCreate()
-    listAppend(list, a)
-    listAppend(list, b)
-    listAppend(list, c)
-    listAppend(list, d)
-    return list
-}
-
-// Create a list with 5 items
-fun listOf5(a: Int, b: Int, c: Int, d: Int, e: Int): List {
-    val list = listCreate()
-    listAppend(list, a)
-    listAppend(list, b)
-    listAppend(list, c)
-    listAppend(list, d)
-    listAppend(list, e)
-    return list
-}
-
 // Count elements matching a predicate
 fun listCount(list: List, predicate: (Int) -> Bool): Int {
     var count: Int = 0
@@ -233,6 +249,8 @@ fun listFind(list: List, predicate: (Int) -> Bool): Int {
     }
     return -1
 }
+
+// == Sorting and Deduplication ===============================================
 
 // Sort a list using insertion sort (in-place)
 fun listSort(list: List): Unit {
@@ -264,6 +282,8 @@ fun listDistinct(list: List): List {
     return result
 }
 
+// == Combining Lists =========================================================
+
 // Zip two lists into a list of pairs (alternating elements)
 fun listZip(a: List, b: List): List {
     val result = listCreate()
@@ -278,13 +298,11 @@ fun listZip(a: List, b: List): List {
 }
 
 // Flatten a list of lists into a single list
-// Each element is expected to be a List
 fun listFlatten(lists: List): List {
     val result = listCreate()
     var i: Int = 0
     while (i < listSize(lists)) {
         val inner = listGet(lists, i)
-        // Append all elements from inner list
         var j: Int = 0
         while (j < listSize(inner)) {
             listAppend(result, listGet(inner, j))
