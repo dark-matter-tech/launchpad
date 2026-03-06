@@ -1,0 +1,83 @@
+// rockit.security.x509 — X.509 certificate inspection
+//
+// Parse and inspect X.509 certificates from PEM data or TLS connections.
+// Provides subject, issuer, validity period, and serial number extraction.
+// Handles are reference-counted — call x509Release() when done.
+//
+// Standards: RFC 5280 (X.509 PKI)
+//
+// Usage:
+//   import rockit.security.x509
+//   val cert = x509FromPem(pemData)
+//   val subject = x509GetSubject(cert["handle"])
+//   x509Release(cert["handle"])
+
+// == Constants ================================================================
+
+fun X509_ERROR(): String { return "X509_ERROR" }
+
+// == Certificate Parsing ======================================================
+
+// Parse a PEM-encoded certificate, returning a result map with handle
+fun x509FromPem(pemData: String): Map {
+    val result = mapCreate()
+    val handle = x509ParsePem(pemData)
+    if (handle < 0) {
+        mapPut(result, "type", X509_ERROR())
+        mapPut(result, "error", "Failed to parse X.509 certificate")
+        mapPut(result, "handle", -1)
+        return result
+    }
+    mapPut(result, "type", "X509_CERT")
+    mapPut(result, "error", "")
+    mapPut(result, "handle", handle)
+    return result
+}
+
+// == Certificate Inspection ===================================================
+
+// Get the subject distinguished name
+fun x509GetSubject(handle: Int): String {
+    return x509Subject(handle)
+}
+
+// Get the issuer distinguished name
+fun x509GetIssuer(handle: Int): String {
+    return x509Issuer(handle)
+}
+
+// Get the not-before validity date as epoch seconds
+fun x509GetNotBefore(handle: Int): Int {
+    return x509NotBefore(handle)
+}
+
+// Get the not-after validity date as epoch seconds
+fun x509GetNotAfter(handle: Int): Int {
+    return x509NotAfter(handle)
+}
+
+// Get the certificate serial number as a hex string
+fun x509GetSerial(handle: Int): String {
+    return x509SerialNumber(handle)
+}
+
+// Check if a certificate is expired (compared to current time)
+fun x509IsExpired(handle: Int): Bool {
+    val notAfter = x509NotAfter(handle)
+    val now = currentTimeMillis() / 1000
+    return now > notAfter
+}
+
+// == Resource Management ======================================================
+
+// Free a certificate handle
+fun x509Release(handle: Int): Unit {
+    x509Free(handle)
+}
+
+// == Error Checking ===========================================================
+
+fun x509IsError(result: Map): Bool {
+    val t = mapGet(result, "type")
+    return t == X509_ERROR()
+}

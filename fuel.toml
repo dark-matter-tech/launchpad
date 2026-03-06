@@ -29,6 +29,10 @@ exclude = []
 include = ["time"]
 exclude = []
 
+[test.scheme.security]
+include = ["security"]
+exclude = []
+
 [test.scheme.all]
 include = ["*"]
 exclude = []

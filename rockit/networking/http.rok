@@ -1,7 +1,7 @@
 // rockit.networking.http — HTTP/1.1 client
 //
 // Provides HTTP request methods (GET, POST, PUT, DELETE) over plain TCP
-// for HTTP, with automatic HTTPS fallback via curl. Response parsing
+// for HTTP, with native TLS for HTTPS via OpenSSL. Response parsing
 // extracts status code, headers, and body.
 //
 // Standards: RFC 9110 — HTTP Semantics; RFC 9112 — HTTP/1.1
@@ -9,7 +9,7 @@
 // Usage:
 //   import rockit.networking.http
 //   import rockit.networking.url
-//   val resp = httpGet("http://example.com/api")
+//   val resp = httpGet("https://example.com/api")
 //   println(httpStatus(resp))
 //   println(httpBody(resp))
 
@@ -197,46 +197,90 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
     return result
 }
 
-// == HTTPS via curl ==========================================================
+// == HTTPS via Native TLS =====================================================
 
-// Send an HTTPS request by shelling out to curl
+// Send an HTTPS request using native TLS (OpenSSL)
 fun httpRequestSecure(method: String, url: String, headers: Map, body: String): Map {
     val result = mapCreate()
     val respHeaders = mapCreate()
     mapPut(result, "headers", respHeaders)
 
-    // Build curl command
-    var cmd: String = stringConcat("curl -s -D- -X ", method)
-    cmd = stringConcat(cmd, stringConcat(" '", stringConcat(url, "'")))
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val path = urlExtractPath(url)
 
-    // Add headers
+    if (stringLength(host) == 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Invalid URL: no host")
+        return result
+    }
+
+    // Create TLS context and connect
+    val ctx = tlsCreateContext()
+    if (ctx < 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Failed to create TLS context")
+        return result
+    }
+    tlsSetVerifyPeer(ctx, 1)
+
+    val conn = tlsConnect(ctx, host, port)
+    if (conn < 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", stringConcat("TLS connection failed to ", host))
+        return result
+    }
+
+    // Build request
+    var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", host), "\r\n"))
+
+    // Add custom headers
     val hdrKeys = mapKeys(headers)
     var i: Int = 0
     while (i < listSize(hdrKeys)) {
         val k = toString(listGet(hdrKeys, i))
         val v = toString(mapGet(headers, k))
-        cmd = stringConcat(cmd, stringConcat(stringConcat(stringConcat(" -H '", k), stringConcat(": ", stringConcat(v, "'"))))
+        req = stringConcat(req, stringConcat(stringConcat(stringConcat(k, ": "), v), "\r\n"))
         i = i + 1
     }
 
-    // Add body
+    // Content-Length for body
     if (stringLength(body) > 0) {
-        cmd = stringConcat(cmd, stringConcat(" -d '", stringConcat(body, "'")))
+        req = stringConcat(req, stringConcat(stringConcat("Content-Length: ", toString(stringLength(body))), "\r\n"))
     }
 
-    // Write curl output to temp file, read it back
-    val tmpFile = "/tmp/rockit_http_resp.tmp"
-    cmd = stringConcat(cmd, stringConcat(" > ", tmpFile))
-    val exitCode = systemExec(cmd)
+    req = stringConcat(req, "Connection: close\r\n")
+    req = stringConcat(req, "\r\n")
+    req = stringConcat(req, body)
 
-    if (exitCode != 0) {
+    // Send
+    val sent = tlsSend(conn, req)
+    if (sent < 0) {
+        tlsClose(conn)
         mapPut(result, "status", 0)
         mapPut(result, "body", "")
-        mapPut(result, "error", stringConcat("curl failed with exit code ", toString(exitCode)))
+        mapPut(result, "error", "TLS send failed")
         return result
     }
 
-    val response = toString(fileRead(tmpFile))
+    // Receive response
+    var response: String = ""
+    var done: Bool = false
+    while (done == false) {
+        val chunk = tlsRecv(conn, 8192)
+        if (stringLength(chunk) == 0) {
+            done = true
+        } else {
+            response = stringConcat(response, chunk)
+        }
+    }
+    tlsClose(conn)
+
+    // Parse response
     httpParseResponse(response, result, respHeaders)
     return result
 }

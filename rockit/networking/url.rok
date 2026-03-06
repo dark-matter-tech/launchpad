@@ -403,11 +403,13 @@ fun urlExtractPort(url: String): Int {
     if (colonPos < 0) {
         val scheme = urlExtractScheme(url)
         if (scheme == "https") { return 443 }
+        if (scheme == "wss") { return 443 }
         return 80
     }
     if (colonPos >= endPos) {
         val scheme = urlExtractScheme(url)
         if (scheme == "https") { return 443 }
+        if (scheme == "wss") { return 443 }
         return 80
     }
 

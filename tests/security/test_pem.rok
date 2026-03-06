@@ -1,0 +1,60 @@
+// Tests for rockit.security.pem
+// PEM decode/encode roundtrip and field extraction
+import rockit.testing.probe
+import rockit.security.pem
+import rockit.encoding.base64
+
+// == Sample PEM Data ==========================================================
+
+fun samplePem(): String {
+    return "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJALRiMLAh0FRAMA0GCSqGSIb3DQEBCwUAMBExDzANBgNVBAMMBnRl\nc3RjYTAeFw0yNDAxMDEwMDAwMDBaFw0yNTAxMDEwMDAwMDBaMBExDzANBgNVBAMM\nBnRlc3RjYTBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC7o96TqHGXzfGPVHQf/T6U\nQgkGGsOi6ggBMJh/A5RhCzMjM0RH7dDlBZBt+sdV/4MWaYkSJBQx0N/5nl/MwWEH\nAgMBAAEwDQYJKoZIhvcNAQELBQADQQBVQF7JK1h6QJ0kB2kiw7sBJ1FcXp0LqZ3S\nPNz3MT4MmQh7bHFA0JkFnHMp5K1Z9mRY/fOJ3rMmchL6khYdnGk=\n-----END CERTIFICATE-----\n"
+}
+
+// == Decode ===================================================================
+
+@Test fun testPemDecodeValid() {
+    val block = pemDecode(samplePem())
+    assertFalse(pemIsError(block))
+}
+
+@Test fun testPemDecodeType() {
+    val block = pemDecode(samplePem())
+    assertEqualsStr("CERTIFICATE", pemType(block))
+}
+
+@Test fun testPemDecodeDataNotEmpty() {
+    val block = pemDecode(samplePem())
+    assertStringNotEmpty(pemData(block))
+}
+
+@Test fun testPemDecodeInvalid() {
+    val block = pemDecode("not a pem block")
+    assertTrue(pemIsError(block))
+}
+
+// == Encode ===================================================================
+
+@Test fun testPemEncodeRoundtrip() {
+    val original = "Hello, PEM world!"
+    val encoded = pemEncode("TEST DATA", original)
+    assertStringContains(encoded, "-----BEGIN TEST DATA-----")
+    assertStringContains(encoded, "-----END TEST DATA-----")
+    val block = pemDecode(encoded)
+    assertFalse(pemIsError(block))
+    assertEqualsStr("TEST DATA", pemType(block))
+    assertEqualsStr(original, pemData(block))
+}
+
+@Test fun testPemEncodeContainsBase64() {
+    val encoded = pemEncode("RSA PRIVATE KEY", "test data")
+    assertStringContains(encoded, "-----BEGIN RSA PRIVATE KEY-----")
+    assertStringContains(encoded, "-----END RSA PRIVATE KEY-----")
+}
+
+// == Error Cases ==============================================================
+
+@Test fun testPemMissingEndMarker() {
+    val bad = "-----BEGIN CERTIFICATE-----\ndata\n"
+    val block = pemDecode(bad)
+    assertTrue(pemIsError(block))
+}

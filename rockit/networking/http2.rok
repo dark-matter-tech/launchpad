@@ -1,0 +1,2403 @@
+// rockit.networking.http2 — HTTP/2 client and server
+//
+// Implements the HTTP/2 protocol over cleartext TCP (h2c) and TLS (h2).
+// Provides binary framing, stream multiplexing, flow control, CONTINUATION
+// reassembly, trailers, server push, 1xx informational responses, Extended
+// CONNECT, graceful shutdown, and concurrent request batching.
+// Automatically uses TLS with ALPN "h2" for https:// URLs.
+//
+// Standards: RFC 9113 — HTTP/2
+//
+// Usage:
+//   import rockit.networking.http2
+//   import rockit.encoding.hpack
+//   import rockit.networking.url
+//   val conn = h2Connect("https://example.com")
+//   val resp = h2Get(conn, "/api/data")
+//   println(h2ResponseStatus(resp))
+//   h2Close(conn)
+
+// == Frame Type Constants (Section 6) =========================================
+
+fun H2_DATA(): Int          { return 0 }
+fun H2_HEADERS(): Int       { return 1 }
+fun H2_PRIORITY(): Int      { return 2 }
+fun H2_RST_STREAM(): Int    { return 3 }
+fun H2_SETTINGS(): Int      { return 4 }
+fun H2_PUSH_PROMISE(): Int  { return 5 }
+fun H2_PING(): Int          { return 6 }
+fun H2_GOAWAY(): Int        { return 7 }
+fun H2_WINDOW_UPDATE(): Int { return 8 }
+fun H2_CONTINUATION(): Int  { return 9 }
+
+// == Error Code Constants (Section 7) =========================================
+
+fun H2_NO_ERROR(): Int            { return 0 }
+fun H2_PROTOCOL_ERROR(): Int      { return 1 }
+fun H2_INTERNAL_ERROR(): Int      { return 2 }
+fun H2_FLOW_CONTROL_ERROR(): Int  { return 3 }
+fun H2_SETTINGS_TIMEOUT(): Int    { return 4 }
+fun H2_STREAM_CLOSED(): Int       { return 5 }
+fun H2_FRAME_SIZE_ERROR(): Int    { return 6 }
+fun H2_REFUSED_STREAM(): Int      { return 7 }
+fun H2_CANCEL(): Int              { return 8 }
+fun H2_COMPRESSION_ERROR(): Int   { return 9 }
+fun H2_CONNECT_ERROR(): Int       { return 10 }
+fun H2_ENHANCE_YOUR_CALM(): Int   { return 11 }
+fun H2_INADEQUATE_SECURITY(): Int { return 12 }
+fun H2_HTTP_1_1_REQUIRED(): Int   { return 13 }
+
+// == Settings Constants (Section 6.5.2) =======================================
+
+fun H2_SETTINGS_HEADER_TABLE_SIZE(): Int      { return 1 }
+fun H2_SETTINGS_ENABLE_PUSH(): Int            { return 2 }
+fun H2_SETTINGS_MAX_CONCURRENT_STREAMS(): Int { return 3 }
+fun H2_SETTINGS_INITIAL_WINDOW_SIZE(): Int    { return 4 }
+fun H2_SETTINGS_MAX_FRAME_SIZE(): Int         { return 5 }
+fun H2_SETTINGS_MAX_HEADER_LIST_SIZE(): Int   { return 6 }
+
+// Default values
+fun H2_DEFAULT_HEADER_TABLE_SIZE(): Int   { return 4096 }
+fun H2_DEFAULT_INITIAL_WINDOW_SIZE(): Int { return 65535 }
+fun H2_DEFAULT_MAX_FRAME_SIZE(): Int      { return 16384 }
+
+// == Flag Constants (Section 6) ===============================================
+
+fun H2_FLAG_END_STREAM(): Int  { return 1 }
+fun H2_FLAG_END_HEADERS(): Int { return 4 }
+fun H2_FLAG_PADDED(): Int      { return 8 }
+fun H2_FLAG_PRIORITY(): Int    { return 32 }
+fun H2_FLAG_ACK(): Int         { return 1 }
+
+// == Stream State Constants (Section 5.1) =====================================
+
+fun H2_STREAM_IDLE(): Int              { return 0 }
+fun H2_STREAM_OPEN(): Int              { return 1 }
+fun H2_STREAM_HALF_CLOSED_LOCAL(): Int { return 2 }
+fun H2_STREAM_HALF_CLOSED_REMOTE(): Int { return 3 }
+fun H2_STREAM_CLOSED_STATE(): Int      { return 4 }
+
+// == Bitwise Helpers ==========================================================
+
+// Bitwise OR for 8-bit values
+fun h2Or(a: Int, b: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vb: Int = b
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val bBit = vb - (vb / 2) * 2
+        if (aBit == 1) {
+            result = result + bit
+        } else {
+            if (bBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vb = vb / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}
+
+// Bitwise AND for 8-bit values
+fun h2And(a: Int, b: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vb: Int = b
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val bBit = vb - (vb / 2) * 2
+        if (aBit == 1) {
+            if (bBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vb = vb / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}
+
+// Test if a flag bit is set
+fun h2HasFlag(flags: Int, flag: Int): Bool {
+    return h2And(flags, flag) == flag
+}
+
+// Compute 2^n for small n
+fun h2Pow2(n: Int): Int {
+    var result: Int = 1
+    var i: Int = 0
+    while (i < n) {
+        result = result * 2
+        i = i + 1
+    }
+    return result
+}
+
+// == Multi-byte Integer Encoding ==============================================
+
+// Encode a 32-bit unsigned integer as 4 big-endian bytes
+fun h2EncodeUint32(value: Int): String {
+    val b0 = value / 16777216
+    val b1 = (value - b0 * 16777216) / 65536
+    val b2 = (value - b0 * 16777216 - b1 * 65536) / 256
+    val b3 = value - b0 * 16777216 - b1 * 65536 - b2 * 256
+    var result: String = intToChar(b0)
+    result = stringConcat(result, intToChar(b1))
+    result = stringConcat(result, intToChar(b2))
+    result = stringConcat(result, intToChar(b3))
+    return result
+}
+
+// Decode a 32-bit unsigned integer from 4 big-endian bytes
+fun h2DecodeUint32(buf: String, offset: Int): Int {
+    val b0 = charCodeAt(buf, offset)
+    val b1 = charCodeAt(buf, offset + 1)
+    val b2 = charCodeAt(buf, offset + 2)
+    val b3 = charCodeAt(buf, offset + 3)
+    return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+// Encode a 16-bit unsigned integer as 2 big-endian bytes
+fun h2EncodeUint16(value: Int): String {
+    val b0 = value / 256
+    val b1 = value - b0 * 256
+    var result: String = intToChar(b0)
+    result = stringConcat(result, intToChar(b1))
+    return result
+}
+
+// Decode a 16-bit unsigned integer from 2 big-endian bytes
+fun h2DecodeUint16(buf: String, offset: Int): Int {
+    return charCodeAt(buf, offset) * 256 + charCodeAt(buf, offset + 1)
+}
+
+// == Frame Header Encode/Decode (Section 4.1) =================================
+// Frame header: 3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream ID
+
+// Encode a 9-byte frame header
+fun h2EncodeFrameHeader(length: Int, frameType: Int, flags: Int, streamId: Int): String {
+    // 3-byte length (24 bits big-endian)
+    val b0 = length / 65536
+    val b1 = (length - b0 * 65536) / 256
+    val b2 = length - b0 * 65536 - b1 * 256
+    var header: String = intToChar(b0)
+    header = stringConcat(header, intToChar(b1))
+    header = stringConcat(header, intToChar(b2))
+    // Type
+    header = stringConcat(header, intToChar(frameType))
+    // Flags
+    header = stringConcat(header, intToChar(flags))
+    // Stream ID (31 bits, MSB reserved = 0)
+    header = stringConcat(header, h2EncodeUint32(streamId))
+    return header
+}
+
+// Decode a 9-byte frame header from data at offset
+// Returns map with: length, type, flags, streamId
+fun h2DecodeFrameHeader(buf: String, offset: Int): Map {
+    val result = mapCreate()
+    val b0 = charCodeAt(buf, offset)
+    val b1 = charCodeAt(buf, offset + 1)
+    val b2 = charCodeAt(buf, offset + 2)
+    mapPut(result, "length", b0 * 65536 + b1 * 256 + b2)
+    mapPut(result, "type", charCodeAt(buf, offset + 3))
+    mapPut(result, "flags", charCodeAt(buf, offset + 4))
+    // Stream ID: mask off reserved bit
+    val rawStreamId = h2DecodeUint32(buf, offset + 5)
+    mapPut(result, "streamId", h2And31(rawStreamId))
+    return result
+}
+
+// Mask to 31 bits (clear MSB of a 32-bit integer)
+fun h2And31(value: Int): Int {
+    if (value >= 2147483648) {
+        return value - 2147483648
+    }
+    return value
+}
+
+// == Frame Builders ===========================================================
+
+// Build a DATA frame (Section 6.1)
+fun h2BuildDataFrame(streamId: Int, payload: String, endStream: Bool): String {
+    var flags: Int = 0
+    if (endStream) { flags = H2_FLAG_END_STREAM() }
+    val header = h2EncodeFrameHeader(stringLength(payload), H2_DATA(), flags, streamId)
+    return stringConcat(header, payload)
+}
+
+// Build a HEADERS frame (Section 6.2)
+fun h2BuildHeadersFrame(streamId: Int, headerBlock: String, endStream: Bool, endHeaders: Bool): String {
+    var flags: Int = 0
+    if (endStream) { flags = h2Or(flags, H2_FLAG_END_STREAM()) }
+    if (endHeaders) { flags = h2Or(flags, H2_FLAG_END_HEADERS()) }
+    val header = h2EncodeFrameHeader(stringLength(headerBlock), H2_HEADERS(), flags, streamId)
+    return stringConcat(header, headerBlock)
+}
+
+// Build a SETTINGS frame (Section 6.5)
+// params: list of maps with "id" and "value" keys
+fun h2BuildSettingsFrame(params: List): String {
+    var payload: String = ""
+    var i: Int = 0
+    while (i < listSize(params)) {
+        val param = listGet(params, i)
+        val id = toInt(mapGet(param, "id"))
+        val value = toInt(mapGet(param, "value"))
+        payload = stringConcat(payload, h2EncodeUint16(id))
+        payload = stringConcat(payload, h2EncodeUint32(value))
+        i = i + 1
+    }
+    val header = h2EncodeFrameHeader(stringLength(payload), H2_SETTINGS(), 0, 0)
+    return stringConcat(header, payload)
+}
+
+// Build a SETTINGS ACK frame
+fun h2BuildSettingsAckFrame(): String {
+    return h2EncodeFrameHeader(0, H2_SETTINGS(), H2_FLAG_ACK(), 0)
+}
+
+// Build a PING frame (Section 6.7)
+fun h2BuildPingFrame(opaqueData: String, ack: Bool): String {
+    // PING payload is always exactly 8 bytes
+    var payload: String = opaqueData
+    while (stringLength(payload) < 8) {
+        payload = stringConcat(payload, intToChar(0))
+    }
+    // Truncate to 8 bytes if longer
+    if (stringLength(payload) > 8) {
+        payload = substring(payload, 0, 8)
+    }
+    var flags: Int = 0
+    if (ack) { flags = H2_FLAG_ACK() }
+    val header = h2EncodeFrameHeader(8, H2_PING(), flags, 0)
+    return stringConcat(header, payload)
+}
+
+// Build a GOAWAY frame (Section 6.8)
+fun h2BuildGoawayFrame(lastStreamId: Int, errorCode: Int, debugData: String): String {
+    var payload: String = h2EncodeUint32(lastStreamId)
+    payload = stringConcat(payload, h2EncodeUint32(errorCode))
+    if (stringLength(debugData) > 0) {
+        payload = stringConcat(payload, debugData)
+    }
+    val header = h2EncodeFrameHeader(stringLength(payload), H2_GOAWAY(), 0, 0)
+    return stringConcat(header, payload)
+}
+
+// Build a WINDOW_UPDATE frame (Section 6.9)
+fun h2BuildWindowUpdateFrame(streamId: Int, increment: Int): String {
+    val payload = h2EncodeUint32(increment)
+    val header = h2EncodeFrameHeader(4, H2_WINDOW_UPDATE(), 0, streamId)
+    return stringConcat(header, payload)
+}
+
+// Build a RST_STREAM frame (Section 6.4)
+fun h2BuildRstStreamFrame(streamId: Int, errorCode: Int): String {
+    val payload = h2EncodeUint32(errorCode)
+    val header = h2EncodeFrameHeader(4, H2_RST_STREAM(), 0, streamId)
+    return stringConcat(header, payload)
+}
+
+// Build a CONTINUATION frame (Section 6.10)
+fun h2BuildContinuationFrame(streamId: Int, headerBlock: String, endHeaders: Bool): String {
+    var flags: Int = 0
+    if (endHeaders) { flags = H2_FLAG_END_HEADERS() }
+    val header = h2EncodeFrameHeader(stringLength(headerBlock), H2_CONTINUATION(), flags, streamId)
+    return stringConcat(header, headerBlock)
+}
+
+// Build a PUSH_PROMISE frame (Section 6.6)
+fun h2BuildPushPromiseFrame(streamId: Int, promisedStreamId: Int, headerBlock: String): String {
+    var payload: String = h2EncodeUint32(promisedStreamId)
+    payload = stringConcat(payload, headerBlock)
+    val flags = H2_FLAG_END_HEADERS()
+    val header = h2EncodeFrameHeader(stringLength(payload), H2_PUSH_PROMISE(), flags, streamId)
+    return stringConcat(header, payload)
+}
+
+// == Transport Abstraction (TLS-aware) ========================================
+
+// Send data over the connection's transport (TLS or TCP)
+fun h2Send(conn: Map, data: String): Int {
+    val useTls = mapGet(conn, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(conn, "tlsConn"))
+        return tlsSend(tlsConn, data)
+    }
+    val rawFd = toInt(mapGet(conn, "fd"))
+    return tcpSend(rawFd, data)
+}
+
+// Receive data from the connection's transport (TLS or TCP)
+fun h2Recv(conn: Map, maxBytes: Int): String {
+    val useTls = mapGet(conn, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(conn, "tlsConn"))
+        return tlsRecv(tlsConn, maxBytes)
+    }
+    val rawFd = toInt(mapGet(conn, "fd"))
+    return tcpRecv(rawFd, maxBytes)
+}
+
+// Close the connection's transport (TLS or TCP)
+fun h2CloseTransport(conn: Map): Unit {
+    val useTls = mapGet(conn, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(conn, "tlsConn"))
+        tlsClose(tlsConn)
+        return
+    }
+    val rawFd = toInt(mapGet(conn, "fd"))
+    tcpClose(rawFd)
+}
+
+// Send a header block, auto-splitting into HEADERS + CONTINUATION frames
+// if the block exceeds peerMaxFrameSize
+fun h2SendHeaderBlock(conn: Map, streamId: Int, headerBlock: String, endStream: Bool): Int {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+    val maxSize = toInt(mapGet(conn, "peerMaxFrameSize"))
+    val blockLen = stringLength(headerBlock)
+    if (blockLen <= maxSize) {
+        // Fits in a single HEADERS frame
+        val frame = h2BuildHeadersFrame(streamId, headerBlock, endStream, true)
+        return h2Send(conn,frame)
+    }
+    // Split: first chunk in HEADERS (no END_HEADERS), rest in CONTINUATION frames
+    val firstChunk = substring(headerBlock, 0, maxSize)
+    val headersFrame = h2BuildHeadersFrame(streamId, firstChunk, endStream, false)
+    val sent1 = h2Send(conn,headersFrame)
+    if (sent1 < 0) { return sent1 }
+    var offset: Int = maxSize
+    while (offset < blockLen) {
+        var chunkEnd: Int = offset + maxSize
+        if (chunkEnd > blockLen) { chunkEnd = blockLen }
+        val chunk = substring(headerBlock, offset, chunkEnd)
+        val isLast = chunkEnd >= blockLen
+        val contFrame = h2BuildContinuationFrame(streamId, chunk, isLast)
+        val sent = h2Send(conn,contFrame)
+        if (sent < 0) { return sent }
+        offset = chunkEnd
+    }
+    return 1
+}
+
+// Send trailers (HEADERS frame with END_STREAM on an open stream)
+fun h2SendTrailers(conn: Map, streamId: Int, trailers: List): Int {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, trailers)
+    return h2SendHeaderBlock(conn, streamId, headerBlock, true)
+}
+
+// Get trailers from a response (if any)
+fun h2ResponseTrailers(resp: Map): List {
+    val v = mapGet(resp, "trailers")
+    if (v == null) { return listCreate() }
+    return v
+}
+
+// == Client Preface (Section 3.4) =============================================
+
+// The 24-byte client connection preface magic string
+fun h2ClientPreface(): String {
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var s: String = stringConcat("PRI * HTTP/2.0", crlf)
+    s = stringConcat(s, crlf)
+    s = stringConcat(s, "SM")
+    s = stringConcat(s, crlf)
+    s = stringConcat(s, crlf)
+    return s
+}
+
+// == Connection Management ====================================================
+
+// Connect to an HTTP/2 server (h2c for http://, h2-over-TLS for https://)
+fun h2Connect(url: String): Map {
+    val conn = mapCreate()
+
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val scheme = urlExtractScheme(url)
+
+    if (stringLength(host) == 0) {
+        mapPut(conn, "fd", 0 - 1)
+        mapPut(conn, "error", "Invalid URL: no host")
+        return conn
+    }
+
+    // Determine TLS vs plaintext
+    val useTls = scheme == "https"
+    mapPut(conn, "tls", useTls)
+
+    if (useTls) {
+        // TLS connect with ALPN "h2"
+        val ctx = tlsCreateContext()
+        if (ctx < 0) {
+            mapPut(conn, "fd", 0 - 1)
+            mapPut(conn, "error", "Failed to create TLS context")
+            return conn
+        }
+        tlsSetVerifyPeer(ctx, 1)
+        // Wire-format ALPN: \x02h2
+        val alpnWire = stringConcat(intToChar(2), "h2")
+        tlsSetAlpn(ctx, alpnWire)
+        val tlsConn = tlsConnect(ctx, host, port)
+        if (tlsConn < 0) {
+            mapPut(conn, "fd", 0 - 1)
+            mapPut(conn, "error", stringConcat("TLS connection failed to ", host))
+            return conn
+        }
+        mapPut(conn, "tlsConn", tlsConn)
+        mapPut(conn, "fd", 0)  // placeholder, transport uses tlsConn
+    } else {
+        // Plain TCP connect
+        val fd = tcpConnect(host, port)
+        if (fd < 0) {
+            mapPut(conn, "fd", 0 - 1)
+            mapPut(conn, "error", stringConcat("Connection failed to ", host))
+            return conn
+        }
+        mapPut(conn, "fd", fd)
+    }
+
+    mapPut(conn, "error", "")
+    mapPut(conn, "host", host)
+    mapPut(conn, "port", port)
+    mapPut(conn, "hpackEncCtx", hpackCreateContext())
+    mapPut(conn, "hpackDecCtx", hpackCreateContext())
+    mapPut(conn, "nextStreamId", 1)
+    mapPut(conn, "connSendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(conn, "connRecvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(conn, "peerMaxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "recvBuffer", "")
+
+    // Local settings map
+    val localSettings = mapCreate()
+    mapPut(localSettings, "headerTableSize", H2_DEFAULT_HEADER_TABLE_SIZE())
+    mapPut(localSettings, "enablePush", 0)
+    mapPut(localSettings, "initialWindowSize", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(localSettings, "maxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "localSettings", localSettings)
+
+    // Peer settings map (defaults until SETTINGS received)
+    val peerSettings = mapCreate()
+    mapPut(peerSettings, "headerTableSize", H2_DEFAULT_HEADER_TABLE_SIZE())
+    mapPut(peerSettings, "initialWindowSize", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(peerSettings, "maxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "peerSettings", peerSettings)
+
+    // Streams map
+    mapPut(conn, "streams", mapCreate())
+
+    // CONTINUATION reassembly state
+    mapPut(conn, "expectContinuation", false)
+    mapPut(conn, "continuationStreamId", 0)
+    mapPut(conn, "continuationBuffer", "")
+    mapPut(conn, "continuationCount", 0)
+    mapPut(conn, "continuationEndStream", false)
+    mapPut(conn, "continuationIsTrailer", false)
+
+    // Multiplexing state
+    mapPut(conn, "activeStreamCount", 0)
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+
+    // Shutdown state
+    mapPut(conn, "shuttingDown", false)
+    mapPut(conn, "goawayLastStreamId", 0)
+    mapPut(conn, "goawayErrorCode", 0)
+
+    // Settings state machine
+    mapPut(conn, "settingsState", "UNSENT")
+
+    // Send client preface
+    val preface = h2ClientPreface()
+    val sent1 = h2Send(conn, preface)
+    if (sent1 < 0) {
+        h2CloseTransport(conn)
+        mapPut(conn, "fd", 0 - 1)
+        mapPut(conn, "error", "Failed to send client preface")
+        return conn
+    }
+
+    // Send our SETTINGS frame (disable push, keep defaults otherwise)
+    val settingsParams = listCreate()
+    val pushParam = mapCreate()
+    mapPut(pushParam, "id", H2_SETTINGS_ENABLE_PUSH())
+    mapPut(pushParam, "value", 0)
+    listAppend(settingsParams, pushParam)
+    val settingsFrame = h2BuildSettingsFrame(settingsParams)
+    val sent2 = h2Send(conn, settingsFrame)
+    if (sent2 < 0) {
+        h2CloseTransport(conn)
+        mapPut(conn, "fd", 0 - 1)
+        mapPut(conn, "error", "Failed to send SETTINGS")
+        return conn
+    }
+
+    // Don't wait for server SETTINGS here. Per RFC 9113, the client MAY
+    // immediately send request frames after the preface. The server's
+    // SETTINGS will be processed during h2ProcessFrames when a request is
+    // made. This avoids a deadlock with servers (like Go's h2c handler)
+    // that wait for request data before responding.
+
+    return conn
+}
+
+// Read and process initial server frames (SETTINGS + ACK exchange)
+fun h2ReadAndProcessInitial(conn: Map): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+
+    // Read some bytes from server
+    val recvd = h2Recv(conn,4096)
+    if (stringLength(recvd) == 0) { return }
+
+    var buf: String = toString(mapGet(conn, "recvBuffer"))
+    buf = stringConcat(buf, recvd)
+    mapPut(conn, "recvBuffer", buf)
+
+    // Process frames in buffer
+    var done: Bool = false
+    while (done == false) {
+        buf = toString(mapGet(conn, "recvBuffer"))
+        if (stringLength(buf) < 9) {
+            done = true
+        } else {
+            val frameHeader = h2DecodeFrameHeader(buf, 0)
+            val frameLen = toInt(mapGet(frameHeader, "length"))
+            val totalLen = 9 + frameLen
+            if (stringLength(buf) < totalLen) {
+                done = true
+            } else {
+                val frameType = toInt(mapGet(frameHeader, "type"))
+                val flags = toInt(mapGet(frameHeader, "flags"))
+                val streamId = toInt(mapGet(frameHeader, "streamId"))
+
+                // Extract payload
+                var payload: String = ""
+                if (frameLen > 0) {
+                    payload = substring(buf, 9, totalLen)
+                }
+
+                // Consume frame from buffer
+                if (totalLen < stringLength(buf)) {
+                    mapPut(conn, "recvBuffer", substring(buf, totalLen, stringLength(buf)))
+                } else {
+                    mapPut(conn, "recvBuffer", "")
+                }
+
+                // Handle frame
+                h2DispatchFrame(conn, frameType, flags, streamId, payload)
+            }
+        }
+    }
+}
+
+// Close the HTTP/2 connection
+fun h2Close(conn: Map): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd >= 0) {
+        val lastStreamId = toInt(mapGet(conn, "nextStreamId")) - 2
+        var goawayStreamId: Int = lastStreamId
+        if (lastStreamId < 0) { goawayStreamId = 0 }
+        val goaway = h2BuildGoawayFrame(goawayStreamId, H2_NO_ERROR(), "")
+        h2Send(conn,goaway)
+        h2CloseTransport(conn)
+        mapPut(conn, "fd", 0 - 1)
+    }
+}
+
+// Return true if connection is open
+fun h2IsOpen(conn: Map): Bool {
+    val fd = toInt(mapGet(conn, "fd"))
+    return fd >= 0
+}
+
+// Return connection error message
+fun h2Error(conn: Map): String {
+    val v = mapGet(conn, "error")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+// == Frame Dispatch ===========================================================
+
+// Route a received frame to the appropriate handler
+fun h2DispatchFrame(conn: Map, frameType: Int, flags: Int, streamId: Int, payload: String): Unit {
+    // During CONTINUATION reassembly, only CONTINUATION on the same stream is allowed
+    val expectCont = mapGet(conn, "expectContinuation")
+    if (expectCont != null) {
+        if (toBool(expectCont) == true) {
+            if (frameType == H2_CONTINUATION()) {
+                h2HandleContinuation(conn, flags, streamId, payload)
+                return
+            }
+            // Protocol error: got non-CONTINUATION frame during reassembly
+            val fd = toInt(mapGet(conn, "fd"))
+            if (fd >= 0) {
+                val goaway = h2BuildGoawayFrame(0, H2_PROTOCOL_ERROR(), "expected CONTINUATION")
+                h2Send(conn,goaway)
+            }
+            return
+        }
+    }
+    if (frameType == H2_SETTINGS()) {
+        h2HandleSettings(conn, flags, payload)
+    } else { if (frameType == H2_HEADERS()) {
+        h2HandleHeaders(conn, flags, streamId, payload)
+    } else { if (frameType == H2_DATA()) {
+        h2HandleData(conn, flags, streamId, payload)
+    } else { if (frameType == H2_PING()) {
+        h2HandlePing(conn, flags, payload)
+    } else { if (frameType == H2_GOAWAY()) {
+        h2HandleGoaway(conn, payload)
+    } else { if (frameType == H2_RST_STREAM()) {
+        h2HandleRstStream(conn, streamId, payload)
+    } else { if (frameType == H2_WINDOW_UPDATE()) {
+        h2HandleWindowUpdate(conn, streamId, payload)
+    } else { if (frameType == H2_PUSH_PROMISE()) {
+        h2HandlePushPromise(conn, flags, streamId, payload)
+    } else { if (frameType == H2_PRIORITY()) {
+        h2HandlePriority(conn, streamId, payload)
+    } else { if (frameType == H2_CONTINUATION()) {
+        // Unexpected CONTINUATION (not during reassembly)
+        val fd = toInt(mapGet(conn, "fd"))
+        if (fd >= 0) {
+            val goaway = h2BuildGoawayFrame(0, H2_PROTOCOL_ERROR(), "unexpected CONTINUATION")
+            h2Send(conn,goaway)
+        }
+    } } } } } } } } } }
+}
+
+// == Frame Handlers ===========================================================
+
+// Handle SETTINGS frame
+fun h2HandleSettings(conn: Map, flags: Int, payload: String): Unit {
+    if (h2HasFlag(flags, H2_FLAG_ACK())) {
+        h2HandleSettingsAck(conn)
+        return
+    }
+    // Apply peer settings using state machine
+    h2ApplyPeerSettings(conn, payload)
+    // Send SETTINGS ACK
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd >= 0) {
+        val ackFrame = h2BuildSettingsAckFrame()
+        h2Send(conn,ackFrame)
+    }
+}
+
+// Handle HEADERS frame
+fun h2HandleHeaders(conn: Map, flags: Int, streamId: Int, payload: String): Unit {
+    val hasEndHeaders = h2HasFlag(flags, H2_FLAG_END_HEADERS())
+    val hasEndStream = h2HasFlag(flags, H2_FLAG_END_STREAM())
+
+    // Check if this is a trailer HEADERS (stream already has body data)
+    val streams = mapGet(conn, "streams")
+    val existingStream = mapGet(streams, toString(streamId))
+    var isTrailer: Bool = false
+    if (existingStream != null) {
+        val body = toString(mapGet(existingStream, "body"))
+        if (stringLength(body) > 0) {
+            isTrailer = true
+        }
+        val state = toInt(mapGet(existingStream, "state"))
+        if (state == H2_STREAM_HALF_CLOSED_LOCAL()) {
+            // We already sent END_STREAM, receiving headers after data = trailers
+            if (existingStream != null) {
+                val existingHeaders = mapGet(existingStream, "headers")
+                if (listSize(existingHeaders) > 0) {
+                    isTrailer = true
+                }
+            }
+        }
+    }
+
+    if (hasEndHeaders == false) {
+        // Start CONTINUATION reassembly
+        mapPut(conn, "expectContinuation", true)
+        mapPut(conn, "continuationStreamId", streamId)
+        mapPut(conn, "continuationBuffer", payload)
+        mapPut(conn, "continuationCount", 0)
+        mapPut(conn, "continuationEndStream", hasEndStream)
+        mapPut(conn, "continuationIsTrailer", isTrailer)
+        return
+    }
+
+    // Complete header block — decode and store
+    h2ApplyDecodedHeaders(conn, streamId, payload, hasEndStream, isTrailer)
+}
+
+// Handle CONTINUATION frame (during reassembly)
+fun h2HandleContinuation(conn: Map, flags: Int, streamId: Int, payload: String): Unit {
+    val expectedStreamId = toInt(mapGet(conn, "continuationStreamId"))
+    if (streamId != expectedStreamId) {
+        val fd = toInt(mapGet(conn, "fd"))
+        if (fd >= 0) {
+            val goaway = h2BuildGoawayFrame(0, H2_PROTOCOL_ERROR(), "CONTINUATION stream mismatch")
+            h2Send(conn,goaway)
+        }
+        return
+    }
+    // Flood protection: max 100 CONTINUATION frames
+    val count = toInt(mapGet(conn, "continuationCount")) + 1
+    if (count > 100) {
+        mapPut(conn, "expectContinuation", false)
+        val fd = toInt(mapGet(conn, "fd"))
+        if (fd >= 0) {
+            val goaway = h2BuildGoawayFrame(0, H2_ENHANCE_YOUR_CALM(), "CONTINUATION flood")
+            h2Send(conn,goaway)
+        }
+        return
+    }
+    mapPut(conn, "continuationCount", count)
+
+    // Append payload to reassembly buffer
+    val buffer = toString(mapGet(conn, "continuationBuffer"))
+    mapPut(conn, "continuationBuffer", stringConcat(buffer, payload))
+
+    if (h2HasFlag(flags, H2_FLAG_END_HEADERS())) {
+        // Reassembly complete
+        mapPut(conn, "expectContinuation", false)
+        val fullBlock = toString(mapGet(conn, "continuationBuffer"))
+        val endStream = toBool(mapGet(conn, "continuationEndStream"))
+        val isTrailer = toBool(mapGet(conn, "continuationIsTrailer"))
+        h2ApplyDecodedHeaders(conn, streamId, fullBlock, endStream, isTrailer)
+    }
+}
+
+// Apply a complete (reassembled) header block to a stream
+fun h2ApplyDecodedHeaders(conn: Map, streamId: Int, headerBlock: String, endStream: Bool, isTrailer: Bool): Unit {
+    val hpackCtx = mapGet(conn, "hpackDecCtx")
+    val headers = hpackDecode(hpackCtx, headerBlock, stringLength(headerBlock))
+
+    val streams = mapGet(conn, "streams")
+    val existingStream = mapGet(streams, toString(streamId))
+    if (existingStream == null) {
+        val newStream = mapCreate()
+        mapPut(newStream, "state", H2_STREAM_OPEN())
+        mapPut(newStream, "headers", listCreate())
+        mapPut(newStream, "body", "")
+        mapPut(newStream, "trailers", listCreate())
+        mapPut(newStream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+        mapPut(newStream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+        mapPut(streams, toString(streamId), newStream)
+    }
+    val stream = mapGet(streams, toString(streamId))
+
+    if (isTrailer) {
+        // Store as trailers
+        var existingTrailers: List = mapGet(stream, "trailers")
+        if (existingTrailers == null) {
+            existingTrailers = listCreate()
+            mapPut(stream, "trailers", existingTrailers)
+        }
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(existingTrailers, listGet(headers, i))
+            i = i + 1
+        }
+    } else {
+        // Store as response headers
+        val existingHeaders = mapGet(stream, "headers")
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(existingHeaders, listGet(headers, i))
+            i = i + 1
+        }
+    }
+
+    if (endStream) {
+        mapPut(stream, "state", H2_STREAM_HALF_CLOSED_REMOTE())
+    }
+}
+
+// Handle DATA frame
+fun h2HandleData(conn: Map, flags: Int, streamId: Int, payload: String): Unit {
+    val streams = mapGet(conn, "streams")
+    val existingStream = mapGet(streams, toString(streamId))
+    if (existingStream == null) {
+        val newStream = mapCreate()
+        mapPut(newStream, "state", H2_STREAM_OPEN())
+        mapPut(newStream, "headers", listCreate())
+        mapPut(newStream, "body", "")
+        mapPut(newStream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+        mapPut(newStream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+        mapPut(streams, toString(streamId), newStream)
+    }
+    val stream = mapGet(streams, toString(streamId))
+
+    // Append data to body
+    val existingBody = toString(mapGet(stream, "body"))
+    mapPut(stream, "body", stringConcat(existingBody, payload))
+
+    // Update flow control (skip if END_STREAM — no more data will arrive)
+    val isEndStream = h2HasFlag(flags, H2_FLAG_END_STREAM())
+    val payloadLen = stringLength(payload)
+    if (payloadLen > 0) {
+        if (isEndStream == false) {
+            // Send WINDOW_UPDATE for connection
+            val connUpdate = h2BuildWindowUpdateFrame(0, payloadLen)
+            val fd = toInt(mapGet(conn, "fd"))
+            if (fd >= 0) {
+                h2Send(conn,connUpdate)
+            }
+            // Send WINDOW_UPDATE for stream
+            val streamUpdate = h2BuildWindowUpdateFrame(streamId, payloadLen)
+            if (fd >= 0) {
+                h2Send(conn,streamUpdate)
+            }
+        }
+    }
+
+    if (isEndStream) {
+        mapPut(stream, "state", H2_STREAM_HALF_CLOSED_REMOTE())
+    }
+}
+
+// Handle PING frame
+fun h2HandlePing(conn: Map, flags: Int, payload: String): Unit {
+    if (h2HasFlag(flags, H2_FLAG_ACK())) {
+        return
+    }
+    // Reply with PING ACK
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd >= 0) {
+        val pong = h2BuildPingFrame(payload, true)
+        h2Send(conn,pong)
+    }
+}
+
+// Handle GOAWAY frame
+fun h2HandleGoaway(conn: Map, payload: String): Unit {
+    if (stringLength(payload) >= 8) {
+        val lastStreamId = h2And31(h2DecodeUint32(payload, 0))
+        val errorCode = h2DecodeUint32(payload, 4)
+        mapPut(conn, "shuttingDown", true)
+        mapPut(conn, "goawayLastStreamId", lastStreamId)
+        mapPut(conn, "goawayErrorCode", errorCode)
+        mapPut(conn, "error", stringConcat("GOAWAY received, error=", toString(errorCode)))
+    }
+}
+
+// Handle RST_STREAM frame
+fun h2HandleRstStream(conn: Map, streamId: Int, payload: String): Unit {
+    if (stringLength(payload) >= 4) {
+        val errorCode = h2DecodeUint32(payload, 0)
+        val streams = mapGet(conn, "streams")
+        val stream = mapGet(streams, toString(streamId))
+        if (stream != null) {
+            mapPut(stream, "state", H2_STREAM_CLOSED_STATE())
+            mapPut(stream, "error", stringConcat("RST_STREAM error=", toString(errorCode)))
+        }
+    }
+}
+
+// Handle WINDOW_UPDATE frame
+fun h2HandleWindowUpdate(conn: Map, streamId: Int, payload: String): Unit {
+    if (stringLength(payload) >= 4) {
+        val increment = h2And31(h2DecodeUint32(payload, 0))
+        // Zero increment is a protocol error (RFC 9113 Section 6.9.1)
+        if (increment == 0) {
+            val fd = toInt(mapGet(conn, "fd"))
+            if (fd >= 0) {
+                if (streamId == 0) {
+                    val goaway = h2BuildGoawayFrame(0, H2_PROTOCOL_ERROR(), "zero window increment")
+                    h2Send(conn,goaway)
+                } else {
+                    val rst = h2BuildRstStreamFrame(streamId, H2_PROTOCOL_ERROR())
+                    h2Send(conn,rst)
+                }
+            }
+            return
+        }
+        if (streamId == 0) {
+            // Connection-level window update
+            val current = toInt(mapGet(conn, "connSendWindow"))
+            val newWindow = current + increment
+            // Overflow check: window must not exceed 2^31 - 1
+            if (newWindow > 2147483647) {
+                val fd = toInt(mapGet(conn, "fd"))
+                if (fd >= 0) {
+                    val goaway = h2BuildGoawayFrame(0, H2_FLOW_CONTROL_ERROR(), "window overflow")
+                    h2Send(conn,goaway)
+                }
+                return
+            }
+            mapPut(conn, "connSendWindow", newWindow)
+        } else {
+            val streams = mapGet(conn, "streams")
+            val stream = mapGet(streams, toString(streamId))
+            if (stream != null) {
+                val current = toInt(mapGet(stream, "sendWindow"))
+                val newWindow = current + increment
+                if (newWindow > 2147483647) {
+                    val fd = toInt(mapGet(conn, "fd"))
+                    if (fd >= 0) {
+                        val rst = h2BuildRstStreamFrame(streamId, H2_FLOW_CONTROL_ERROR())
+                        h2Send(conn,rst)
+                    }
+                    return
+                }
+                mapPut(stream, "sendWindow", newWindow)
+            }
+        }
+    }
+}
+
+// Handle PUSH_PROMISE frame (client-side)
+fun h2HandlePushPromise(conn: Map, flags: Int, streamId: Int, payload: String): Unit {
+    if (stringLength(payload) < 4) { return }
+    val promisedStreamId = h2And31(h2DecodeUint32(payload, 0))
+    val headerBlock = substring(payload, 4, stringLength(payload))
+    val hpackCtx = mapGet(conn, "hpackDecCtx")
+    val headers = hpackDecode(hpackCtx, headerBlock, stringLength(headerBlock))
+
+    // Create stream for the promised resource
+    val streams = mapGet(conn, "streams")
+    val stream = mapCreate()
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+    mapPut(stream, "headers", listCreate())
+    mapPut(stream, "body", "")
+    mapPut(stream, "trailers", listCreate())
+    mapPut(stream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(stream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(stream, "promisedHeaders", headers)
+    mapPut(stream, "parentStreamId", streamId)
+    mapPut(streams, toString(promisedStreamId), stream)
+}
+
+// Handle PRIORITY frame (Section 6.3) — deprecated in RFC 9113, acknowledge and ignore
+fun h2HandlePriority(conn: Map, streamId: Int, payload: String): Unit {
+    // Parse but ignore priority information (deprecated)
+}
+
+// == Flow Control Helpers =====================================================
+
+// Send data with flow control, splitting into chunks that fit the send window
+fun h2SendData(conn: Map, streamId: Int, data: String, endStream: Bool): Int {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+    val maxFrameSize = toInt(mapGet(conn, "peerMaxFrameSize"))
+    val dataLen = stringLength(data)
+    if (dataLen == 0) {
+        if (endStream) {
+            val frame = h2BuildDataFrame(streamId, "", true)
+            return h2Send(conn,frame)
+        }
+        return 0
+    }
+    var offset: Int = 0
+    while (offset < dataLen) {
+        // Determine chunk size: min of remaining, connSendWindow, streamSendWindow, maxFrameSize
+        var connWindow: Int = toInt(mapGet(conn, "connSendWindow"))
+        val streams = mapGet(conn, "streams")
+        val stream = mapGet(streams, toString(streamId))
+        var streamWindow: Int = maxFrameSize
+        if (stream != null) {
+            streamWindow = toInt(mapGet(stream, "sendWindow"))
+        }
+        var chunkSize: Int = dataLen - offset
+        if (chunkSize > maxFrameSize) { chunkSize = maxFrameSize }
+        if (chunkSize > connWindow) { chunkSize = connWindow }
+        if (chunkSize > streamWindow) { chunkSize = streamWindow }
+        if (chunkSize <= 0) {
+            // Window exhausted — wait for WINDOW_UPDATE by reading frames
+            h2WaitForSendWindow(conn, streamId, 1)
+            connWindow = toInt(mapGet(conn, "connSendWindow"))
+            if (connWindow <= 0) {
+                return 0 - 1
+            }
+            chunkSize = dataLen - offset
+            if (chunkSize > maxFrameSize) { chunkSize = maxFrameSize }
+            if (chunkSize > connWindow) { chunkSize = connWindow }
+            if (stream != null) {
+                streamWindow = toInt(mapGet(stream, "sendWindow"))
+                if (chunkSize > streamWindow) { chunkSize = streamWindow }
+            }
+            if (chunkSize <= 0) { return 0 - 1 }
+        }
+        val chunkEnd = offset + chunkSize
+        val chunk = substring(data, offset, chunkEnd)
+        val isLast = chunkEnd >= dataLen
+        val es = isLast == true
+        var sendEndStream: Bool = false
+        if (es) { if (endStream) { sendEndStream = true } }
+        val frame = h2BuildDataFrame(streamId, chunk, sendEndStream)
+        val sent = h2Send(conn,frame)
+        if (sent < 0) { return sent }
+        // Update send windows
+        mapPut(conn, "connSendWindow", toInt(mapGet(conn, "connSendWindow")) - chunkSize)
+        if (stream != null) {
+            mapPut(stream, "sendWindow", toInt(mapGet(stream, "sendWindow")) - chunkSize)
+        }
+        offset = chunkEnd
+    }
+    return 1
+}
+
+// Wait for send window to open by reading frames (up to 50 iterations)
+fun h2WaitForSendWindow(conn: Map, streamId: Int, needed: Int): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+    var attempts: Int = 0
+    while (attempts < 50) {
+        val connWindow = toInt(mapGet(conn, "connSendWindow"))
+        if (connWindow >= needed) { return }
+        val chunk = h2Recv(conn,16384)
+        if (stringLength(chunk) == 0) { return }
+        var buf: String = toString(mapGet(conn, "recvBuffer"))
+        buf = stringConcat(buf, chunk)
+        mapPut(conn, "recvBuffer", buf)
+        // Process frames
+        var framesDone: Bool = false
+        while (framesDone == false) {
+            buf = toString(mapGet(conn, "recvBuffer"))
+            if (stringLength(buf) < 9) {
+                framesDone = true
+            } else {
+                val fh = h2DecodeFrameHeader(buf, 0)
+                val frameLen = toInt(mapGet(fh, "length"))
+                val totalLen = 9 + frameLen
+                if (stringLength(buf) < totalLen) {
+                    framesDone = true
+                } else {
+                    val fType = toInt(mapGet(fh, "type"))
+                    val fFlags = toInt(mapGet(fh, "flags"))
+                    val fStreamId = toInt(mapGet(fh, "streamId"))
+                    var fPayload: String = ""
+                    if (frameLen > 0) {
+                        fPayload = substring(buf, 9, totalLen)
+                    }
+                    if (totalLen < stringLength(buf)) {
+                        mapPut(conn, "recvBuffer", substring(buf, totalLen, stringLength(buf)))
+                    } else {
+                        mapPut(conn, "recvBuffer", "")
+                    }
+                    h2DispatchFrame(conn, fType, fFlags, fStreamId, fPayload)
+                }
+            }
+        }
+        attempts = attempts + 1
+    }
+}
+
+// Send batched WINDOW_UPDATE when receive window drops below 50% threshold
+fun h2MaybeSendWindowUpdate(conn: Map, streamId: Int): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+    val defaultWindow = H2_DEFAULT_INITIAL_WINDOW_SIZE()
+    val threshold = defaultWindow / 2
+    if (streamId == 0) {
+        val recvWindow = toInt(mapGet(conn, "connRecvWindow"))
+        if (recvWindow < threshold) {
+            val increment = defaultWindow - recvWindow
+            val frame = h2BuildWindowUpdateFrame(0, increment)
+            h2Send(conn,frame)
+            mapPut(conn, "connRecvWindow", defaultWindow)
+        }
+    } else {
+        val streams = mapGet(conn, "streams")
+        val stream = mapGet(streams, toString(streamId))
+        if (stream != null) {
+            val recvWindow = toInt(mapGet(stream, "recvWindow"))
+            if (recvWindow < threshold) {
+                val increment = defaultWindow - recvWindow
+                val frame = h2BuildWindowUpdateFrame(streamId, increment)
+                h2Send(conn,frame)
+                mapPut(stream, "recvWindow", defaultWindow)
+            }
+        }
+    }
+}
+
+// == Settings State Machine ===================================================
+
+// Apply peer settings from a SETTINGS payload
+fun h2ApplyPeerSettings(conn: Map, payload: String): Unit {
+    val payloadLen = stringLength(payload)
+    var pos: Int = 0
+    while (pos + 5 < payloadLen) {
+        val id = h2DecodeUint16(payload, pos)
+        val value = h2DecodeUint32(payload, pos + 2)
+        pos = pos + 6
+
+        val peerSettings = mapGet(conn, "peerSettings")
+        if (id == H2_SETTINGS_HEADER_TABLE_SIZE()) {
+            mapPut(peerSettings, "headerTableSize", value)
+        } else { if (id == H2_SETTINGS_ENABLE_PUSH()) {
+            mapPut(peerSettings, "enablePush", value)
+        } else { if (id == H2_SETTINGS_MAX_CONCURRENT_STREAMS()) {
+            mapPut(conn, "peerMaxConcurrentStreams", value)
+        } else { if (id == H2_SETTINGS_INITIAL_WINDOW_SIZE()) {
+            // Adjust all open stream windows by the delta
+            val oldInitial = toInt(mapGet(peerSettings, "initialWindowSize"))
+            val delta = value - oldInitial
+            mapPut(peerSettings, "initialWindowSize", value)
+            val streams = mapGet(conn, "streams")
+            val streamKeys = mapKeys(streams)
+            var i: Int = 0
+            while (i < listSize(streamKeys)) {
+                val key = toString(listGet(streamKeys, i))
+                val stream = mapGet(streams, key)
+                if (stream != null) {
+                    val state = toInt(mapGet(stream, "state"))
+                    if (state != H2_STREAM_CLOSED_STATE()) {
+                        val current = toInt(mapGet(stream, "sendWindow"))
+                        mapPut(stream, "sendWindow", current + delta)
+                    }
+                }
+                i = i + 1
+            }
+        } else { if (id == H2_SETTINGS_MAX_FRAME_SIZE()) {
+            mapPut(peerSettings, "maxFrameSize", value)
+            mapPut(conn, "peerMaxFrameSize", value)
+        } else { if (id == H2_SETTINGS_MAX_HEADER_LIST_SIZE()) {
+            mapPut(peerSettings, "maxHeaderListSize", value)
+        } } } } } }
+    }
+}
+
+// Handle SETTINGS ACK — apply pending local settings
+fun h2HandleSettingsAck(conn: Map): Unit {
+    mapPut(conn, "settingsState", "ACKED")
+}
+
+// == Error Classification =====================================================
+
+// Return true if response has an I/O error (connection-level failure)
+fun h2IsIoError(resp: Map): Bool {
+    val err = mapGet(resp, "error")
+    if (err == null) { return false }
+    val msg = toString(err)
+    if (stringLength(msg) == 0) { return false }
+    // I/O errors are connection failures, not protocol-level
+    if (msg == "Connection not open") { return true }
+    if (msg == "Failed to send HEADERS") { return true }
+    if (msg == "Failed to send DATA") { return true }
+    val prefix7 = substring(msg, 0, 7)
+    if (prefix7 == "Connect") { return true }
+    if (prefix7 == "Failed ") { return true }
+    return false
+}
+
+// Return true if response has a RST_STREAM error
+fun h2IsResetError(resp: Map): Bool {
+    val err = mapGet(resp, "error")
+    if (err == null) { return false }
+    val msg = toString(err)
+    if (stringLength(msg) >= 10) {
+        val prefix = substring(msg, 0, 10)
+        if (prefix == "RST_STREAM") { return true }
+    }
+    return false
+}
+
+// Return true if response has a GOAWAY error
+fun h2IsGoawayError(resp: Map): Bool {
+    val err = mapGet(resp, "error")
+    if (err == null) { return false }
+    val msg = toString(err)
+    if (stringLength(msg) >= 6) {
+        val prefix = substring(msg, 0, 6)
+        if (prefix == "GOAWAY") { return true }
+    }
+    return false
+}
+
+// Extract the error code from a response error message
+fun h2ErrorReasonCode(resp: Map): Int {
+    val err = mapGet(resp, "error")
+    if (err == null) { return 0 - 1 }
+    val msg = toString(err)
+    // Look for "error=" pattern
+    var i: Int = 0
+    val msgLen = stringLength(msg)
+    while (i < msgLen) {
+        if (i + 6 <= msgLen) {
+            val chunk = substring(msg, i, i + 6)
+            if (chunk == "error=") {
+                val numStr = substring(msg, i + 6, msgLen)
+                return toInt(numStr)
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// == Frame I/O ================================================================
+
+// Read and process frames until the target stream is complete
+fun h2ProcessFrames(conn: Map, targetStreamId: Int): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+
+    var done: Bool = false
+    var iterations: Int = 0
+    while (done == false) {
+        if (iterations > 200) {
+            done = true
+        } else {
+            // Check if target stream is done
+            val streams = mapGet(conn, "streams")
+            val stream = mapGet(streams, toString(targetStreamId))
+            if (stream != null) {
+                val state = toInt(mapGet(stream, "state"))
+                if (state == H2_STREAM_HALF_CLOSED_REMOTE()) { done = true }
+                if (state == H2_STREAM_CLOSED_STATE()) { done = true }
+            }
+
+            if (done == false) {
+                // Try to read more data
+                var buf: String = toString(mapGet(conn, "recvBuffer"))
+                val chunk = h2Recv(conn,16384)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    buf = stringConcat(buf, chunk)
+                    mapPut(conn, "recvBuffer", buf)
+
+                    // Process all complete frames in buffer
+                    var framesDone: Bool = false
+                    while (framesDone == false) {
+                        buf = toString(mapGet(conn, "recvBuffer"))
+                        if (stringLength(buf) < 9) {
+                            framesDone = true
+                        } else {
+                            val fh = h2DecodeFrameHeader(buf, 0)
+                            val frameLen = toInt(mapGet(fh, "length"))
+                            val totalLen = 9 + frameLen
+                            if (stringLength(buf) < totalLen) {
+                                framesDone = true
+                            } else {
+                                val fType = toInt(mapGet(fh, "type"))
+                                val fFlags = toInt(mapGet(fh, "flags"))
+                                val fStreamId = toInt(mapGet(fh, "streamId"))
+                                var fPayload: String = ""
+                                if (frameLen > 0) {
+                                    fPayload = substring(buf, 9, totalLen)
+                                }
+                                if (totalLen < stringLength(buf)) {
+                                    mapPut(conn, "recvBuffer", substring(buf, totalLen, stringLength(buf)))
+                                } else {
+                                    mapPut(conn, "recvBuffer", "")
+                                }
+                                h2DispatchFrame(conn, fType, fFlags, fStreamId, fPayload)
+                            }
+                        }
+                    }
+                }
+            }
+            iterations = iterations + 1
+        }
+    }
+}
+
+// == Request API ==============================================================
+
+// Build the pseudo-header list for a request
+fun h2BuildRequestHeaders(method: String, path: String, authority: String, headers: Map): List {
+    val headerList = listCreate()
+
+    // Pseudo-headers first (required order per RFC 9113 Section 8.3.1)
+    val mHeader = mapCreate()
+    mapPut(mHeader, "name", ":method")
+    mapPut(mHeader, "value", method)
+    listAppend(headerList, mHeader)
+
+    val sHeader = mapCreate()
+    mapPut(sHeader, "name", ":scheme")
+    mapPut(sHeader, "value", "http")
+    listAppend(headerList, sHeader)
+
+    val aHeader = mapCreate()
+    mapPut(aHeader, "name", ":authority")
+    mapPut(aHeader, "value", authority)
+    listAppend(headerList, aHeader)
+
+    val pHeader = mapCreate()
+    mapPut(pHeader, "name", ":path")
+    mapPut(pHeader, "value", path)
+    listAppend(headerList, pHeader)
+
+    // Regular headers
+    if (headers != null) {
+        val keys = mapKeys(headers)
+        var i: Int = 0
+        while (i < listSize(keys)) {
+            val k = toString(listGet(keys, i))
+            val v = toString(mapGet(headers, k))
+            val h = mapCreate()
+            mapPut(h, "name", k)
+            mapPut(h, "value", v)
+            listAppend(headerList, h)
+            i = i + 1
+        }
+    }
+
+    return headerList
+}
+
+// Send a request and receive the response
+fun h2Request(conn: Map, method: String, path: String, headers: Map, body: String): Map {
+    val result = mapCreate()
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) {
+        mapPut(result, "error", "Connection not open")
+        return result
+    }
+
+    // Allocate stream ID (client uses odd numbers)
+    val streamId = toInt(mapGet(conn, "nextStreamId"))
+    mapPut(conn, "nextStreamId", streamId + 2)
+
+    // Create stream state
+    val streams = mapGet(conn, "streams")
+    val stream = mapCreate()
+    mapPut(stream, "state", H2_STREAM_OPEN())
+    mapPut(stream, "headers", listCreate())
+    mapPut(stream, "body", "")
+    mapPut(stream, "trailers", listCreate())
+    mapPut(stream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(stream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(streams, toString(streamId), stream)
+
+    // Track active streams
+    val activeCount = toInt(mapGet(conn, "activeStreamCount"))
+    mapPut(conn, "activeStreamCount", activeCount + 1)
+
+    // Build authority
+    val host = toString(mapGet(conn, "host"))
+    val port = toInt(mapGet(conn, "port"))
+    var authority: String = host
+    if (port != 80) {
+        if (port != 443) {
+            authority = stringConcat(host, stringConcat(":", toString(port)))
+        }
+    }
+
+    // Build and encode headers
+    val headerList = h2BuildRequestHeaders(method, path, authority, headers)
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+
+    val hasBody = stringLength(body) > 0
+    val endStream = hasBody == false
+
+    // Send HEADERS (auto-splitting via CONTINUATION if needed)
+    val sent1 = h2SendHeaderBlock(conn, streamId, headerBlock, endStream)
+    if (sent1 < 0) {
+        mapPut(result, "error", "Failed to send HEADERS")
+        return result
+    }
+
+    // Send DATA with flow control if body present
+    if (hasBody) {
+        val sent2 = h2SendData(conn, streamId, body, true)
+        if (sent2 < 0) {
+            mapPut(result, "error", "Failed to send DATA")
+            return result
+        }
+    }
+
+    // Mark stream as half-closed local
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+
+    // Process response frames
+    h2ProcessFrames(conn, streamId)
+
+    // Build response from stream state
+    val respHeaders = mapGet(stream, "headers")
+    mapPut(result, "headers", respHeaders)
+    mapPut(result, "body", toString(mapGet(stream, "body")))
+
+    // Include trailers if present
+    val trailers = mapGet(stream, "trailers")
+    if (trailers != null) {
+        mapPut(result, "trailers", trailers)
+    }
+
+    // Extract status from :status pseudo-header
+    var status: Int = 0
+    var i: Int = 0
+    while (i < listSize(respHeaders)) {
+        val h = listGet(respHeaders, i)
+        val name = toString(mapGet(h, "name"))
+        if (name == ":status") {
+            status = toInt(mapGet(h, "value"))
+        }
+        i = i + 1
+    }
+    mapPut(result, "status", status)
+
+    val streamErr = mapGet(stream, "error")
+    if (streamErr != null) {
+        mapPut(result, "error", toString(streamErr))
+    } else {
+        mapPut(result, "error", "")
+    }
+
+    // Decrement active stream count
+    val newActiveCount = toInt(mapGet(conn, "activeStreamCount"))
+    if (newActiveCount > 0) {
+        mapPut(conn, "activeStreamCount", newActiveCount - 1)
+    }
+
+    return result
+}
+
+// == Response Accessors =======================================================
+
+// Return the HTTP status code from a response
+fun h2ResponseStatus(resp: Map): Int {
+    val v = mapGet(resp, "status")
+    if (v == null) { return 0 }
+    return toInt(v)
+}
+
+// Return the response body
+fun h2ResponseBody(resp: Map): String {
+    val v = mapGet(resp, "body")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+// Return a specific header value from the response
+fun h2ResponseHeader(resp: Map, name: String): String {
+    val headers = mapGet(resp, "headers")
+    if (headers == null) { return "" }
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val h = listGet(headers, i)
+        val hName = toString(mapGet(h, "name"))
+        if (hName == name) {
+            return toString(mapGet(h, "value"))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Return true if the response is an error
+fun h2IsError(resp: Map): Bool {
+    val v = mapGet(resp, "error")
+    if (v == null) { return false }
+    val msg = toString(v)
+    return stringLength(msg) > 0
+}
+
+// Return the error message
+fun h2ErrorMessage(resp: Map): String {
+    val v = mapGet(resp, "error")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+// == Convenience Methods ======================================================
+
+// Send a GET request
+fun h2Get(conn: Map, path: String): Map {
+    val headers = mapCreate()
+    return h2Request(conn, "GET", path, headers, "")
+}
+
+// Send a POST request with body and content type
+fun h2Post(conn: Map, path: String, body: String, contentType: String): Map {
+    val headers = mapCreate()
+    mapPut(headers, "content-type", contentType)
+    mapPut(headers, "content-length", toString(stringLength(body)))
+    return h2Request(conn, "POST", path, headers, body)
+}
+
+// Send a PUT request with body and content type
+fun h2Put(conn: Map, path: String, body: String, contentType: String): Map {
+    val headers = mapCreate()
+    mapPut(headers, "content-type", contentType)
+    mapPut(headers, "content-length", toString(stringLength(body)))
+    return h2Request(conn, "PUT", path, headers, body)
+}
+
+// Send a DELETE request
+fun h2Delete(conn: Map, path: String): Map {
+    val headers = mapCreate()
+    return h2Request(conn, "DELETE", path, headers, "")
+}
+
+// == Concurrent Stream Multiplexing ===========================================
+
+// Send a request without waiting for response, return the stream ID
+fun h2SendRequestAsync(conn: Map, method: String, path: String, headers: Map, body: String): Int {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+
+    val streamId = toInt(mapGet(conn, "nextStreamId"))
+    mapPut(conn, "nextStreamId", streamId + 2)
+
+    val streams = mapGet(conn, "streams")
+    val stream = mapCreate()
+    mapPut(stream, "state", H2_STREAM_OPEN())
+    mapPut(stream, "headers", listCreate())
+    mapPut(stream, "body", "")
+    mapPut(stream, "trailers", listCreate())
+    mapPut(stream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(stream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(streams, toString(streamId), stream)
+
+    val activeCount = toInt(mapGet(conn, "activeStreamCount"))
+    mapPut(conn, "activeStreamCount", activeCount + 1)
+
+    val host = toString(mapGet(conn, "host"))
+    val port = toInt(mapGet(conn, "port"))
+    var authority: String = host
+    if (port != 80) {
+        if (port != 443) {
+            authority = stringConcat(host, stringConcat(":", toString(port)))
+        }
+    }
+
+    val headerList = h2BuildRequestHeaders(method, path, authority, headers)
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+
+    val hasBody = stringLength(body) > 0
+    val endStream = hasBody == false
+
+    val sent1 = h2SendHeaderBlock(conn, streamId, headerBlock, endStream)
+    if (sent1 < 0) { return 0 - 1 }
+
+    if (hasBody) {
+        val sent2 = h2SendData(conn, streamId, body, true)
+        if (sent2 < 0) { return 0 - 1 }
+    }
+
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+    return streamId
+}
+
+// Collect a response for a single stream (read frames until it completes)
+fun h2CollectResponse(conn: Map, streamId: Int): Map {
+    h2ProcessFrames(conn, streamId)
+    return h2BuildResponseFromStream(conn, streamId)
+}
+
+// Read frames until all given streams are complete, return list of responses
+fun h2CollectResponses(conn: Map, streamIds: List): List {
+    val results = listCreate()
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) {
+        var i: Int = 0
+        while (i < listSize(streamIds)) {
+            val errResp = mapCreate()
+            mapPut(errResp, "error", "Connection not open")
+            listAppend(results, errResp)
+            i = i + 1
+        }
+        return results
+    }
+
+    // Read frames until all streams complete
+    h2ProcessFramesMulti(conn, streamIds)
+
+    // Build responses
+    var i: Int = 0
+    while (i < listSize(streamIds)) {
+        val sid = toInt(listGet(streamIds, i))
+        listAppend(results, h2BuildResponseFromStream(conn, sid))
+        i = i + 1
+    }
+    return results
+}
+
+// Read frames until any one of the target streams completes
+fun h2CollectAnyResponse(conn: Map, streamIds: List): Map {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) {
+        val errResp = mapCreate()
+        mapPut(errResp, "error", "Connection not open")
+        return errResp
+    }
+
+    var done: Bool = false
+    var iterations: Int = 0
+    var completedStreamId: Int = 0 - 1
+    while (done == false) {
+        if (iterations > 500) { done = true }
+        if (done == false) {
+            // Check if any target stream is done
+            var j: Int = 0
+            while (j < listSize(streamIds)) {
+                val sid = toInt(listGet(streamIds, j))
+                val streams = mapGet(conn, "streams")
+                val stream = mapGet(streams, toString(sid))
+                if (stream != null) {
+                    val state = toInt(mapGet(stream, "state"))
+                    if (state == H2_STREAM_HALF_CLOSED_REMOTE()) {
+                        completedStreamId = sid
+                        done = true
+                    }
+                    if (state == H2_STREAM_CLOSED_STATE()) {
+                        completedStreamId = sid
+                        done = true
+                    }
+                }
+                j = j + 1
+            }
+            if (done == false) {
+                val chunk = h2Recv(conn,16384)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    var buf: String = toString(mapGet(conn, "recvBuffer"))
+                    buf = stringConcat(buf, chunk)
+                    mapPut(conn, "recvBuffer", buf)
+                    h2ProcessBufferedFrames(conn)
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+    if (completedStreamId >= 0) {
+        return h2BuildResponseFromStream(conn, completedStreamId)
+    }
+    val errResp = mapCreate()
+    mapPut(errResp, "error", "No stream completed")
+    return errResp
+}
+
+// Multi-target frame processing: read until all target streams complete
+fun h2ProcessFramesMulti(conn: Map, targetStreamIds: List): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+
+    var done: Bool = false
+    var iterations: Int = 0
+    while (done == false) {
+        if (iterations > 500) { done = true }
+        if (done == false) {
+            // Check if all target streams are done
+            var allDone: Bool = true
+            var j: Int = 0
+            while (j < listSize(targetStreamIds)) {
+                val sid = toInt(listGet(targetStreamIds, j))
+                val streams = mapGet(conn, "streams")
+                val stream = mapGet(streams, toString(sid))
+                if (stream != null) {
+                    val state = toInt(mapGet(stream, "state"))
+                    if (state != H2_STREAM_HALF_CLOSED_REMOTE()) {
+                        if (state != H2_STREAM_CLOSED_STATE()) {
+                            allDone = false
+                        }
+                    }
+                } else {
+                    allDone = false
+                }
+                j = j + 1
+            }
+            if (allDone) {
+                done = true
+            } else {
+                val chunk = h2Recv(conn,16384)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    var buf: String = toString(mapGet(conn, "recvBuffer"))
+                    buf = stringConcat(buf, chunk)
+                    mapPut(conn, "recvBuffer", buf)
+                    h2ProcessBufferedFrames(conn)
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+}
+
+// Process all complete frames currently in the receive buffer
+fun h2ProcessBufferedFrames(conn: Map): Unit {
+    var framesDone: Bool = false
+    while (framesDone == false) {
+        val buf = toString(mapGet(conn, "recvBuffer"))
+        if (stringLength(buf) < 9) {
+            framesDone = true
+        } else {
+            val fh = h2DecodeFrameHeader(buf, 0)
+            val frameLen = toInt(mapGet(fh, "length"))
+            val totalLen = 9 + frameLen
+            if (stringLength(buf) < totalLen) {
+                framesDone = true
+            } else {
+                val fType = toInt(mapGet(fh, "type"))
+                val fFlags = toInt(mapGet(fh, "flags"))
+                val fStreamId = toInt(mapGet(fh, "streamId"))
+                var fPayload: String = ""
+                if (frameLen > 0) {
+                    fPayload = substring(buf, 9, totalLen)
+                }
+                if (totalLen < stringLength(buf)) {
+                    mapPut(conn, "recvBuffer", substring(buf, totalLen, stringLength(buf)))
+                } else {
+                    mapPut(conn, "recvBuffer", "")
+                }
+                h2DispatchFrame(conn, fType, fFlags, fStreamId, fPayload)
+            }
+        }
+    }
+}
+
+// Build a response map from a stream's state
+fun h2BuildResponseFromStream(conn: Map, streamId: Int): Map {
+    val result = mapCreate()
+    val streams = mapGet(conn, "streams")
+    val stream = mapGet(streams, toString(streamId))
+    if (stream == null) {
+        mapPut(result, "error", "Stream not found")
+        return result
+    }
+    val respHeaders = mapGet(stream, "headers")
+    mapPut(result, "headers", respHeaders)
+    mapPut(result, "body", toString(mapGet(stream, "body")))
+    mapPut(result, "streamId", streamId)
+
+    val trailers = mapGet(stream, "trailers")
+    if (trailers != null) {
+        mapPut(result, "trailers", trailers)
+    }
+
+    var status: Int = 0
+    var i: Int = 0
+    while (i < listSize(respHeaders)) {
+        val h = listGet(respHeaders, i)
+        val hName = toString(mapGet(h, "name"))
+        if (hName == ":status") {
+            status = toInt(mapGet(h, "value"))
+        }
+        i = i + 1
+    }
+    mapPut(result, "status", status)
+
+    val streamErr = mapGet(stream, "error")
+    if (streamErr != null) {
+        mapPut(result, "error", toString(streamErr))
+    } else {
+        mapPut(result, "error", "")
+    }
+    return result
+}
+
+// Check if we can open another stream (MAX_CONCURRENT_STREAMS)
+fun h2CanOpenStream(conn: Map): Bool {
+    val active = toInt(mapGet(conn, "activeStreamCount"))
+    val maxConcurrent = toInt(mapGet(conn, "peerMaxConcurrentStreams"))
+    return active < maxConcurrent
+}
+
+// Return the number of active streams
+fun h2ActiveStreamCount(conn: Map): Int {
+    return toInt(mapGet(conn, "activeStreamCount"))
+}
+
+// Clean up closed streams to prevent memory leaks
+fun h2CleanupClosedStreams(conn: Map): Unit {
+    val streams = mapGet(conn, "streams")
+    val keys = mapKeys(streams)
+    var toRemove: List = listCreate()
+    var i: Int = 0
+    while (i < listSize(keys)) {
+        val key = toString(listGet(keys, i))
+        val stream = mapGet(streams, key)
+        if (stream != null) {
+            val state = toInt(mapGet(stream, "state"))
+            if (state == H2_STREAM_CLOSED_STATE()) {
+                listAppend(toRemove, key)
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while (i < listSize(toRemove)) {
+        val key = toString(listGet(toRemove, i))
+        mapRemove(streams, key)
+        i = i + 1
+    }
+}
+
+// Batch GET: send multiple GET requests concurrently
+fun h2GetMultiple(conn: Map, paths: List): List {
+    val streamIds = listCreate()
+    var i: Int = 0
+    while (i < listSize(paths)) {
+        val path = toString(listGet(paths, i))
+        val headers = mapCreate()
+        val sid = h2SendRequestAsync(conn, "GET", path, headers, "")
+        listAppend(streamIds, sid)
+        i = i + 1
+    }
+    return h2CollectResponses(conn, streamIds)
+}
+
+// Batch request: send multiple requests concurrently
+// Each request is a map with "method", "path", "headers" (optional), "body" (optional)
+fun h2RequestMultiple(conn: Map, requests: List): List {
+    val streamIds = listCreate()
+    var i: Int = 0
+    while (i < listSize(requests)) {
+        val req = listGet(requests, i)
+        val method = toString(mapGet(req, "method"))
+        val path = toString(mapGet(req, "path"))
+        var headers: Map = mapGet(req, "headers")
+        if (headers == null) { headers = mapCreate() }
+        var body: String = ""
+        val bodyVal = mapGet(req, "body")
+        if (bodyVal != null) { body = toString(bodyVal) }
+        val sid = h2SendRequestAsync(conn, method, path, headers, body)
+        listAppend(streamIds, sid)
+        i = i + 1
+    }
+    return h2CollectResponses(conn, streamIds)
+}
+
+// == Server-Side API ==========================================================
+// Note: Server-side functions require runtime builtins tcpListen and tcpAccept.
+// These are stubs that will work once the runtime builtins are available.
+
+// Create a server listening on the given port
+fun h2Listen(port: Int): Map {
+    val server = mapCreate()
+    val fd = tcpListen(port, 128)
+    mapPut(server, "fd", fd)
+    mapPut(server, "port", port)
+    mapPut(server, "running", fd >= 0)
+    mapPut(server, "error", "")
+    if (fd < 0) {
+        mapPut(server, "error", "Failed to listen")
+    }
+    return server
+}
+
+// Accept a new client connection and perform server-side handshake
+fun h2Accept(server: Map): Map {
+    val serverFd = toInt(mapGet(server, "fd"))
+    val clientFd = tcpAccept(serverFd)
+    val conn = mapCreate()
+    if (clientFd < 0) {
+        mapPut(conn, "fd", 0 - 1)
+        mapPut(conn, "error", "Accept failed")
+        return conn
+    }
+    mapPut(conn, "fd", clientFd)
+    mapPut(conn, "error", "")
+    mapPut(conn, "isServer", true)
+    mapPut(conn, "hpackEncCtx", hpackCreateContext())
+    mapPut(conn, "hpackDecCtx", hpackCreateContext())
+    mapPut(conn, "nextStreamId", 2)  // Server uses even stream IDs for push
+    mapPut(conn, "connSendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(conn, "connRecvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(conn, "peerMaxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "recvBuffer", "")
+    mapPut(conn, "streams", mapCreate())
+    mapPut(conn, "expectContinuation", false)
+    mapPut(conn, "continuationStreamId", 0)
+    mapPut(conn, "continuationBuffer", "")
+    mapPut(conn, "continuationCount", 0)
+    mapPut(conn, "continuationEndStream", false)
+    mapPut(conn, "continuationIsTrailer", false)
+    mapPut(conn, "activeStreamCount", 0)
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+    mapPut(conn, "shuttingDown", false)
+    mapPut(conn, "goawayLastStreamId", 0)
+    mapPut(conn, "goawayErrorCode", 0)
+    mapPut(conn, "settingsState", "UNSENT")
+    mapPut(conn, "lastProcessedStreamId", 0)
+
+    val localSettings = mapCreate()
+    mapPut(localSettings, "headerTableSize", H2_DEFAULT_HEADER_TABLE_SIZE())
+    mapPut(localSettings, "enablePush", 1)
+    mapPut(localSettings, "initialWindowSize", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(localSettings, "maxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "localSettings", localSettings)
+
+    val peerSettings = mapCreate()
+    mapPut(peerSettings, "headerTableSize", H2_DEFAULT_HEADER_TABLE_SIZE())
+    mapPut(peerSettings, "initialWindowSize", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(peerSettings, "maxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "peerSettings", peerSettings)
+
+    // Read client preface (24 bytes + client SETTINGS)
+    val preface = tcpRecv(clientFd, 4096)
+    mapPut(conn, "recvBuffer", preface)
+
+    // Skip the 24-byte magic preface string, process remaining as frames
+    val prefaceLen = stringLength(preface)
+    if (prefaceLen >= 24) {
+        mapPut(conn, "recvBuffer", substring(preface, 24, prefaceLen))
+    }
+
+    // Send server SETTINGS
+    val settingsParams = listCreate()
+    val settingsFrame = h2BuildSettingsFrame(settingsParams)
+    tcpSend(clientFd, settingsFrame)
+
+    // Process client's SETTINGS frame
+    h2ProcessBufferedFrames(conn)
+
+    return conn
+}
+
+// Check if server is running
+fun h2ServerIsRunning(server: Map): Bool {
+    val v = mapGet(server, "running")
+    if (v == null) { return false }
+    return toBool(v)
+}
+
+// Stop the server
+fun h2StopServer(server: Map): Unit {
+    val fd = toInt(mapGet(server, "fd"))
+    if (fd >= 0) {
+        h2CloseTransport(conn)
+        mapPut(server, "fd", 0 - 1)
+        mapPut(server, "running", false)
+    }
+}
+
+// Receive a request from a client connection
+fun h2ReceiveRequest(conn: Map): Map {
+    val fd = toInt(mapGet(conn, "fd"))
+    val result = mapCreate()
+    if (fd < 0) {
+        mapPut(result, "error", "Connection not open")
+        return result
+    }
+
+    // Read frames until we get a complete request (HEADERS with END_STREAM or
+    // HEADERS + DATA + END_STREAM)
+    var done: Bool = false
+    var iterations: Int = 0
+    var requestStreamId: Int = 0
+
+    while (done == false) {
+        if (iterations > 200) { done = true }
+        if (done == false) {
+            // Check all streams for a complete request
+            val streams = mapGet(conn, "streams")
+            val keys = mapKeys(streams)
+            var k: Int = 0
+            while (k < listSize(keys)) {
+                val key = toString(listGet(keys, k))
+                val stream = mapGet(streams, key)
+                if (stream != null) {
+                    val state = toInt(mapGet(stream, "state"))
+                    if (state == H2_STREAM_HALF_CLOSED_REMOTE()) {
+                        requestStreamId = toInt(key)
+                        done = true
+                    }
+                }
+                k = k + 1
+            }
+            if (done == false) {
+                val chunk = h2Recv(conn,16384)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    var buf: String = toString(mapGet(conn, "recvBuffer"))
+                    buf = stringConcat(buf, chunk)
+                    mapPut(conn, "recvBuffer", buf)
+                    h2ProcessBufferedFrames(conn)
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+
+    if (requestStreamId == 0) {
+        mapPut(result, "error", "No request received")
+        return result
+    }
+
+    mapPut(conn, "lastProcessedStreamId", requestStreamId)
+    val streams = mapGet(conn, "streams")
+    val stream = mapGet(streams, toString(requestStreamId))
+    mapPut(result, "streamId", requestStreamId)
+    mapPut(result, "headers", mapGet(stream, "headers"))
+    mapPut(result, "body", toString(mapGet(stream, "body")))
+    mapPut(result, "error", "")
+
+    // Extract pseudo-headers
+    val reqHeaders = mapGet(stream, "headers")
+    var i: Int = 0
+    while (i < listSize(reqHeaders)) {
+        val h = listGet(reqHeaders, i)
+        val name = toString(mapGet(h, "name"))
+        val value = toString(mapGet(h, "value"))
+        if (name == ":method") { mapPut(result, "method", value) }
+        if (name == ":path") { mapPut(result, "path", value) }
+        if (name == ":authority") { mapPut(result, "authority", value) }
+        if (name == ":scheme") { mapPut(result, "scheme", value) }
+        i = i + 1
+    }
+    return result
+}
+
+// Request accessors
+fun h2RequestMethod(req: Map): String {
+    val v = mapGet(req, "method")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+fun h2RequestPath(req: Map): String {
+    val v = mapGet(req, "path")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+fun h2RequestAuthority(req: Map): String {
+    val v = mapGet(req, "authority")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+fun h2RequestHeader(req: Map, name: String): String {
+    return h2ResponseHeader(req, name)
+}
+
+fun h2RequestBody(req: Map): String {
+    val v = mapGet(req, "body")
+    if (v == null) { return "" }
+    return toString(v)
+}
+
+fun h2RequestStreamId(req: Map): Int {
+    val v = mapGet(req, "streamId")
+    if (v == null) { return 0 }
+    return toInt(v)
+}
+
+// == Response Sending (Server-Side) ===========================================
+
+// Send a complete response
+fun h2SendResponse(conn: Map, req: Map, status: Int, headers: List, body: String): Int {
+    val streamId = toInt(mapGet(req, "streamId"))
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+
+    // Build response headers
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", toString(status))
+    listAppend(headerList, statusHeader)
+    if (headers != null) {
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(headerList, listGet(headers, i))
+            i = i + 1
+        }
+    }
+
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+
+    val hasBody = stringLength(body) > 0
+    if (hasBody == false) {
+        return h2SendHeaderBlock(conn, streamId, headerBlock, true)
+    }
+
+    val sent1 = h2SendHeaderBlock(conn, streamId, headerBlock, false)
+    if (sent1 < 0) { return sent1 }
+    return h2SendData(conn, streamId, body, true)
+}
+
+// Send response headers only (for streaming responses)
+fun h2SendResponseHeaders(conn: Map, req: Map, status: Int, headers: List): Int {
+    val streamId = toInt(mapGet(req, "streamId"))
+
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", toString(status))
+    listAppend(headerList, statusHeader)
+    if (headers != null) {
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(headerList, listGet(headers, i))
+            i = i + 1
+        }
+    }
+
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+    return h2SendHeaderBlock(conn, streamId, headerBlock, false)
+}
+
+// Send response data chunk
+fun h2SendResponseData(conn: Map, streamId: Int, data: String, endStream: Bool): Int {
+    return h2SendData(conn, streamId, data, endStream)
+}
+
+// Send response trailers
+fun h2SendResponseTrailers(conn: Map, streamId: Int, trailers: List): Int {
+    return h2SendTrailers(conn, streamId, trailers)
+}
+
+// == 1xx Informational Responses ==============================================
+
+// Send 100 Continue (HEADERS with :status=100, no END_STREAM)
+fun h2Send100Continue(conn: Map, req: Map): Int {
+    val streamId = toInt(mapGet(req, "streamId"))
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", "100")
+    listAppend(headerList, statusHeader)
+
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+    // Informational: no END_STREAM
+    return h2SendHeaderBlock(conn, streamId, headerBlock, false)
+}
+
+// Send 103 Early Hints with Link headers
+fun h2Send103EarlyHints(conn: Map, req: Map, headers: List): Int {
+    val streamId = toInt(mapGet(req, "streamId"))
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", "103")
+    listAppend(headerList, statusHeader)
+    if (headers != null) {
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(headerList, listGet(headers, i))
+            i = i + 1
+        }
+    }
+
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, headerList)
+    return h2SendHeaderBlock(conn, streamId, headerBlock, false)
+}
+
+// == Server Push (PUSH_PROMISE) ===============================================
+
+// Send a server push: send PUSH_PROMISE on parent stream, then the pushed response
+fun h2ServerPush(conn: Map, parentStreamId: Int, method: String, path: String, headers: List, body: String): Int {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return 0 - 1 }
+
+    // Allocate even stream ID for push
+    val promisedStreamId = toInt(mapGet(conn, "nextStreamId"))
+    mapPut(conn, "nextStreamId", promisedStreamId + 2)
+
+    // Build promised request headers
+    val promisedHeaders = listCreate()
+    val mH = mapCreate()
+    mapPut(mH, "name", ":method")
+    mapPut(mH, "value", method)
+    listAppend(promisedHeaders, mH)
+    val pH = mapCreate()
+    mapPut(pH, "name", ":path")
+    mapPut(pH, "value", path)
+    listAppend(promisedHeaders, pH)
+    if (headers != null) {
+        var i: Int = 0
+        while (i < listSize(headers)) {
+            listAppend(promisedHeaders, listGet(headers, i))
+            i = i + 1
+        }
+    }
+
+    val hpackCtx = mapGet(conn, "hpackEncCtx")
+    val headerBlock = hpackEncode(hpackCtx, promisedHeaders)
+
+    // Send PUSH_PROMISE on parent stream
+    val ppFrame = h2BuildPushPromiseFrame(parentStreamId, promisedStreamId, headerBlock)
+    val sent = h2Send(conn,ppFrame)
+    if (sent < 0) { return 0 - 1 }
+
+    // Create promised stream
+    val streams = mapGet(conn, "streams")
+    val stream = mapCreate()
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_REMOTE())
+    mapPut(stream, "headers", listCreate())
+    mapPut(stream, "body", "")
+    mapPut(stream, "trailers", listCreate())
+    mapPut(stream, "sendWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(stream, "recvWindow", H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    mapPut(streams, toString(promisedStreamId), stream)
+
+    return promisedStreamId
+}
+
+// Client-side: receive a pushed resource
+fun h2ReceivePush(conn: Map): Map {
+    val streams = mapGet(conn, "streams")
+    val keys = mapKeys(streams)
+    var i: Int = 0
+    while (i < listSize(keys)) {
+        val key = toString(listGet(keys, i))
+        val stream = mapGet(streams, key)
+        if (stream != null) {
+            val promised = mapGet(stream, "promisedHeaders")
+            if (promised != null) {
+                return h2BuildResponseFromStream(conn, toInt(key))
+            }
+        }
+        i = i + 1
+    }
+    val empty = mapCreate()
+    mapPut(empty, "error", "No push received")
+    return empty
+}
+
+// == Extended CONNECT (RFC 8441) ===============================================
+
+// Send an Extended CONNECT request
+fun h2SendExtendedConnect(conn: Map, protocol: String, path: String, authority: String): Map {
+    val headers = mapCreate()
+    mapPut(headers, ":protocol", protocol)
+    return h2Request(conn, "CONNECT", path, headers, "")
+}
+
+// Check if a request is an Extended CONNECT
+fun h2HandleExtendedConnect(conn: Map, req: Map): Bool {
+    val method = h2RequestMethod(req)
+    if (method != "CONNECT") { return false }
+    val proto = h2RequestHeader(req, ":protocol")
+    return stringLength(proto) > 0
+}
+
+// == Graceful Shutdown (RFC 9113 Section 6.8) =================================
+// Full sequence: GOAWAY(MAX_STREAM_ID) → process in-flight → GOAWAY(lastProcessed) → drain → close
+
+// Initiate graceful shutdown
+fun h2GracefulShutdown(conn: Map, timeoutMs: Int): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return }
+
+    mapPut(conn, "shuttingDown", true)
+
+    // Step 1: Send GOAWAY with MAX_STREAM_ID to announce intent
+    val goaway1 = h2BuildGoawayFrame(2147483647, H2_NO_ERROR(), "")
+    h2Send(conn,goaway1)
+
+    // Step 2: Drain in-flight streams
+    h2DrainStreams(conn, timeoutMs)
+
+    // Step 3: Send final GOAWAY with actual last processed stream ID
+    val lastStreamId = toInt(mapGet(conn, "lastProcessedStreamId"))
+    val goaway2 = h2BuildGoawayFrame(lastStreamId, H2_NO_ERROR(), "")
+    h2Send(conn,goaway2)
+
+    // Step 4: Close
+    h2CloseTransport(conn)
+    mapPut(conn, "fd", 0 - 1)
+}
+
+// Drain all active streams (process frames until all complete or timeout)
+fun h2DrainStreams(conn: Map, timeoutMs: Int): Bool {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd < 0) { return true }
+
+    var iterations: Int = 0
+    val maxIter = timeoutMs / 10
+    var allDone: Bool = false
+
+    while (allDone == false) {
+        if (iterations > maxIter) { return false }
+        // Check if all streams are closed
+        allDone = true
+        val streams = mapGet(conn, "streams")
+        val keys = mapKeys(streams)
+        var i: Int = 0
+        while (i < listSize(keys)) {
+            val key = toString(listGet(keys, i))
+            val stream = mapGet(streams, key)
+            if (stream != null) {
+                val state = toInt(mapGet(stream, "state"))
+                if (state != H2_STREAM_CLOSED_STATE()) {
+                    if (state != H2_STREAM_HALF_CLOSED_REMOTE()) {
+                        allDone = false
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if (allDone == false) {
+            val chunk = h2Recv(conn,16384)
+            if (stringLength(chunk) > 0) {
+                var buf: String = toString(mapGet(conn, "recvBuffer"))
+                buf = stringConcat(buf, chunk)
+                mapPut(conn, "recvBuffer", buf)
+                h2ProcessBufferedFrames(conn)
+            }
+        }
+        iterations = iterations + 1
+    }
+    return true
+}
+
+// Check if the connection is shutting down
+fun h2IsShuttingDown(conn: Map): Bool {
+    val v = mapGet(conn, "shuttingDown")
+    if (v == null) { return false }
+    return toBool(v)
+}
+
+// Get the last stream ID from a received GOAWAY
+fun h2ShutdownLastStreamId(conn: Map): Int {
+    return toInt(mapGet(conn, "goawayLastStreamId"))
+}
+
+// Get streams that were sent but not processed by the peer (retryable)
+fun h2RetryableStreams(conn: Map, goawayStreamId: Int): List {
+    val retryable = listCreate()
+    val streams = mapGet(conn, "streams")
+    val keys = mapKeys(streams)
+    var i: Int = 0
+    while (i < listSize(keys)) {
+        val key = toString(listGet(keys, i))
+        val sid = toInt(key)
+        if (sid > goawayStreamId) {
+            // This stream was not processed by the peer
+            val stream = mapGet(streams, key)
+            if (stream != null) {
+                val state = toInt(mapGet(stream, "state"))
+                if (state != H2_STREAM_CLOSED_STATE()) {
+                    listAppend(retryable, sid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return retryable
+}
+
+// Hard close without draining
+fun h2CloseImmediate(conn: Map): Unit {
+    val fd = toInt(mapGet(conn, "fd"))
+    if (fd >= 0) {
+        h2CloseTransport(conn)
+        mapPut(conn, "fd", 0 - 1)
+    }
+}

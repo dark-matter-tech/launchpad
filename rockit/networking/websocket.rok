@@ -2,8 +2,8 @@
 //
 // Implements the WebSocket protocol for real-time bidirectional communication.
 // Handles connection upgrade, frame encoding/decoding, masking, and control
-// frames (ping/pong/close). Uses base64 from rockit.encoding.base64 and URL
-// parsing from rockit.networking.url.
+// frames (ping/pong/close). Supports both ws:// (plain TCP) and wss:// (TLS).
+// Uses base64 from rockit.encoding.base64 and URL parsing from rockit.networking.url.
 //
 // Standards: RFC 6455 — The WebSocket Protocol
 //
@@ -11,7 +11,7 @@
 //   import rockit.networking.websocket
 //   import rockit.networking.url
 //   import rockit.encoding.base64
-//   val ws = wsConnect("ws://localhost:8080/chat")
+//   val ws = wsConnect("wss://echo.example.com/chat")
 //   wsSend(ws, "hello")
 //   val msg = wsRecv(ws)
 
@@ -32,16 +32,53 @@ fun WS_PING(): Int     { return 9 }
 // Pong opcode
 fun WS_PONG(): Int     { return 10 }
 
+// == Transport Abstraction (TLS-aware) ========================================
+
+// Send raw data over the WebSocket transport (TLS or TCP)
+fun wsSendRaw(ws: Map, data: String): Int {
+    val useTls = mapGet(ws, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(ws, "tlsConn"))
+        return tlsSend(tlsConn, data)
+    }
+    val fd = toInt(mapGet(ws, "fd"))
+    return tcpSend(fd, data)
+}
+
+// Receive raw data from the WebSocket transport (TLS or TCP)
+fun wsRecvRaw(ws: Map, maxBytes: Int): String {
+    val useTls = mapGet(ws, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(ws, "tlsConn"))
+        return tlsRecv(tlsConn, maxBytes)
+    }
+    val fd = toInt(mapGet(ws, "fd"))
+    return tcpRecv(fd, maxBytes)
+}
+
+// Close the WebSocket transport (TLS or TCP)
+fun wsCloseTransport(ws: Map): Unit {
+    val useTls = mapGet(ws, "tls")
+    if (useTls == true) {
+        val tlsConn = toInt(mapGet(ws, "tlsConn"))
+        tlsClose(tlsConn)
+        return
+    }
+    val fd = toInt(mapGet(ws, "fd"))
+    tcpClose(fd)
+}
+
 // == Connection ==============================================================
 
 // Connect to a WebSocket server and perform the HTTP upgrade handshake
 fun wsConnect(url: String): Map {
     val result = mapCreate()
 
-    // Parse ws://host:port/path using shared URL functions
+    // Parse URL using shared URL functions
     val host = urlExtractHost(url)
     val port = urlExtractPort(url)
     val path = urlExtractPath(url)
+    val scheme = urlExtractScheme(url)
 
     if (stringLength(host) == 0) {
         mapPut(result, "fd", 0 - 1)
@@ -49,12 +86,36 @@ fun wsConnect(url: String): Map {
         return result
     }
 
-    // TCP connect
-    val fd = tcpConnect(host, port)
-    if (fd < 0) {
-        mapPut(result, "fd", 0 - 1)
-        mapPut(result, "error", stringConcat("Connection failed to ", host))
-        return result
+    // Determine TLS vs plaintext
+    val useTls = scheme == "wss" || scheme == "https"
+    mapPut(result, "tls", useTls)
+
+    if (useTls) {
+        // TLS connect
+        val ctx = tlsCreateContext()
+        if (ctx < 0) {
+            mapPut(result, "fd", 0 - 1)
+            mapPut(result, "error", "Failed to create TLS context")
+            return result
+        }
+        tlsSetVerifyPeer(ctx, 1)
+        val tlsConn = tlsConnect(ctx, host, port)
+        if (tlsConn < 0) {
+            mapPut(result, "fd", 0 - 1)
+            mapPut(result, "error", stringConcat("TLS connection failed to ", host))
+            return result
+        }
+        mapPut(result, "tlsConn", tlsConn)
+        mapPut(result, "fd", 0)  // placeholder
+    } else {
+        // Plain TCP connect
+        val fd = tcpConnect(host, port)
+        if (fd < 0) {
+            mapPut(result, "fd", 0 - 1)
+            mapPut(result, "error", stringConcat("Connection failed to ", host))
+            return result
+        }
+        mapPut(result, "fd", fd)
     }
 
     // Generate random WebSocket key (16 random bytes, base64-encoded)
@@ -69,18 +130,18 @@ fun wsConnect(url: String): Map {
     req = stringConcat(req, "Sec-WebSocket-Version: 13\r\n")
     req = stringConcat(req, "\r\n")
 
-    val sent = tcpSend(fd, req)
+    val sent = wsSendRaw(result, req)
     if (sent < 0) {
-        tcpClose(fd)
+        wsCloseTransport(result)
         mapPut(result, "fd", 0 - 1)
         mapPut(result, "error", "Failed to send upgrade request")
         return result
     }
 
     // Read response
-    val response = tcpRecv(fd, 4096)
+    val response = wsRecvRaw(result, 4096)
     if (stringLength(response) == 0) {
-        tcpClose(fd)
+        wsCloseTransport(result)
         mapPut(result, "fd", 0 - 1)
         mapPut(result, "error", "No response to upgrade request")
         return result
@@ -89,13 +150,12 @@ fun wsConnect(url: String): Map {
     // Verify 101 response
     val statusIdx = stringIndexOf(response, "101")
     if (statusIdx < 0) {
-        tcpClose(fd)
+        wsCloseTransport(result)
         mapPut(result, "fd", 0 - 1)
         mapPut(result, "error", stringConcat("Upgrade rejected: ", substring(response, 0, if (stringLength(response) > 80) { 80 } else { stringLength(response) })))
         return result
     }
 
-    mapPut(result, "fd", fd)
     mapPut(result, "error", "")
     return result
 }
@@ -104,8 +164,8 @@ fun wsConnect(url: String): Map {
 fun wsClose(ws: Map): Unit {
     val fd = toInt(mapGet(ws, "fd"))
     if (fd >= 0) {
-        wsSendFrame(fd, WS_CLOSE(), "")
-        tcpClose(fd)
+        wsSendFrame(ws, WS_CLOSE(), "")
+        wsCloseTransport(ws)
     }
 }
 
@@ -121,14 +181,14 @@ fun wsIsOpen(ws: Map): Bool {
 fun wsSend(ws: Map, message: String): Bool {
     val fd = toInt(mapGet(ws, "fd"))
     if (fd < 0) { return false }
-    return wsSendFrame(fd, WS_TEXT(), message)
+    return wsSendFrame(ws, WS_TEXT(), message)
 }
 
 // Send a binary message
 fun wsSendBinary(ws: Map, data: String): Bool {
     val fd = toInt(mapGet(ws, "fd"))
     if (fd < 0) { return false }
-    return wsSendFrame(fd, WS_BINARY(), data)
+    return wsSendFrame(ws, WS_BINARY(), data)
 }
 
 // Receive a message (returns Map with "type" and "data" keys)
@@ -142,7 +202,7 @@ fun wsRecv(ws: Map): Map {
     }
 
     // Read frame header (at least 2 bytes)
-    val header = tcpRecv(fd, 2)
+    val header = wsRecvRaw(ws, 2)
     if (stringLength(header) < 2) {
         mapPut(result, "type", 0 - 1)
         mapPut(result, "data", "")
@@ -158,14 +218,14 @@ fun wsRecv(ws: Map): Map {
 
     // Handle extended payload length (16-bit)
     if (payloadLen == 126) {
-        val extLen = tcpRecv(fd, 2)
+        val extLen = wsRecvRaw(ws, 2)
         if (stringLength(extLen) >= 2) {
             payloadLen = charCodeAt(extLen, 0) * 256 + charCodeAt(extLen, 1)
         }
     }
     // Handle extended payload length (64-bit, lower 4 bytes only)
     if (payloadLen == 127) {
-        val extLen = tcpRecv(fd, 8)
+        val extLen = wsRecvRaw(ws, 8)
         if (stringLength(extLen) >= 8) {
             payloadLen = charCodeAt(extLen, 4) * 16777216 +
                          charCodeAt(extLen, 5) * 65536 +
@@ -177,13 +237,13 @@ fun wsRecv(ws: Map): Map {
     // Read masking key if present
     var maskKey: String = ""
     if (masked == 1) {
-        maskKey = tcpRecv(fd, 4)
+        maskKey = wsRecvRaw(ws, 4)
     }
 
     // Read payload
     var payload: String = ""
     if (payloadLen > 0) {
-        payload = tcpRecv(fd, payloadLen)
+        payload = wsRecvRaw(ws, payloadLen)
     }
 
     // Unmask if needed
@@ -195,7 +255,7 @@ fun wsRecv(ws: Map): Map {
 
     // Handle control frames
     if (opcode == WS_PING()) {
-        wsSendFrame(fd, WS_PONG(), payload)
+        wsSendFrame(ws, WS_PONG(), payload)
         return wsRecv(ws)
     }
 
@@ -207,7 +267,7 @@ fun wsRecv(ws: Map): Map {
 // == Frame Encoding ==========================================================
 
 // Encode and send a WebSocket frame with masking (client requirement)
-fun wsSendFrame(fd: Int, opcode: Int, payload: String): Bool {
+fun wsSendFrame(ws: Map, opcode: Int, payload: String): Bool {
     val payloadLen = stringLength(payload)
 
     // Byte 0: FIN(1) + opcode
@@ -263,7 +323,7 @@ fun wsSendFrame(fd: Int, opcode: Int, payload: String): Bool {
 
     // Send header + masked payload
     val frame = stringConcat(header, maskedPayload)
-    val sent = tcpSend(fd, frame)
+    val sent = wsSendRaw(ws, frame)
     return sent >= 0
 }
 

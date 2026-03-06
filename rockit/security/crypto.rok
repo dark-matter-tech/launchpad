@@ -1,0 +1,121 @@
+// rockit.security.crypto — Cryptographic primitives
+//
+// Provides hash functions (SHA-256, SHA-1, SHA-512, MD5), HMAC, AES
+// encryption/decryption, and secure random byte generation. Hash and
+// HMAC functions return raw bytes; use cryptoToHex() for hex strings.
+//
+// Standards: FIPS 180-4 (SHA), RFC 2104 (HMAC), FIPS 197 (AES), RFC 4231 (HMAC-SHA)
+//
+// Usage:
+//   import rockit.security.crypto
+//   val hash = sha256("hello")
+//   val hex  = cryptoToHex(hash)  // "2cf24dba..."
+
+// == Hash Functions ===========================================================
+
+// SHA-256 hash (returns 32 raw bytes)
+fun sha256(input: String): String {
+    return cryptoSha256(input)
+}
+
+// SHA-1 hash (returns 20 raw bytes)
+fun sha1(input: String): String {
+    return cryptoSha1(input)
+}
+
+// SHA-512 hash (returns 64 raw bytes)
+fun sha512(input: String): String {
+    return cryptoSha512(input)
+}
+
+// MD5 hash (returns 16 raw bytes)
+fun md5(input: String): String {
+    return cryptoMd5(input)
+}
+
+// == HMAC =====================================================================
+
+// HMAC-SHA256 (returns 32 raw bytes)
+fun hmacSha256(key: String, msg: String): String {
+    return cryptoHmacSha256(key, msg)
+}
+
+// HMAC-SHA1 (returns 20 raw bytes)
+fun hmacSha1(key: String, msg: String): String {
+    return cryptoHmacSha1(key, msg)
+}
+
+// == AES Encryption ===========================================================
+
+// AES-CBC encrypt
+fun aesEncryptCBC(key: String, iv: String, plaintext: String): String {
+    return cryptoAesEncrypt(key, iv, plaintext, 0)
+}
+
+// AES-CBC decrypt
+fun aesDecryptCBC(key: String, iv: String, ciphertext: String): String {
+    return cryptoAesDecrypt(key, iv, ciphertext, 0)
+}
+
+// AES-GCM encrypt (ciphertext includes 16-byte auth tag appended)
+fun aesEncryptGCM(key: String, iv: String, plaintext: String): String {
+    return cryptoAesEncrypt(key, iv, plaintext, 1)
+}
+
+// AES-GCM decrypt (input must include 16-byte auth tag appended)
+fun aesDecryptGCM(key: String, iv: String, ciphertext: String): String {
+    return cryptoAesDecrypt(key, iv, ciphertext, 1)
+}
+
+// == Random ===================================================================
+
+// Generate count bytes of cryptographically secure random bytes
+fun cryptoRandom(count: Int): String {
+    return cryptoRandomBytes(count)
+}
+
+// == Hex Conversion ===========================================================
+
+// Convert raw bytes to lowercase hex string
+fun cryptoToHex(raw: String): String {
+    val len = stringLength(raw)
+    var result = ""
+    var i = 0
+    while (i < len) {
+        val byte = charCodeAt(raw, i)
+        val hi = byte / 16
+        val lo = byte % 16
+        result = result + cryptoNibbleToHex(hi) + cryptoNibbleToHex(lo)
+        i = i + 1
+    }
+    return result
+}
+
+// Convert hex string to raw bytes
+fun cryptoFromHex(hex: String): String {
+    val len = stringLength(hex)
+    var result = ""
+    var i = 0
+    while (i < len - 1) {
+        val hi = cryptoHexToNibble(charCodeAt(hex, i))
+        val lo = cryptoHexToNibble(charCodeAt(hex, i + 1))
+        if (hi < 0 || lo < 0) { return result }
+        result = result + intToChar(hi * 16 + lo)
+        i = i + 2
+    }
+    return result
+}
+
+// == Internal Helpers =========================================================
+
+fun cryptoNibbleToHex(n: Int): String {
+    if (n < 10) { return intToChar(48 + n) }
+    return intToChar(97 + n - 10)
+}
+
+fun cryptoHexToNibble(ch: Int): Int {
+    if (ch >= 48 && ch <= 57) { return ch - 48 }       // 0-9
+    if (ch >= 97 && ch <= 102) { return ch - 97 + 10 } // a-f
+    if (ch >= 65 && ch <= 70) { return ch - 65 + 10 }  // A-F
+    return -1
+}

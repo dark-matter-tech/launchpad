@@ -1,0 +1,143 @@
+// rockit.security.pem — PEM encoding and decoding
+//
+// Pure-Rockit implementation of PEM (Privacy Enhanced Mail) format
+// encoding and decoding. Extracts type labels and Base64-encoded data
+// from PEM blocks. Uses rockit.encoding.base64 for Base64 operations.
+//
+// Standards: RFC 7468 (Textual Encodings of PKIX, PKCS, and CMS Structures)
+//
+// Usage:
+//   import rockit.security.pem
+//   import rockit.encoding.base64
+//   val block = pemDecode(pemString)
+//   val certType = pemType(block)   // "CERTIFICATE"
+//   val rawData  = pemData(block)   // decoded binary
+
+import rockit.encoding.base64
+
+// == Constants ================================================================
+
+fun PEM_ERROR(): String { return "PEM_ERROR" }
+
+// == Decode ===================================================================
+
+// Decode a PEM block, returning a map with type and data
+fun pemDecode(pem: String): Map {
+    val result = mapCreate()
+    val len = stringLength(pem)
+
+    // Find "-----BEGIN "
+    val beginMarker = "-----BEGIN "
+    val beginIdx = stringIndexOf(pem, beginMarker)
+    if (beginIdx < 0) {
+        mapPut(result, "type", PEM_ERROR())
+        mapPut(result, "error", "No BEGIN marker found")
+        return result
+    }
+
+    // Extract the type label (between BEGIN and -----)
+    val afterBegin = beginIdx + stringLength(beginMarker)
+    val dashAfterType = stringIndexOf(substring(pem, afterBegin, len), "-----")
+    if (dashAfterType < 0) {
+        mapPut(result, "type", PEM_ERROR())
+        mapPut(result, "error", "Malformed BEGIN marker")
+        return result
+    }
+    val pemLabel = substring(pem, afterBegin, afterBegin + dashAfterType)
+
+    // Find the end of the BEGIN line
+    val beginLineEnd = afterBegin + dashAfterType + 5
+    // Find "-----END "
+    val endMarker = "-----END " + pemLabel + "-----"
+    val endIdx = stringIndexOf(pem, endMarker)
+    if (endIdx < 0) {
+        mapPut(result, "type", PEM_ERROR())
+        mapPut(result, "error", "No matching END marker found")
+        return result
+    }
+
+    // Extract Base64 content between markers (strip whitespace)
+    val b64Content = pemStripWhitespace(substring(pem, beginLineEnd, endIdx))
+
+    // Decode Base64
+    val decoded = base64Decode(b64Content)
+
+    mapPut(result, "type", "PEM_BLOCK")
+    mapPut(result, "error", "")
+    mapPut(result, "label", pemLabel)
+    mapPut(result, "data", decoded)
+    return result
+}
+
+// == Encode ===================================================================
+
+// Encode data as a PEM block with the given type label
+fun pemEncode(label: String, content: String): String {
+    val encoded = base64Encode(content)
+    var result = "-----BEGIN " + label + "-----\n"
+    // Wrap at 64 characters per line
+    val len = stringLength(encoded)
+    var i = 0
+    while (i < len) {
+        val end = i + 64
+        if (end > len) {
+            result = result + substring(encoded, i, len) + "\n"
+        } else {
+            result = result + substring(encoded, i, end) + "\n"
+        }
+        i = i + 64
+    }
+    result = result + "-----END " + label + "-----\n"
+    return result
+}
+
+// == File I/O =================================================================
+
+// Read a PEM block from a file
+fun pemReadFile(path: String): Map {
+    val content = fileRead(path)
+    if (content == "") {
+        val result = mapCreate()
+        mapPut(result, "type", PEM_ERROR())
+        mapPut(result, "error", "Failed to read file: " + path)
+        return result
+    }
+    return pemDecode(content)
+}
+
+// == Accessors ================================================================
+
+// Get the type label from a decoded PEM block
+fun pemType(block: Map): String {
+    return mapGet(block, "label")
+}
+
+// Get the decoded binary data from a PEM block
+fun pemData(block: Map): String {
+    return mapGet(block, "data")
+}
+
+// == Error Checking ===========================================================
+
+fun pemIsError(block: Map): Bool {
+    val t = mapGet(block, "type")
+    return t == PEM_ERROR()
+}
+
+// == Internal Helpers =========================================================
+
+// Strip newlines and carriage returns from Base64 content
+fun pemStripWhitespace(s: String): String {
+    val len = stringLength(s)
+    var result = ""
+    var i = 0
+    while (i < len) {
+        val ch = charCodeAt(s, i)
+        // Skip \n (10), \r (13), space (32), tab (9)
+        if (ch != 10 && ch != 13 && ch != 32 && ch != 9) {
+            result = result + intToChar(ch)
+        }
+        i = i + 1
+    }
+    return result
+}

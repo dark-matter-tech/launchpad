@@ -1,0 +1,63 @@
+// Tests for rockit.security.x509
+// Certificate parsing and field extraction
+import rockit.testing.probe
+import rockit.security.x509
+
+// == Sample Test Certificate (self-signed, minimal) ===========================
+
+fun testCertPem(): String {
+    return "-----BEGIN CERTIFICATE-----\nMIIC0TCCAbmgAwIBAgIUO0P+8QXePJWBUe7V269usI1vi7QwDQYJKoZIhvcNAQEL\nBQAwETEPMA0GA1UEAwwGdGVzdGNhMB4XDTI0MDEwMTAwMDAwMFoXDTI1MDEwMTAw\nMDAwMFowETEPMA0GA1UEAwwGdGVzdGNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\nMIIBCgKCAQEAuUfhYNXuZHpKbVPn8aY26h66VYwLXK3xNVQ4byUPrOHPREiP6VNp\nBxWA9ChMTaOSqKDg1Svf9uoWbl3P0ZQCcklgF70jBWBwGgFbtNGWExAHCZ9YraSR\nTlBEx0dYfFdSTlidM/8XOE/zsIreXxJzfLZkcOiMtVlVBMVFyGY+icjvNdMeG2VC\nnoGyUYgxbGH/uEQbkURGZ5JvD+tNCzCKlM9VTCdF5fMZUh8/Dw6hVKZK8paguFwh\nuIHp+2OI+ncyE4ITivxPPlalkxDRysUByxoz2cn8Xcg0Q9LYDRKCDYycvaAhFbil\nHRbZ9fhZzoKc/o2ATIkmG92UnlU0abhT0wIDAQABoyEwHzAdBgNVHQ4EFgQUVxWu\ngxHpVsd24vfn1Z96NuNusUgwDQYJKoZIhvcNAQELBQADggEBAFGtzz3NDtdftEXN\nuU8DgZt0bL6tyNntEI2LwxiCSMQH6LdMPcilqG9FOeoc7Q4b267HIURCwWwb1wAc\n/DHU2nBAHgnvrC/Vt7MQWn3VxMG7+vMosdM8QTzdLqwEK36Ql7gQjHBtG2fIxHsx\nY+J0r2kgYonI0GTzMhTB28L29WQb3GTUgchUQ5IFYnIFePoW4QdX/jlIDBbpbLoj\nAgCXIVst2tKhQgqCVsmccdd8XPtJUkobhJN0yP2I2KiYAa4Uv2LNe7NNkk7PjuHz\nsmUZUUFp0xqSCogzd+Chr1yT17oCnUB8c5GjDas1d9k8YIIzEQlyEjvuxaoGgLWM\nFHo9S3k=\n-----END CERTIFICATE-----\n"
+}
+
+// == Constants ================================================================
+
+@Test fun testX509ErrorConstant() {
+    assertEqualsStr("X509_ERROR", X509_ERROR())
+}
+
+// == Parse and Inspect ========================================================
+
+@Test fun testX509ParseValid() {
+    val result = x509FromPem(testCertPem())
+    assertFalse(x509IsError(result))
+    val handle = toInt(mapGet(result, "handle"))
+    assertGreaterThanOrEqual(handle, 0)
+    x509Release(handle)
+}
+
+@Test fun testX509ParseInvalid() {
+    val result = x509FromPem("not a certificate")
+    assertTrue(x509IsError(result))
+}
+
+@Test fun testX509SubjectNotEmpty() {
+    val result = x509FromPem(testCertPem())
+    val handle = toInt(mapGet(result, "handle"))
+    val subject = x509GetSubject(handle)
+    assertStringNotEmpty(subject)
+    x509Release(handle)
+}
+
+@Test fun testX509IssuerNotEmpty() {
+    val result = x509FromPem(testCertPem())
+    val handle = toInt(mapGet(result, "handle"))
+    val issuer = x509GetIssuer(handle)
+    assertStringNotEmpty(issuer)
+    x509Release(handle)
+}
+
+@Test fun testX509SerialNotEmpty() {
+    val result = x509FromPem(testCertPem())
+    val handle = toInt(mapGet(result, "handle"))
+    val serial = x509GetSerial(handle)
+    assertStringNotEmpty(serial)
+    x509Release(handle)
+}
+
+@Test fun testX509Expired() {
+    // The test cert expired 2025-01-01, so it should be expired
+    val result = x509FromPem(testCertPem())
+    val handle = toInt(mapGet(result, "handle"))
+    assertTrue(x509IsExpired(handle))
+    x509Release(handle)
+}

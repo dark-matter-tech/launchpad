@@ -1,0 +1,175 @@
+// Tests for rockit.security.crypto
+// Includes known hash vectors, HMAC RFC 4231 vectors, AES roundtrip, hex conversion
+import rockit.testing.probe
+import rockit.security.crypto
+
+// == Hex Conversion ===========================================================
+
+@Test fun testCryptoToHexEmpty() {
+    assertEqualsStr("", cryptoToHex(""))
+}
+
+@Test fun testCryptoToHexSingleByte() {
+    // 'A' = 0x41
+    assertEqualsStr("41", cryptoToHex("A"))
+}
+
+@Test fun testCryptoToHexMultiBytes() {
+    assertEqualsStr("48656c6c6f", cryptoToHex("Hello"))
+}
+
+@Test fun testCryptoFromHexEmpty() {
+    assertEqualsStr("", cryptoFromHex(""))
+}
+
+@Test fun testCryptoFromHexHello() {
+    assertEqualsStr("Hello", cryptoFromHex("48656c6c6f"))
+}
+
+@Test fun testCryptoHexRoundtrip() {
+    val original = "Test Data 123"
+    val hex = cryptoToHex(original)
+    val decoded = cryptoFromHex(hex)
+    assertEqualsStr(original, decoded)
+}
+
+// == SHA-256 Known Vectors ====================================================
+
+@Test fun testSha256Empty() {
+    // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    val hash = sha256("")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", hex)
+}
+
+@Test fun testSha256Abc() {
+    // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    val hash = sha256("abc")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", hex)
+}
+
+@Test fun testSha256Length() {
+    // SHA-256 always returns 32 bytes
+    val hash = sha256("test")
+    assertStringLength(hash, 32)
+}
+
+// == SHA-1 Known Vectors ======================================================
+
+@Test fun testSha1Empty() {
+    // SHA-1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+    val hash = sha1("")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("da39a3ee5e6b4b0d3255bfef95601890afd80709", hex)
+}
+
+@Test fun testSha1Abc() {
+    // SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+    val hash = sha1("abc")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("a9993e364706816aba3e25717850c26c9cd0d89d", hex)
+}
+
+@Test fun testSha1Length() {
+    // SHA-1 always returns 20 bytes
+    val hash = sha1("test")
+    assertStringLength(hash, 20)
+}
+
+// == SHA-512 ==================================================================
+
+@Test fun testSha512Length() {
+    // SHA-512 always returns 64 bytes
+    val hash = sha512("test")
+    assertStringLength(hash, 64)
+}
+
+// == MD5 Known Vectors ========================================================
+
+@Test fun testMd5Empty() {
+    // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+    val hash = md5("")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("d41d8cd98f00b204e9800998ecf8427e", hex)
+}
+
+@Test fun testMd5Abc() {
+    // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
+    val hash = md5("abc")
+    val hex = cryptoToHex(hash)
+    assertEqualsStr("900150983cd24fb0d6963f7d28e17f72", hex)
+}
+
+@Test fun testMd5Length() {
+    // MD5 always returns 16 bytes
+    val hash = md5("test")
+    assertStringLength(hash, 16)
+}
+
+// == HMAC-SHA256 (RFC 4231 Test Case 2) =======================================
+
+@Test fun testHmacSha256Rfc4231Case2() {
+    // Key = "Jefe", Data = "what do ya want for nothing?"
+    // Expected = 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+    val mac = hmacSha256("Jefe", "what do ya want for nothing?")
+    val hex = cryptoToHex(mac)
+    assertEqualsStr("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", hex)
+}
+
+@Test fun testHmacSha256Length() {
+    // HMAC-SHA256 always returns 32 bytes
+    val mac = hmacSha256("key", "data")
+    assertStringLength(mac, 32)
+}
+
+// == HMAC-SHA1 ================================================================
+
+@Test fun testHmacSha1Length() {
+    // HMAC-SHA1 always returns 20 bytes
+    val mac = hmacSha1("key", "data")
+    assertStringLength(mac, 20)
+}
+
+// == AES Roundtrip ============================================================
+
+@Test fun testAesCbcRoundtrip() {
+    // 16-byte key and IV for AES-128-CBC
+    val key = "0123456789abcdef"
+    val iv  = "abcdef0123456789"
+    val plaintext = "Hello, AES-CBC!!"  // 16 bytes (one block)
+    val ciphertext = aesEncryptCBC(key, iv, plaintext)
+    assertStringNotEmpty(ciphertext)
+    val decrypted = aesDecryptCBC(key, iv, ciphertext)
+    assertEqualsStr(plaintext, decrypted)
+}
+
+@Test fun testAesGcmRoundtrip() {
+    // 16-byte key, 12-byte IV for AES-128-GCM
+    val key = "0123456789abcdef"
+    val iv  = "abcdef012345"
+    val plaintext = "Hello, AES-GCM!"
+    val ciphertext = aesEncryptGCM(key, iv, plaintext)
+    assertStringNotEmpty(ciphertext)
+    val decrypted = aesDecryptGCM(key, iv, ciphertext)
+    assertEqualsStr(plaintext, decrypted)
+}
+
+// == Secure Random ============================================================
+
+@Test fun testCryptoRandomLength() {
+    val bytes = cryptoRandom(32)
+    assertStringLength(bytes, 32)
+}
+
+@Test fun testCryptoRandomNonEmpty() {
+    val bytes = cryptoRandom(16)
+    assertStringNotEmpty(bytes)
+}
+
+@Test fun testCryptoRandomDifferent() {
+    // Two random calls should (almost certainly) produce different results
+    val a = cryptoRandom(16)
+    val b = cryptoRandom(16)
+    assertNotEqualsStr(cryptoToHex(a), cryptoToHex(b))
+}

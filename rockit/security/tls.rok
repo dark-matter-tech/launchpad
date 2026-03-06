@@ -1,0 +1,130 @@
+// rockit.security.tls — TLS connection management
+//
+// High-level API for establishing TLS-secured TCP connections.
+// Wraps OpenSSL builtins with error-map semantics consistent with
+// the networking module pattern. Supports client and server modes,
+// ALPN negotiation, and certificate/key configuration.
+//
+// Standards: RFC 8446 (TLS 1.3), RFC 5246 (TLS 1.2)
+//
+// Usage:
+//   import rockit.security.tls
+//   val ctx = tlsDefaultContext()
+//   val conn = tlsConnectTo(ctx, "example.com", 443)
+//   val sent = tlsSendData(conn["conn"], "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+// == Constants ================================================================
+
+fun TLS_ERROR(): String { return "TLS_ERROR" }
+
+// == Context Creation =========================================================
+
+// Create a client context with peer verification enabled
+fun tlsDefaultContext(): Int {
+    val ctx = tlsCreateContext()
+    if (ctx >= 0) {
+        tlsSetVerifyPeer(ctx, 1)
+    }
+    return ctx
+}
+
+// Create a server context with certificate and private key loaded
+fun tlsServerContext(certPath: String, keyPath: String): Int {
+    val ctx = tlsCreateServerContext()
+    if (ctx < 0) { return -1 }
+    val certOk = tlsSetCertificate(ctx, certPath)
+    if (certOk < 0) { return -1 }
+    val keyOk = tlsSetPrivateKey(ctx, keyPath)
+    if (keyOk < 0) { return -1 }
+    return ctx
+}
+
+// == Connection ===============================================================
+
+// Connect to a TLS server, returning a result map
+fun tlsConnectTo(ctx: Int, host: String, port: Int): Map {
+    val result = mapCreate()
+    val conn = tlsConnect(ctx, host, port)
+    if (conn < 0) {
+        mapPut(result, "type", TLS_ERROR())
+        mapPut(result, "error", "TLS connection failed: " + tlsLastError())
+        mapPut(result, "conn", -1)
+        return result
+    }
+    mapPut(result, "type", "TLS_CONN")
+    mapPut(result, "error", "")
+    mapPut(result, "conn", conn)
+    mapPut(result, "host", host)
+    mapPut(result, "port", port)
+    return result
+}
+
+// Connect with ALPN protocol negotiation (e.g., for HTTP/2 "h2")
+fun tlsConnectAlpn(ctx: Int, host: String, port: Int, alpn: String): Map {
+    // alpn should be wire-format: length-prefixed protocol names
+    // e.g., "\x02h2" for h2 or "\x02h2\x08http/1.1" for h2 + http/1.1
+    val alpnResult = tlsSetAlpn(ctx, alpn)
+    return tlsConnectTo(ctx, host, port)
+}
+
+// Send data over a TLS connection
+fun tlsSendData(conn: Int, payload: String): Int {
+    return tlsSend(conn, payload)
+}
+
+// Receive data from a TLS connection
+fun tlsRecvData(conn: Int, maxBytes: Int): String {
+    return tlsRecv(conn, maxBytes)
+}
+
+// Close a TLS connection
+fun tlsDisconnect(conn: Int): Unit {
+    tlsClose(conn)
+}
+
+// Get the negotiated ALPN protocol
+fun tlsNegotiatedProtocol(conn: Int): String {
+    return tlsGetAlpn(conn)
+}
+
+// == Server ===================================================================
+
+// Start a TLS server listening on a port
+fun tlsListenOn(ctx: Int, port: Int): Map {
+    val result = mapCreate()
+    val fd = tlsListen(ctx, port)
+    if (fd < 0) {
+        mapPut(result, "type", TLS_ERROR())
+        mapPut(result, "error", "TLS listen failed")
+        mapPut(result, "fd", -1)
+        return result
+    }
+    mapPut(result, "type", "TLS_SERVER")
+    mapPut(result, "error", "")
+    mapPut(result, "fd", fd)
+    return result
+}
+
+// Accept a TLS client connection
+fun tlsAcceptClient(ctx: Int, serverFd: Int): Map {
+    val result = mapCreate()
+    val conn = tlsAccept(ctx, serverFd)
+    if (conn < 0) {
+        mapPut(result, "type", TLS_ERROR())
+        mapPut(result, "error", "TLS accept failed: " + tlsLastError())
+        mapPut(result, "conn", -1)
+        return result
+    }
+    mapPut(result, "type", "TLS_CONN")
+    mapPut(result, "error", "")
+    mapPut(result, "conn", conn)
+    return result
+}
+
+// == Error Checking ===========================================================
+
+// Check if a TLS result map represents an error
+fun tlsIsError(result: Map): Bool {
+    val t = mapGet(result, "type")
+    return t == TLS_ERROR()
+}
