@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [master, develop, 'feature/**']
+  pull_request:
+    branches: [master, develop]
+
+jobs:
+  test-stdlib:
+    runs-on: ubuntu-22.04
+    container: swift:5.10.1-jammy
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends git libssl-dev pkg-config
+          if command -v clang > /dev/null 2>&1; then
+            echo "clang already available: $(clang --version | head -1)"
+          else
+            apt-get install -y --no-install-recommends clang-15
+            ln -sf /usr/bin/clang-15 /usr/bin/clang
+          fi
+          apt-get clean && rm -rf /var/lib/apt/lists/*
+
+      - name: Checkout stdlib
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          git clone --depth 1 --branch "${BRANCH}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build compiler
+        run: |
+          echo "Cloning compiler repo..."
+          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit.git /tmp/compiler
+          cd /tmp/compiler/RockitCompiler
+          echo "Building Stage 0 compiler..."
+          swift build -c release
+          echo "Building Stage 1 compiler..."
+          .build/release/rockit build-native self-hosted-rockit/command.rok
+          echo "Building runtime..."
+          bash runtime/rockit/build.sh
+          echo "Compiler ready"
+
+      - name: Run stdlib tests — core
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme core --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE
+
+      - name: Run stdlib tests — encoding
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme encoding --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE
+
+      - name: Run stdlib tests — filesystem
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme filesystem --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE
+
+      - name: Run stdlib tests — networking
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme networking --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE
+
+      - name: Run stdlib tests — security
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme security --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE
+
+      - name: Run stdlib tests — time
+        run: |
+          ROCKIT=/tmp/compiler/RockitCompiler/self-hosted-rockit/command
+          RUNTIME=/tmp/compiler/RockitCompiler/runtime/rockit_runtime.o
+          TRIPLE="x86_64-unknown-linux-gnu"
+          $ROCKIT test --scheme time --lib-path . --runtime-path $RUNTIME --target-triple $TRIPLE

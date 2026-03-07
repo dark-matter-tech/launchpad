@@ -1,6 +1,8 @@
 # Launchpad — Rockit Standard Library
 
-The standard library for the [Rockit](https://github.com/dark-matter-tech) programming language. 15 modules covering core utilities, file I/O, networking, encoding, testing, and time.
+![CI](https://github.com/dark-matter-tech/launchpad/actions/workflows/ci.yml/badge.svg)
+
+The standard library for the [Rockit](https://github.com/dark-matter-tech) programming language. 22 modules covering core utilities, encoding, filesystem, networking, security, testing, and time.
 
 ## Usage
 
@@ -23,13 +25,19 @@ import rockit.testing.probe
 | Result | `rockit.core.result` | — | Result type (Success/Failure) for error handling |
 | UUID | `rockit.core.uuid` | RFC 9562 | UUID v4 random generation |
 | Base64 | `rockit.encoding.base64` | RFC 4648 | Base64 encode/decode |
+| HPACK | `rockit.encoding.hpack` | RFC 7541 | HPACK header compression for HTTP/2 |
 | JSON | `rockit.encoding.json` | RFC 8259 | JSON parse, stringify, pretty-print, auto-wrap |
 | XML | `rockit.encoding.xml` | W3C XML 1.0 | XML parsing, generation, JSON bridge |
 | File I/O | `rockit.filesystem.file` | — | Read, write, exists, delete files |
 | Path | `rockit.filesystem.path` | — | Join, dir, base, ext, normalize paths |
-| HTTP | `rockit.networking.http` | RFC 9110 | HTTP/1.1 client (GET/POST/PUT/DELETE, HTTPS via curl) |
+| HTTP | `rockit.networking.http` | RFC 9110 | HTTP/1.1 client with native TLS for HTTPS |
+| HTTP/2 | `rockit.networking.http2` | RFC 9113 | HTTP/2 multiplexed client with HPACK |
 | URL | `rockit.networking.url` | RFC 3986 | URL parsing, percent-encoding, query parameters |
-| WebSocket | `rockit.networking.websocket` | RFC 6455 | WebSocket client with frame encoding |
+| WebSocket | `rockit.networking.websocket` | RFC 6455 | WebSocket client, ws:// and wss:// |
+| TLS | `rockit.security.tls` | RFC 8446 | TLS 1.2/1.3 via OpenSSL |
+| Crypto | `rockit.security.crypto` | FIPS 180-4 | SHA-256, HMAC, AES encryption |
+| X.509 | `rockit.security.x509` | RFC 5280 | X.509 certificate parsing and validation |
+| PEM | `rockit.security.pem` | RFC 7468 | PEM encoding and decoding |
 | Probe | `rockit.testing.probe` | — | Test assertions for `@Test` annotated functions |
 | DateTime | `rockit.time.datetime` | ISO 8601 | Date/time formatting, epoch conversion, leap years |
 
@@ -53,15 +61,22 @@ rockit/
 │   └── uuid.rok           # UUID v4 generation
 ├── encoding/
 │   ├── base64.rok         # Base64 encode/decode (RFC 4648)
+│   ├── hpack.rok          # HPACK header compression (RFC 7541)
 │   ├── json.rok           # JSON encoder/decoder (RFC 8259)
 │   └── xml.rok            # XML parser/generator (W3C XML 1.0)
 ├── filesystem/
 │   ├── file.rok           # File I/O wrappers
 │   └── path.rok           # Path join/dir/base/ext/normalize
 ├── networking/
-│   ├── http.rok           # HTTP/1.1 client (RFC 9110)
+│   ├── http.rok           # HTTP/1.1 client with native TLS (RFC 9110)
+│   ├── http2.rok          # HTTP/2 multiplexed client (RFC 9113)
 │   ├── url.rok            # URL parser and encoder (RFC 3986)
-│   └── websocket.rok      # WebSocket client (RFC 6455)
+│   └── websocket.rok      # WebSocket client, ws/wss (RFC 6455)
+├── security/
+│   ├── tls.rok            # TLS 1.2/1.3 via OpenSSL (RFC 8446)
+│   ├── crypto.rok         # SHA-256, HMAC, AES (FIPS 180-4)
+│   ├── x509.rok           # X.509 certificate parsing (RFC 5280)
+│   └── pem.rok            # PEM encoding/decoding (RFC 7468)
 ├── testing/
 │   └── probe.rok          # Probe test framework (20+ assertions)
 └── time/
@@ -71,6 +86,7 @@ tests/
 ├── encoding/              # Tests for encoding modules
 ├── filesystem/            # Tests for filesystem modules
 ├── networking/            # Tests for networking modules
+├── security/              # Tests for security modules
 ├── testing/               # Tests for testing module
 └── time/                  # Tests for time module
 ```
