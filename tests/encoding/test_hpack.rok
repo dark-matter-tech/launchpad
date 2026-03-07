@@ -1,0 +1,541 @@
+// Tests for rockit.encoding.hpack
+import rockit.testing.probe
+import rockit.encoding.hpack
+
+// == Representation Type Constants ============================================
+
+@Test fun testHpackConstants() {
+    assertEquals(1, HPACK_INDEXED())
+    assertEquals(2, HPACK_LITERAL_INCREMENTAL())
+    assertEquals(3, HPACK_LITERAL_NONE())
+    assertEquals(4, HPACK_LITERAL_NEVER())
+}
+
+// == Static Table =============================================================
+
+@Test fun testStaticTableEntry1() {
+    val entry = hpackStaticEntry(1)
+    assertEqualsStr(":authority", toString(mapGet(entry, "name")))
+    assertEqualsStr("", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry2() {
+    val entry = hpackStaticEntry(2)
+    assertEqualsStr(":method", toString(mapGet(entry, "name")))
+    assertEqualsStr("GET", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry3() {
+    val entry = hpackStaticEntry(3)
+    assertEqualsStr(":method", toString(mapGet(entry, "name")))
+    assertEqualsStr("POST", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry4() {
+    val entry = hpackStaticEntry(4)
+    assertEqualsStr(":path", toString(mapGet(entry, "name")))
+    assertEqualsStr("/", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry5() {
+    val entry = hpackStaticEntry(5)
+    assertEqualsStr(":path", toString(mapGet(entry, "name")))
+    assertEqualsStr("/index.html", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry8() {
+    val entry = hpackStaticEntry(8)
+    assertEqualsStr(":status", toString(mapGet(entry, "name")))
+    assertEqualsStr("200", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry16() {
+    val entry = hpackStaticEntry(16)
+    assertEqualsStr("accept-encoding", toString(mapGet(entry, "name")))
+    assertEqualsStr("gzip, deflate", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry31() {
+    val entry = hpackStaticEntry(31)
+    assertEqualsStr("content-type", toString(mapGet(entry, "name")))
+    assertEqualsStr("", toString(mapGet(entry, "value")))
+}
+
+@Test fun testStaticTableEntry58() {
+    val entry = hpackStaticEntry(58)
+    assertEqualsStr("user-agent", toString(mapGet(entry, "name")))
+}
+
+@Test fun testStaticTableEntry61() {
+    val entry = hpackStaticEntry(61)
+    assertEqualsStr("www-authenticate", toString(mapGet(entry, "name")))
+}
+
+// == Static Table Lookup ======================================================
+
+@Test fun testStaticLookupExactMatch() {
+    assertEquals(2, hpackStaticLookup(":method", "GET"))
+    assertEquals(3, hpackStaticLookup(":method", "POST"))
+    assertEquals(4, hpackStaticLookup(":path", "/"))
+    assertEquals(8, hpackStaticLookup(":status", "200"))
+}
+
+@Test fun testStaticLookupNoMatch() {
+    assertEquals(0, hpackStaticLookup("x-custom", "value"))
+}
+
+@Test fun testStaticLookupNameOnly() {
+    assertEquals(2, hpackStaticLookupName(":method"))
+    assertEquals(4, hpackStaticLookupName(":path"))
+    assertEquals(1, hpackStaticLookupName(":authority"))
+    assertEquals(0, hpackStaticLookupName("x-custom"))
+}
+
+// == Integer Encoding/Decoding (RFC 7541 Section 5.1) =========================
+
+@Test fun testEncodeIntSmall() {
+    // Value 10 with 5-bit prefix, no high bits
+    val encoded = hpackEncodeInt(10, 5, 0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(10, charCodeAt(encoded, 0))
+}
+
+@Test fun testEncodeIntBoundary() {
+    // Value 30 with 5-bit prefix (max prefix = 31, so fits in one byte)
+    val encoded = hpackEncodeInt(30, 5, 0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(30, charCodeAt(encoded, 0))
+}
+
+@Test fun testEncodeIntMultiByte() {
+    // Value 50 with 5-bit prefix: exceeds max prefix (31), needs 2 bytes
+    // Expected: 31, 19 (50 - 31 = 19, both < 128)
+    val encoded = hpackEncodeInt(50, 5, 0)
+    assertEquals(2, stringLength(encoded))
+    assertEquals(31, charCodeAt(encoded, 0))
+    assertEquals(19, charCodeAt(encoded, 1))
+}
+
+@Test fun testDecodeIntSmall() {
+    val input = intToChar(10)
+    val result = hpackDecodeInt(input, 0, 5)
+    assertEquals(10, toInt(mapGet(result, "value")))
+    assertEquals(1, toInt(mapGet(result, "pos")))
+}
+
+@Test fun testDecodeIntMultiByte() {
+    // Decode value 50 from bytes [31, 19] (both < 128)
+    var input: String = intToChar(31)
+    input = stringConcat(input, intToChar(19))
+    val result = hpackDecodeInt(input, 0, 5)
+    assertEquals(50, toInt(mapGet(result, "value")))
+    assertEquals(2, toInt(mapGet(result, "pos")))
+}
+
+@Test fun testIntRoundtrip5bit() {
+    // Values 0-30 fit in one byte; values 31-158 produce 2-byte encodings
+    // with all bytes < 128. Values >= 159 need continuation bytes >= 128
+    // which intToChar can't produce (ASCII-only runtime limitation).
+    var v: Int = 0
+    while (v <= 158) {
+        val encoded = hpackEncodeInt(v, 5, 0)
+        val decoded = hpackDecodeInt(encoded, 0, 5)
+        assertEquals(v, toInt(mapGet(decoded, "value")))
+        v = v + 1
+    }
+}
+
+@Test fun testIntRoundtrip7bit() {
+    val encoded = hpackEncodeInt(42, 7, 0)
+    val decoded = hpackDecodeInt(encoded, 0, 7)
+    assertEquals(42, toInt(mapGet(decoded, "value")))
+}
+
+@Test fun testIntWithPrefixBits() {
+    // Encode 10 with 5-bit prefix and high bits 0x40 (64)
+    // Result byte: 64 + 10 = 74 (< 128, within ASCII range)
+    val encoded = hpackEncodeInt(10, 5, 64)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(74, charCodeAt(encoded, 0))  // 64 + 10
+}
+
+// == String Encoding/Decoding =================================================
+
+@Test fun testEncodeStringEmpty() {
+    val encoded = hpackEncodeString("")
+    assertEquals(1, stringLength(encoded))
+    assertEquals(0, charCodeAt(encoded, 0))  // length = 0, H = 0
+}
+
+@Test fun testEncodeStringShort() {
+    val encoded = hpackEncodeString("hello")
+    assertEquals(6, stringLength(encoded))
+    assertEquals(5, charCodeAt(encoded, 0))  // length = 5, H = 0
+}
+
+@Test fun testDecodeStringRaw() {
+    // Build: 0x05 "hello"
+    var input: String = intToChar(5)
+    input = stringConcat(input, "hello")
+    val result = hpackDecodeString(input, 0)
+    assertEqualsStr("hello", toString(mapGet(result, "value")))
+    assertEquals(6, toInt(mapGet(result, "pos")))
+}
+
+@Test fun testStringRoundtrip() {
+    val original = "content-type"
+    val encoded = hpackEncodeString(original)
+    val decoded = hpackDecodeString(encoded, 0)
+    assertEqualsStr(original, toString(mapGet(decoded, "value")))
+}
+
+@Test fun testStringRoundtripEmpty() {
+    val encoded = hpackEncodeString("")
+    val decoded = hpackDecodeString(encoded, 0)
+    assertEqualsStr("", toString(mapGet(decoded, "value")))
+}
+
+// == Header Block Encode/Decode ===============================================
+
+@Test fun testEncodeLiteralWithIndexedName() {
+    // :authority with custom value uses incremental indexing (non-sensitive)
+    // Byte 0: 0x40 | 1 = 0x41 = 65 (incremental indexing, name index 1)
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":authority")
+    mapPut(h, "value", "example.com")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    assertEquals(65, charCodeAt(encoded, 0))
+    assertGreaterThan(stringLength(encoded), 1)
+}
+
+@Test fun testEncodeLiteralNewName() {
+    // Custom header with no static table match uses literal without indexing
+    // Byte 0: 0x00 = 0 (without indexing, no name index)
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "x-custom")
+    mapPut(h, "value", "test")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    assertEquals(0, charCodeAt(encoded, 0))
+    assertGreaterThan(stringLength(encoded), 1)
+}
+
+@Test fun testEncodeLiteralWithNameRef() {
+    // :authority with custom value - name is in static table (index 1)
+    // Non-sensitive → incremental indexing: 0x40 | 1 = 65
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":authority")
+    mapPut(h, "value", "example.com")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    assertEquals(65, charCodeAt(encoded, 0))
+    assertGreaterThan(stringLength(encoded), 1)
+}
+
+@Test fun testHeaderBlockRoundtrip() {
+    // Use literal-only headers (no exact static match → avoids indexed bytes >= 128)
+    val encCtx = hpackCreateContext()
+    val decCtx = hpackCreateContext()
+    val headers = listCreate()
+
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":authority")
+    mapPut(h1, "value", "example.com")
+    listAppend(headers, h1)
+
+    val h2 = mapCreate()
+    mapPut(h2, "name", "x-request-id")
+    mapPut(h2, "value", "abc123")
+    listAppend(headers, h2)
+
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(decCtx, encoded, stringLength(encoded))
+
+    assertEquals(2, listSize(decoded))
+    val d1 = listGet(decoded, 0)
+    assertEqualsStr(":authority", toString(mapGet(d1, "name")))
+    assertEqualsStr("example.com", toString(mapGet(d1, "value")))
+    val d2 = listGet(decoded, 1)
+    assertEqualsStr("x-request-id", toString(mapGet(d2, "name")))
+    assertEqualsStr("abc123", toString(mapGet(d2, "value")))
+}
+
+@Test fun testHeaderBlockCustomHeaders() {
+    val encCtx = hpackCreateContext()
+    val decCtx = hpackCreateContext()
+    val headers = listCreate()
+
+    val h1 = mapCreate()
+    mapPut(h1, "name", "x-custom")
+    mapPut(h1, "value", "test-value")
+    listAppend(headers, h1)
+
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(decCtx, encoded, stringLength(encoded))
+
+    assertEquals(1, listSize(decoded))
+    val d1 = listGet(decoded, 0)
+    assertEqualsStr("x-custom", toString(mapGet(d1, "name")))
+    assertEqualsStr("test-value", toString(mapGet(d1, "value")))
+}
+
+@Test fun testHeaderBlockMultipleHeaders() {
+    // Use literal-only headers to avoid indexed encoding (bytes >= 128)
+    // :authority and :path with non-default values use literal with name index
+    // Custom headers use literal with new name — all bytes < 128
+    val encCtx = hpackCreateContext()
+    val decCtx = hpackCreateContext()
+    val headers = listCreate()
+
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":authority")
+    mapPut(h1, "value", "localhost")
+    listAppend(headers, h1)
+
+    val h2 = mapCreate()
+    mapPut(h2, "name", ":path")
+    mapPut(h2, "value", "/api")
+    listAppend(headers, h2)
+
+    val h3 = mapCreate()
+    mapPut(h3, "name", "x-custom")
+    mapPut(h3, "value", "value1")
+    listAppend(headers, h3)
+
+    val h4 = mapCreate()
+    mapPut(h4, "name", "x-trace-id")
+    mapPut(h4, "value", "abc")
+    listAppend(headers, h4)
+
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(decCtx, encoded, stringLength(encoded))
+
+    assertEquals(4, listSize(decoded))
+    assertEqualsStr(":authority", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("localhost", toString(mapGet(listGet(decoded, 0), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(decoded, 1), "name")))
+    assertEqualsStr("/api", toString(mapGet(listGet(decoded, 1), "value")))
+    assertEqualsStr("x-custom", toString(mapGet(listGet(decoded, 2), "name")))
+    assertEqualsStr("value1", toString(mapGet(listGet(decoded, 2), "value")))
+    assertEqualsStr("x-trace-id", toString(mapGet(listGet(decoded, 3), "name")))
+    assertEqualsStr("abc", toString(mapGet(listGet(decoded, 3), "value")))
+}
+
+// == Dynamic Table ============================================================
+
+@Test fun testDynamicTableAdd() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "custom-header", "custom-value")
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    // Size = len("custom-header") + len("custom-value") + 32 = 13 + 12 + 32 = 57
+    assertEquals(57, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testDynamicTableMultipleEntries() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "name1", "val1")
+    hpackDynamicAdd(ctx, "name2", "val2")
+    hpackDynamicAdd(ctx, "name3", "val3")
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    // Each: 5 + 4 + 32 = 41, total = 123
+    assertEquals(123, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testDynamicTableEviction() {
+    val ctx = hpackCreateContext()
+    // Set max to 100 bytes — room for 2 entries of size 41 (82) but not 3 (123)
+    hpackDynamicResize(ctx, 100)
+    hpackDynamicAdd(ctx, "name1", "val1")
+    hpackDynamicAdd(ctx, "name2", "val2")
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    // Adding a third should evict the oldest
+    hpackDynamicAdd(ctx, "name3", "val3")
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    // Remaining: name3 (newest at idx 0) and name2 (idx 1); name1 evicted
+    assertEquals(82, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testDynamicTableResizeToZero() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "name1", "val1")
+    hpackDynamicAdd(ctx, "name2", "val2")
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    hpackDynamicResize(ctx, 0)
+    assertEquals(0, hpackDynamicTableLength(ctx))
+    assertEquals(0, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testDynamicTableResize() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "name1", "val1")  // 41
+    hpackDynamicAdd(ctx, "name2", "val2")  // 41
+    hpackDynamicAdd(ctx, "name3", "val3")  // 41, total = 123
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    // Resize to 50: only room for 1 entry
+    hpackDynamicResize(ctx, 50)
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    assertEquals(41, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testDynamicTableSizeCalculation() {
+    val ctx = hpackCreateContext()
+    // RFC 7541 Section 4.1: entry size = name bytes + value bytes + 32
+    hpackDynamicAdd(ctx, "content-type", "text/html")
+    // 12 + 9 + 32 = 53
+    assertEquals(53, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testHpackLookupStatic() {
+    val ctx = hpackCreateContext()
+    val entry = hpackLookup(ctx, 2)
+    assertEqualsStr(":method", toString(mapGet(entry, "name")))
+    assertEqualsStr("GET", toString(mapGet(entry, "value")))
+}
+
+@Test fun testHpackLookupDynamic() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "x-test", "hello")
+    // Dynamic index 62 = newest entry
+    val entry = hpackLookup(ctx, 62)
+    assertEqualsStr("x-test", toString(mapGet(entry, "name")))
+    assertEqualsStr("hello", toString(mapGet(entry, "value")))
+}
+
+@Test fun testHpackLookupDynamicMultiple() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "first", "aaa")
+    hpackDynamicAdd(ctx, "second", "bbb")
+    // Index 62 = newest (second), 63 = oldest (first)
+    val e62 = hpackLookup(ctx, 62)
+    assertEqualsStr("second", toString(mapGet(e62, "name")))
+    val e63 = hpackLookup(ctx, 63)
+    assertEqualsStr("first", toString(mapGet(e63, "name")))
+}
+
+@Test fun testDecoderIncrementalIndexing() {
+    // Build a header block using incremental indexing (0x40 prefix)
+    // 0x40 | nameIdx (6-bit prefix) + encoded value
+    // :authority (index 1): 0x41 = 65, then string "test.com"
+    val ctx = hpackCreateContext()
+    var block: String = intToChar(65)  // 0x40 | 1 = literal incremental, name idx 1
+    block = stringConcat(block, hpackEncodeString("test.com"))
+    val headers = hpackDecode(ctx, block, stringLength(block))
+    assertEquals(1, listSize(headers))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("test.com", toString(mapGet(listGet(headers, 0), "value")))
+    // Should be added to dynamic table
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    val dynEntry = hpackLookup(ctx, 62)
+    assertEqualsStr(":authority", toString(mapGet(dynEntry, "name")))
+    assertEqualsStr("test.com", toString(mapGet(dynEntry, "value")))
+}
+
+// == Encoder Enhancement ======================================================
+
+@Test fun testEncoderSensitiveHeaders() {
+    // Sensitive headers use never-indexed encoding (0x10 prefix)
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "authorization")
+    mapPut(h, "value", "Bearer token123")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    // authorization is static index 23, so: 0x10 | prefix = hpackEncodeInt(23, 4, 16)
+    // 23 fits in 4 bits (max 15), so needs multi-byte: first byte = 16+15 = 31
+    assertEquals(31, charCodeAt(encoded, 0))
+    // Should NOT be added to dynamic table
+    assertEquals(0, hpackDynamicTableLength(ctx))
+}
+
+@Test fun testEncoderSensitiveCookie() {
+    assertTrue(hpackIsSensitive("authorization"))
+    assertTrue(hpackIsSensitive("cookie"))
+    assertTrue(hpackIsSensitive("set-cookie"))
+    assertTrue(hpackIsSensitive("proxy-authorization"))
+    assertFalse(hpackIsSensitive("content-type"))
+    assertFalse(hpackIsSensitive(":authority"))
+}
+
+@Test fun testEncoderIncrementalIndexing() {
+    // Non-sensitive header with static name match uses incremental indexing
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "content-type")
+    mapPut(h, "value", "text/html")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    // content-type is static index 31: 0x40 | 31 = 95
+    assertEquals(95, charCodeAt(encoded, 0))
+    // Should be added to encoder's dynamic table
+    assertEquals(1, hpackDynamicTableLength(ctx))
+}
+
+@Test fun testEncoderDynamicSizeUpdate() {
+    // Dynamic table size update: 001xxxxx prefix
+    val encoded = hpackEncodeDynamicSizeUpdate(0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(32, charCodeAt(encoded, 0))  // 0x20 = 32 (001 00000)
+
+    val encoded2 = hpackEncodeDynamicSizeUpdate(30)
+    assertEquals(1, stringLength(encoded2))
+    assertEquals(62, charCodeAt(encoded2, 0))  // 32 + 30 = 62
+}
+
+@Test fun testEncoderDecoderRoundtripWithDynamic() {
+    // Encode with incremental indexing, decode should populate dynamic table
+    val encCtx = hpackCreateContext()
+    val decCtx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "content-type")
+    mapPut(h, "value", "application/json")
+    listAppend(headers, h)
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(decCtx, encoded, stringLength(encoded))
+    assertEquals(1, listSize(decoded))
+    assertEqualsStr("content-type", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("application/json", toString(mapGet(listGet(decoded, 0), "value")))
+    // Both encoder and decoder should have the entry in dynamic table
+    assertEquals(1, hpackDynamicTableLength(encCtx))
+    assertEquals(1, hpackDynamicTableLength(decCtx))
+}
+
+@Test fun testDecoderSizeUpdate() {
+    val ctx = hpackCreateContext()
+    hpackDynamicAdd(ctx, "name1", "val1")
+    hpackDynamicAdd(ctx, "name2", "val2")
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    // Build a size update to 0 (001 prefix, 5-bit): 0x20 = 32
+    var block: String = intToChar(32)  // size update to 0
+    val headers = hpackDecode(ctx, block, stringLength(block))
+    assertEquals(0, listSize(headers))
+    assertEquals(0, hpackDynamicTableLength(ctx))
+}
+
+// == Helpers ==================================================================
+
+@Test fun testHpackPow2() {
+    assertEquals(1, hpackPow2(0))
+    assertEquals(2, hpackPow2(1))
+    assertEquals(4, hpackPow2(2))
+    assertEquals(8, hpackPow2(3))
+    assertEquals(128, hpackPow2(7))
+    assertEquals(256, hpackPow2(8))
+}
+
+@Test fun testHpackAnd() {
+    assertEquals(0, hpackAnd(0, 0))
+    assertEquals(0, hpackAnd(255, 0))
+    assertEquals(255, hpackAnd(255, 255))
+    assertEquals(31, hpackAnd(255, 31))
+    assertEquals(127, hpackAnd(255, 127))
+}

@@ -8,7 +8,7 @@
 //   import rockit.core.collections
 //   val nums = listOf3(3, 1, 2)
 //   listSort(nums)
-//   val sum = listFold(nums, 0, fun(a: Int, b: Int): Int { return a + b })
+//   val sum = listFold(nums, 0, { a: Int, b: Int -> a + b })
 
 // == List Constructors =======================================================
 

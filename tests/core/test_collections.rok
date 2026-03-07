@@ -124,7 +124,7 @@ import rockit.core.collections
 
 @Test fun testListMap() {
     val l = listOf3(1, 2, 3)
-    val doubled = listMap(l, fun(x: Int): Int { return x * 2 })
+    val doubled = listMap(l, { x: Int -> x * 2 })
     assertEquals(2, toInt(listGet(doubled, 0)))
     assertEquals(4, toInt(listGet(doubled, 1)))
     assertEquals(6, toInt(listGet(doubled, 2)))
@@ -132,7 +132,7 @@ import rockit.core.collections
 
 @Test fun testListFilter() {
     val l = listOf5(1, 2, 3, 4, 5)
-    val evens = listFilter(l, fun(x: Int): Bool { return x % 2 == 0 })
+    val evens = listFilter(l, { x: Int -> x % 2 == 0 })
     assertEquals(2, listSize(evens))
     assertEquals(2, toInt(listGet(evens, 0)))
     assertEquals(4, toInt(listGet(evens, 1)))
@@ -140,31 +140,31 @@ import rockit.core.collections
 
 @Test fun testListFold() {
     val l = listOf3(1, 2, 3)
-    val sum = listFold(l, 0, fun(acc: Int, x: Int): Int { return acc + x })
+    val sum = listFold(l, 0, { acc: Int, x: Int -> acc + x })
     assertEquals(6, sum)
 }
 
 @Test fun testListAny() {
     val l = listOf3(1, 2, 3)
-    assertTrue(listAny(l, fun(x: Int): Bool { return x == 2 }))
-    assertFalse(listAny(l, fun(x: Int): Bool { return x == 99 }))
+    assertTrue(listAny(l, { x: Int -> x == 2 }))
+    assertFalse(listAny(l, { x: Int -> x == 99 }))
 }
 
 @Test fun testListAll() {
     val l = listOf3(2, 4, 6)
-    assertTrue(listAll(l, fun(x: Int): Bool { return x % 2 == 0 }))
-    assertFalse(listAll(l, fun(x: Int): Bool { return x > 3 }))
+    assertTrue(listAll(l, { x: Int -> x % 2 == 0 }))
+    assertFalse(listAll(l, { x: Int -> x > 3 }))
 }
 
 @Test fun testListCount() {
     val l = listOf5(1, 2, 3, 4, 5)
-    assertEquals(3, listCount(l, fun(x: Int): Bool { return x > 2 }))
+    assertEquals(3, listCount(l, { x: Int -> x > 2 }))
 }
 
 @Test fun testListFind() {
     val l = listOf3(10, 20, 30)
-    assertEquals(20, listFind(l, fun(x: Int): Bool { return x > 15 }))
-    assertEquals(-1, listFind(l, fun(x: Int): Bool { return x > 100 }))
+    assertEquals(20, listFind(l, { x: Int -> x > 15 }))
+    assertEquals(-1, listFind(l, { x: Int -> x > 100 }))
 }
 
 // == Sorting and Deduplication ===============================================

@@ -36,14 +36,14 @@ import rockit.core.result
 
 @Test fun testResultMapSuccess() {
     val r = Success(10)
-    val mapped = resultMap(r, fun(x: Int): Int { return x * 2 })
+    val mapped = resultMap(r, { x: Int -> x * 2 })
     assertTrue(isSuccess(mapped))
     assertEquals(20, resultOrElse(mapped, 0))
 }
 
 @Test fun testResultMapFailure() {
     val r = Failure("err")
-    val mapped = resultMap(r, fun(x: Int): Int { return x * 2 })
+    val mapped = resultMap(r, { x: Int -> x * 2 })
     assertTrue(isFailure(mapped))
     assertEqualsStr("err", resultError(mapped))
 }

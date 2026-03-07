@@ -1,0 +1,951 @@
+// rockit.encoding.hpack — HPACK header compression
+//
+// Implements HPACK header compression for HTTP/2, including the static table
+// (61 entries), dynamic table with eviction, integer encoding/decoding, string
+// literal encoding/decoding, and Huffman decoding. Encoder uses incremental
+// indexing for non-sensitive headers, never-indexed for sensitive headers.
+//
+// Standards: RFC 7541 — HPACK: Header Compression for HTTP/2
+//
+// Usage:
+//   import rockit.encoding.hpack
+//   val ctx = hpackCreateContext()
+//   val encoded = hpackEncode(ctx, headers)
+//   val decoded = hpackDecode(ctx, data, dataLen)
+
+// == Representation Type Constants ============================================
+
+// Indexed header field representation (Section 6.1)
+fun HPACK_INDEXED(): Int { return 1 }
+
+// Literal with incremental indexing (Section 6.2.1)
+fun HPACK_LITERAL_INCREMENTAL(): Int { return 2 }
+
+// Literal without indexing (Section 6.2.2)
+fun HPACK_LITERAL_NONE(): Int { return 3 }
+
+// Literal never indexed (Section 6.2.3)
+fun HPACK_LITERAL_NEVER(): Int { return 4 }
+
+// == Static Table (RFC 7541 Appendix A) =======================================
+
+// Return the header name for a static table index (1-61)
+fun hpackStaticName(index: Int): String {
+    if (index == 1) { return ":authority" }
+    if (index == 2) { return ":method" }
+    if (index == 3) { return ":method" }
+    if (index == 4) { return ":path" }
+    if (index == 5) { return ":path" }
+    if (index == 6) { return ":scheme" }
+    if (index == 7) { return ":scheme" }
+    if (index == 8) { return ":status" }
+    if (index == 9) { return ":status" }
+    if (index == 10) { return ":status" }
+    if (index == 11) { return ":status" }
+    if (index == 12) { return ":status" }
+    if (index == 13) { return ":status" }
+    if (index == 14) { return ":status" }
+    if (index == 15) { return "accept-charset" }
+    if (index == 16) { return "accept-encoding" }
+    if (index == 17) { return "accept-language" }
+    if (index == 18) { return "accept-ranges" }
+    if (index == 19) { return "accept" }
+    if (index == 20) { return "access-control-allow-origin" }
+    if (index == 21) { return "age" }
+    if (index == 22) { return "allow" }
+    if (index == 23) { return "authorization" }
+    if (index == 24) { return "cache-control" }
+    if (index == 25) { return "content-disposition" }
+    if (index == 26) { return "content-encoding" }
+    if (index == 27) { return "content-language" }
+    if (index == 28) { return "content-length" }
+    if (index == 29) { return "content-location" }
+    if (index == 30) { return "content-range" }
+    if (index == 31) { return "content-type" }
+    if (index == 32) { return "cookie" }
+    if (index == 33) { return "date" }
+    if (index == 34) { return "etag" }
+    if (index == 35) { return "expect" }
+    if (index == 36) { return "expires" }
+    if (index == 37) { return "from" }
+    if (index == 38) { return "host" }
+    if (index == 39) { return "if-match" }
+    if (index == 40) { return "if-modified-since" }
+    if (index == 41) { return "if-none-match" }
+    if (index == 42) { return "if-range" }
+    if (index == 43) { return "if-unmodified-since" }
+    if (index == 44) { return "last-modified" }
+    if (index == 45) { return "link" }
+    if (index == 46) { return "location" }
+    if (index == 47) { return "max-forwards" }
+    if (index == 48) { return "proxy-authenticate" }
+    if (index == 49) { return "proxy-authorization" }
+    if (index == 50) { return "range" }
+    if (index == 51) { return "referer" }
+    if (index == 52) { return "refresh" }
+    if (index == 53) { return "retry-after" }
+    if (index == 54) { return "server" }
+    if (index == 55) { return "set-cookie" }
+    if (index == 56) { return "strict-transport-security" }
+    if (index == 57) { return "transfer-encoding" }
+    if (index == 58) { return "user-agent" }
+    if (index == 59) { return "vary" }
+    if (index == 60) { return "via" }
+    if (index == 61) { return "www-authenticate" }
+    return ""
+}
+
+// Return the header value for a static table index (1-61)
+fun hpackStaticValue(index: Int): String {
+    if (index == 2) { return "GET" }
+    if (index == 3) { return "POST" }
+    if (index == 4) { return "/" }
+    if (index == 5) { return "/index.html" }
+    if (index == 6) { return "http" }
+    if (index == 7) { return "https" }
+    if (index == 8) { return "200" }
+    if (index == 9) { return "204" }
+    if (index == 10) { return "206" }
+    if (index == 11) { return "304" }
+    if (index == 12) { return "400" }
+    if (index == 13) { return "404" }
+    if (index == 14) { return "500" }
+    if (index == 16) { return "gzip, deflate" }
+    return ""
+}
+
+// Return a map with "name" and "value" for a static table index
+fun hpackStaticEntry(index: Int): Map {
+    val entry = mapCreate()
+    mapPut(entry, "name", hpackStaticName(index))
+    mapPut(entry, "value", hpackStaticValue(index))
+    return entry
+}
+
+// Look up exact match (name+value) in static table, return index or 0
+fun hpackStaticLookup(name: String, value: String): Int {
+    var i: Int = 1
+    while (i <= 61) {
+        if (hpackStaticName(i) == name) {
+            if (hpackStaticValue(i) == value) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Look up name-only match in static table, return first index or 0
+fun hpackStaticLookupName(name: String): Int {
+    var i: Int = 1
+    while (i <= 61) {
+        if (hpackStaticName(i) == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// == Integer Encoding/Decoding (RFC 7541 Section 5.1) =========================
+
+// Encode an integer with the given prefix size (5, 6, or 7 bits)
+// prefixBits: the high bits to OR into the first byte
+fun hpackEncodeInt(value: Int, prefixSize: Int, prefixBits: Int): String {
+    val maxPrefix = hpackPow2(prefixSize) - 1
+    if (value < maxPrefix) {
+        return intToChar(prefixBits + value)
+    }
+    var result: String = intToChar(prefixBits + maxPrefix)
+    var remaining: Int = value - maxPrefix
+    while (remaining >= 128) {
+        result = stringConcat(result, intToChar(128 + remaining - (remaining / 128) * 128))
+        remaining = remaining / 128
+    }
+    result = stringConcat(result, intToChar(remaining))
+    return result
+}
+
+// Decode an integer from data at position pos with the given prefix size
+// Returns map with "value" and "pos" (updated position)
+fun hpackDecodeInt(buf: String, pos: Int, prefixSize: Int): Map {
+    val result = mapCreate()
+    val bufLen = stringLength(buf)
+    if (pos >= bufLen) {
+        mapPut(result, "value", 0)
+        mapPut(result, "pos", pos)
+        return result
+    }
+    val maxPrefix = hpackPow2(prefixSize) - 1
+    val mask = maxPrefix
+    val b = charCodeAt(buf, pos)
+    var value: Int = hpackAnd(b, mask)
+    var newPos: Int = pos + 1
+    if (value < maxPrefix) {
+        mapPut(result, "value", value)
+        mapPut(result, "pos", newPos)
+        return result
+    }
+    // Multi-byte integer
+    var m: Int = 0
+    var done: Bool = false
+    while (done == false) {
+        if (newPos >= bufLen) {
+            done = true
+        } else {
+            val nextByte = charCodeAt(buf, newPos)
+            value = value + (nextByte - (nextByte / 128) * 128) * hpackPow2(m)
+            newPos = newPos + 1
+            if (nextByte < 128) {
+                done = true
+            }
+            m = m + 7
+        }
+    }
+    mapPut(result, "value", value)
+    mapPut(result, "pos", newPos)
+    return result
+}
+
+// == String Encoding/Decoding (RFC 7541 Section 5.2) ==========================
+
+// Encode a string literal (raw, no Huffman: H=0)
+fun hpackEncodeString(s: String): String {
+    val len = stringLength(s)
+    // H=0 means prefix bits are 0, prefix size is 7
+    var result: String = hpackEncodeInt(len, 7, 0)
+    result = stringConcat(result, s)
+    return result
+}
+
+// Decode a string literal from data at pos
+// Returns map with "value" (string) and "pos" (updated position)
+fun hpackDecodeString(buf: String, pos: Int): Map {
+    val result = mapCreate()
+    val bufLen = stringLength(buf)
+    if (pos >= bufLen) {
+        mapPut(result, "value", "")
+        mapPut(result, "pos", pos)
+        return result
+    }
+    val firstByte = charCodeAt(buf, pos)
+    val huffman = firstByte / 128  // H bit
+    // Decode length with 7-bit prefix
+    val lenResult = hpackDecodeInt(buf, pos, 7)
+    val strLen = toInt(mapGet(lenResult, "value"))
+    var newPos: Int = toInt(mapGet(lenResult, "pos"))
+    if (huffman == 1) {
+        // Huffman-encoded string
+        val decoded = hpackHuffmanDecode(buf, newPos, strLen)
+        mapPut(result, "value", decoded)
+        mapPut(result, "pos", newPos + strLen)
+        return result
+    }
+    // Raw string
+    var s: String = ""
+    var i: Int = 0
+    while (i < strLen) {
+        if (newPos + i < bufLen) {
+            s = stringConcat(s, intToChar(charCodeAt(buf, newPos + i)))
+        }
+        i = i + 1
+    }
+    mapPut(result, "value", s)
+    mapPut(result, "pos", newPos + strLen)
+    return result
+}
+
+// == Huffman Decoding (RFC 7541 Appendix B) ===================================
+
+// Get the Huffman code for a symbol (0-256). Symbol 256 = EOS.
+// Returns the code as an integer.
+fun hpackHuffmanCode(sym: Int): Int {
+    if (sym == 0) { return 8184 }          // 13 bits
+    if (sym == 1) { return 8388568 }       // 23 bits
+    if (sym == 2) { return 268435426 }     // 28 bits
+    if (sym == 3) { return 268435427 }     // 28 bits
+    if (sym == 4) { return 268435428 }     // 28 bits
+    if (sym == 5) { return 268435429 }     // 28 bits
+    if (sym == 6) { return 268435430 }     // 28 bits
+    if (sym == 7) { return 268435431 }     // 28 bits
+    if (sym == 8) { return 268435432 }     // 28 bits
+    if (sym == 9) { return 16777194 }      // 24 bits
+    if (sym == 10) { return 1073741820 }   // 30 bits
+    if (sym == 11) { return 268435433 }    // 28 bits
+    if (sym == 12) { return 268435434 }    // 28 bits
+    if (sym == 13) { return 1073741821 }   // 30 bits
+    if (sym == 14) { return 268435435 }    // 28 bits
+    if (sym == 15) { return 268435436 }    // 28 bits
+    if (sym == 16) { return 268435437 }    // 28 bits
+    if (sym == 17) { return 268435438 }    // 28 bits
+    if (sym == 18) { return 268435439 }    // 28 bits
+    if (sym == 19) { return 268435440 }    // 28 bits
+    if (sym == 20) { return 268435441 }    // 28 bits
+    if (sym == 21) { return 268435442 }    // 28 bits
+    if (sym == 22) { return 1073741822 }   // 30 bits
+    if (sym == 23) { return 268435443 }    // 28 bits
+    if (sym == 24) { return 268435444 }    // 28 bits
+    if (sym == 25) { return 268435445 }    // 28 bits
+    if (sym == 26) { return 268435446 }    // 28 bits
+    if (sym == 27) { return 268435447 }    // 28 bits
+    if (sym == 28) { return 268435448 }    // 28 bits
+    if (sym == 29) { return 268435449 }    // 28 bits
+    if (sym == 30) { return 268435450 }    // 28 bits
+    if (sym == 31) { return 268435451 }    // 28 bits
+    if (sym == 32) { return 20 }           // 6 bits  (space)
+    if (sym == 33) { return 1016 }         // 10 bits !
+    if (sym == 34) { return 1017 }         // 10 bits "
+    if (sym == 35) { return 4084 }         // 12 bits #
+    if (sym == 36) { return 8185 }         // 13 bits $
+    if (sym == 37) { return 21 }           // 6 bits  %
+    if (sym == 38) { return 248 }          // 8 bits  &
+    if (sym == 39) { return 2042 }         // 11 bits '
+    if (sym == 40) { return 1018 }         // 10 bits (
+    if (sym == 41) { return 1019 }         // 10 bits )
+    if (sym == 42) { return 249 }          // 8 bits  *
+    if (sym == 43) { return 2043 }         // 11 bits +
+    if (sym == 44) { return 250 }          // 8 bits  ,
+    if (sym == 45) { return 22 }           // 6 bits  -
+    if (sym == 46) { return 23 }           // 6 bits  .
+    if (sym == 47) { return 24 }           // 6 bits  /
+    if (sym == 48) { return 0 }            // 5 bits  0
+    if (sym == 49) { return 1 }            // 5 bits  1
+    if (sym == 50) { return 2 }            // 5 bits  2
+    if (sym == 51) { return 25 }           // 6 bits  3
+    if (sym == 52) { return 26 }           // 6 bits  4
+    if (sym == 53) { return 27 }           // 6 bits  5
+    if (sym == 54) { return 28 }           // 6 bits  6
+    if (sym == 55) { return 29 }           // 6 bits  7
+    if (sym == 56) { return 30 }           // 6 bits  8
+    if (sym == 57) { return 31 }           // 6 bits  9
+    if (sym == 58) { return 92 }           // 7 bits  :
+    if (sym == 59) { return 251 }          // 8 bits  ;
+    if (sym == 60) { return 32764 }        // 15 bits <
+    if (sym == 61) { return 32 }           // 6 bits  =
+    if (sym == 62) { return 32765 }        // 15 bits >
+    if (sym == 63) { return 1020 }         // 10 bits ?
+    if (sym == 64) { return 32766 }        // 15 bits @
+    if (sym == 65) { return 33 }           // 6 bits  A
+    if (sym == 66) { return 34 }           // 6 bits  B
+    if (sym == 67) { return 35 }           // 6 bits  C
+    if (sym == 68) { return 36 }           // 6 bits  D
+    if (sym == 69) { return 37 }           // 6 bits  E
+    if (sym == 70) { return 38 }           // 6 bits  F
+    if (sym == 71) { return 39 }           // 6 bits  G
+    if (sym == 72) { return 40 }           // 6 bits  H
+    if (sym == 73) { return 41 }           // 6 bits  I
+    if (sym == 74) { return 42 }           // 6 bits  J
+    if (sym == 75) { return 43 }           // 6 bits  K
+    if (sym == 76) { return 44 }           // 6 bits  L
+    if (sym == 77) { return 45 }           // 6 bits  M
+    if (sym == 78) { return 46 }           // 6 bits  N
+    if (sym == 79) { return 47 }           // 6 bits  O
+    if (sym == 80) { return 48 }           // 6 bits  P
+    if (sym == 81) { return 49 }           // 6 bits  Q
+    if (sym == 82) { return 50 }           // 6 bits  R
+    if (sym == 83) { return 51 }           // 6 bits  S
+    if (sym == 84) { return 52 }           // 6 bits  T
+    if (sym == 85) { return 53 }           // 6 bits  U
+    if (sym == 86) { return 54 }           // 6 bits  V
+    if (sym == 87) { return 55 }           // 6 bits  W
+    if (sym == 88) { return 56 }           // 6 bits  X
+    if (sym == 89) { return 57 }           // 6 bits  Y
+    if (sym == 90) { return 58 }           // 6 bits  Z
+    if (sym == 91) { return 252 }          // 8 bits  [
+    if (sym == 92) { return 2044 }         // 11 bits backslash
+    if (sym == 93) { return 253 }          // 8 bits  ]
+    if (sym == 94) { return 8186 }         // 13 bits ^
+    if (sym == 95) { return 93 }           // 7 bits  _
+    if (sym == 96) { return 16380 }        // 14 bits `
+    if (sym == 97) { return 3 }            // 5 bits  a
+    if (sym == 98) { return 4 }            // 5 bits  b
+    if (sym == 99) { return 5 }            // 5 bits  c
+    if (sym == 100) { return 6 }           // 5 bits  d
+    if (sym == 101) { return 7 }           // 5 bits  e
+    if (sym == 102) { return 8 }           // 5 bits  f
+    if (sym == 103) { return 9 }           // 5 bits  g
+    if (sym == 104) { return 10 }          // 5 bits  h
+    if (sym == 105) { return 11 }          // 5 bits  i
+    if (sym == 106) { return 94 }          // 7 bits  j
+    if (sym == 107) { return 95 }          // 7 bits  k
+    if (sym == 108) { return 12 }          // 5 bits  l
+    if (sym == 109) { return 13 }          // 5 bits  m
+    if (sym == 110) { return 14 }          // 5 bits  n
+    if (sym == 111) { return 15 }          // 5 bits  o
+    if (sym == 112) { return 16 }          // 5 bits  p
+    if (sym == 113) { return 59 }          // 6 bits  q
+    if (sym == 114) { return 17 }          // 5 bits  r
+    if (sym == 115) { return 18 }          // 5 bits  s
+    if (sym == 116) { return 19 }          // 5 bits  t
+    if (sym == 117) { return 60 }          // 6 bits  u
+    if (sym == 118) { return 61 }          // 6 bits  v
+    if (sym == 119) { return 62 }          // 6 bits  w
+    if (sym == 120) { return 96 }          // 7 bits  x
+    if (sym == 121) { return 97 }          // 7 bits  y
+    if (sym == 122) { return 98 }          // 7 bits  z
+    if (sym == 123) { return 16381 }       // 14 bits {
+    if (sym == 124) { return 4085 }        // 12 bits |
+    if (sym == 125) { return 16382 }       // 14 bits }
+    if (sym == 126) { return 8187 }        // 13 bits ~
+    if (sym == 127) { return 268435452 }   // 28 bits
+    if (sym == 128) { return 268435453 }   // 28 bits
+    if (sym == 129) { return 268435454 }   // 28 bits
+    if (sym == 130) { return 268435455 }   // 28 bits
+    if (sym == 131) { return 536870896 }   // 29 bits
+    if (sym == 132) { return 536870897 }   // 29 bits
+    if (sym == 133) { return 536870898 }   // 29 bits
+    if (sym == 134) { return 536870899 }   // 29 bits
+    if (sym == 135) { return 536870900 }   // 29 bits
+    if (sym == 136) { return 536870901 }   // 29 bits
+    if (sym == 137) { return 536870902 }   // 29 bits
+    if (sym == 138) { return 536870903 }   // 29 bits
+    if (sym == 139) { return 536870904 }   // 29 bits
+    if (sym == 140) { return 536870905 }   // 29 bits
+    if (sym == 141) { return 536870906 }   // 29 bits
+    if (sym == 142) { return 536870907 }   // 29 bits
+    if (sym == 143) { return 536870908 }   // 29 bits
+    if (sym == 144) { return 536870909 }   // 29 bits
+    if (sym == 145) { return 536870910 }   // 29 bits
+    if (sym == 146) { return 536870911 }   // 29 bits
+    if (sym == 147) { return 1073741824 }  // 30 bits
+    if (sym == 148) { return 1073741825 }  // 30 bits
+    if (sym == 149) { return 1073741826 }  // 30 bits
+    if (sym == 150) { return 1073741827 }  // 30 bits
+    if (sym == 151) { return 1073741828 }  // 30 bits
+    if (sym == 152) { return 1073741829 }  // 30 bits
+    if (sym == 153) { return 1073741830 }  // 30 bits
+    if (sym == 154) { return 1073741831 }  // 30 bits
+    if (sym == 155) { return 1073741832 }  // 30 bits
+    if (sym == 156) { return 1073741833 }  // 30 bits
+    if (sym == 157) { return 1073741834 }  // 30 bits
+    if (sym == 158) { return 1073741835 }  // 30 bits
+    if (sym == 159) { return 1073741836 }  // 30 bits
+    if (sym == 160) { return 1073741837 }  // 30 bits
+    if (sym == 161) { return 1073741838 }  // 30 bits
+    if (sym == 162) { return 1073741839 }  // 30 bits
+    if (sym == 163) { return 1073741840 }  // 30 bits
+    if (sym == 164) { return 1073741841 }  // 30 bits
+    if (sym == 165) { return 1073741842 }  // 30 bits
+    if (sym == 166) { return 1073741843 }  // 30 bits
+    if (sym == 167) { return 1073741844 }  // 30 bits
+    if (sym == 168) { return 1073741845 }  // 30 bits
+    if (sym == 169) { return 1073741846 }  // 30 bits
+    if (sym == 170) { return 1073741847 }  // 30 bits
+    if (sym == 171) { return 1073741848 }  // 30 bits
+    if (sym == 172) { return 1073741849 }  // 30 bits
+    if (sym == 173) { return 1073741850 }  // 30 bits
+    if (sym == 174) { return 1073741851 }  // 30 bits
+    if (sym == 175) { return 1073741852 }  // 30 bits
+    if (sym == 176) { return 1073741853 }  // 30 bits
+    if (sym == 177) { return 1073741854 }  // 30 bits
+    if (sym == 178) { return 1073741855 }  // 30 bits
+    if (sym == 179) { return 1073741856 }  // 30 bits
+    if (sym == 180) { return 1073741857 }  // 30 bits
+    if (sym == 181) { return 1073741858 }  // 30 bits
+    if (sym == 182) { return 1073741859 }  // 30 bits
+    if (sym == 183) { return 1073741860 }  // 30 bits
+    if (sym == 184) { return 1073741861 }  // 30 bits
+    if (sym == 185) { return 1073741862 }  // 30 bits
+    if (sym == 186) { return 1073741863 }  // 30 bits
+    if (sym == 187) { return 1073741864 }  // 30 bits
+    if (sym == 188) { return 1073741865 }  // 30 bits
+    if (sym == 189) { return 1073741866 }  // 30 bits
+    if (sym == 190) { return 1073741867 }  // 30 bits
+    if (sym == 191) { return 1073741868 }  // 30 bits
+    if (sym == 192) { return 1073741869 }  // 30 bits
+    if (sym == 193) { return 1073741870 }  // 30 bits
+    if (sym == 194) { return 1073741871 }  // 30 bits
+    if (sym == 195) { return 1073741872 }  // 30 bits
+    if (sym == 196) { return 1073741873 }  // 30 bits
+    if (sym == 197) { return 1073741874 }  // 30 bits
+    if (sym == 198) { return 1073741875 }  // 30 bits
+    if (sym == 199) { return 1073741876 }  // 30 bits
+    if (sym == 200) { return 1073741877 }  // 30 bits
+    if (sym == 201) { return 1073741878 }  // 30 bits
+    if (sym == 202) { return 1073741879 }  // 30 bits
+    if (sym == 203) { return 2097123 }     // 21 bits
+    if (sym == 204) { return 16777195 }    // 24 bits
+    if (sym == 205) { return 2097124 }     // 21 bits
+    if (sym == 206) { return 2097125 }     // 21 bits
+    if (sym == 207) { return 2097126 }     // 21 bits
+    if (sym == 208) { return 2097127 }     // 21 bits
+    if (sym == 209) { return 2097128 }     // 21 bits
+    if (sym == 210) { return 2097129 }     // 21 bits
+    if (sym == 211) { return 2097130 }     // 21 bits
+    if (sym == 212) { return 2097131 }     // 21 bits
+    if (sym == 213) { return 2097132 }     // 21 bits
+    if (sym == 214) { return 2097133 }     // 21 bits
+    if (sym == 215) { return 2097134 }     // 21 bits
+    if (sym == 216) { return 2097135 }     // 21 bits
+    if (sym == 217) { return 2097136 }     // 21 bits
+    if (sym == 218) { return 2097137 }     // 21 bits
+    if (sym == 219) { return 2097138 }     // 21 bits
+    if (sym == 220) { return 2097139 }     // 21 bits
+    if (sym == 221) { return 2097140 }     // 21 bits
+    if (sym == 222) { return 2097141 }     // 21 bits
+    if (sym == 223) { return 2097142 }     // 21 bits
+    if (sym == 224) { return 2097143 }     // 21 bits
+    if (sym == 225) { return 2097144 }     // 21 bits
+    if (sym == 226) { return 2097145 }     // 21 bits
+    if (sym == 227) { return 2097146 }     // 21 bits
+    if (sym == 228) { return 2097147 }     // 21 bits
+    if (sym == 229) { return 2097148 }     // 21 bits
+    if (sym == 230) { return 2097149 }     // 21 bits
+    if (sym == 231) { return 2097150 }     // 21 bits
+    if (sym == 232) { return 2097151 }     // 21 bits
+    if (sym == 233) { return 16777196 }    // 24 bits
+    if (sym == 234) { return 16777197 }    // 24 bits
+    if (sym == 235) { return 16777198 }    // 24 bits
+    if (sym == 236) { return 16777199 }    // 24 bits
+    if (sym == 237) { return 16777200 }    // 24 bits
+    if (sym == 238) { return 16777201 }    // 24 bits
+    if (sym == 239) { return 16777202 }    // 24 bits
+    if (sym == 240) { return 16777203 }    // 24 bits
+    if (sym == 241) { return 16777204 }    // 24 bits
+    if (sym == 242) { return 16777205 }    // 24 bits
+    if (sym == 243) { return 16777206 }    // 24 bits
+    if (sym == 244) { return 16777207 }    // 24 bits
+    if (sym == 245) { return 16777208 }    // 24 bits
+    if (sym == 246) { return 16777209 }    // 24 bits
+    if (sym == 247) { return 16777210 }    // 24 bits
+    if (sym == 248) { return 16777211 }    // 24 bits
+    if (sym == 249) { return 16777212 }    // 24 bits
+    if (sym == 250) { return 16777213 }    // 24 bits
+    if (sym == 251) { return 16777214 }    // 24 bits
+    if (sym == 252) { return 16777215 }    // 24 bits
+    if (sym == 253) { return 33554400 }    // 25 bits
+    if (sym == 254) { return 33554401 }    // 25 bits
+    if (sym == 255) { return 33554402 }    // 25 bits
+    if (sym == 256) { return 1073741823 }  // 30 bits EOS
+    return 0
+}
+
+// Get the Huffman code length in bits for a symbol (0-256)
+fun hpackHuffmanLen(sym: Int): Int {
+    if (sym <= 1) {
+        if (sym == 0) { return 13 }
+        return 23
+    }
+    if (sym >= 2) { if (sym <= 9) {
+        if (sym <= 8) { return 28 }
+        return 24
+    } }
+    if (sym == 10) { return 30 }
+    if (sym >= 11) { if (sym <= 12) { return 28 } }
+    if (sym == 13) { return 30 }
+    if (sym >= 14) { if (sym <= 31) { return 28 } }
+    if (sym == 22) { return 30 }
+    if (sym == 32) { return 6 }
+    if (sym == 33) { return 10 }
+    if (sym == 34) { return 10 }
+    if (sym == 35) { return 12 }
+    if (sym == 36) { return 13 }
+    if (sym == 37) { return 6 }
+    if (sym == 38) { return 8 }
+    if (sym == 39) { return 11 }
+    if (sym == 40) { return 10 }
+    if (sym == 41) { return 10 }
+    if (sym == 42) { return 8 }
+    if (sym == 43) { return 11 }
+    if (sym == 44) { return 8 }
+    if (sym >= 45) { if (sym <= 47) { return 6 } }
+    if (sym >= 48) { if (sym <= 50) { return 5 } }
+    if (sym >= 51) { if (sym <= 57) { return 6 } }
+    if (sym == 58) { return 7 }
+    if (sym == 59) { return 8 }
+    if (sym == 60) { return 15 }
+    if (sym == 61) { return 6 }
+    if (sym == 62) { return 15 }
+    if (sym == 63) { return 10 }
+    if (sym == 64) { return 15 }
+    if (sym >= 65) { if (sym <= 90) { return 6 } }
+    if (sym == 91) { return 8 }
+    if (sym == 92) { return 11 }
+    if (sym == 93) { return 8 }
+    if (sym == 94) { return 13 }
+    if (sym == 95) { return 7 }
+    if (sym == 96) { return 14 }
+    if (sym >= 97) { if (sym <= 99) { return 5 } }
+    if (sym >= 100) { if (sym <= 102) { return 5 } }
+    if (sym >= 103) { if (sym <= 105) { return 5 } }
+    if (sym == 106) { return 7 }
+    if (sym == 107) { return 7 }
+    if (sym >= 108) { if (sym <= 112) { return 5 } }
+    if (sym == 113) { return 6 }
+    if (sym >= 114) { if (sym <= 116) { return 5 } }
+    if (sym >= 117) { if (sym <= 119) { return 6 } }
+    if (sym >= 120) { if (sym <= 122) { return 7 } }
+    if (sym == 123) { return 14 }
+    if (sym == 124) { return 12 }
+    if (sym == 125) { return 14 }
+    if (sym == 126) { return 13 }
+    if (sym >= 127) { if (sym <= 130) { return 28 } }
+    if (sym >= 131) { if (sym <= 146) { return 29 } }
+    if (sym >= 147) { if (sym <= 202) { return 30 } }
+    if (sym == 203) { return 21 }
+    if (sym == 204) { return 24 }
+    if (sym >= 205) { if (sym <= 232) { return 21 } }
+    if (sym >= 233) { if (sym <= 252) { return 24 } }
+    if (sym >= 253) { if (sym <= 255) { return 25 } }
+    if (sym == 256) { return 30 }
+    return 0
+}
+
+// Decode Huffman-encoded data
+// data: raw bytes, pos: start offset, byteLen: number of Huffman bytes
+fun hpackHuffmanDecode(buf: String, pos: Int, byteLen: Int): String {
+    var result: String = ""
+    var bitBuffer: Int = 0
+    var bitsAvail: Int = 0
+    var i: Int = 0
+    while (i < byteLen) {
+        val b = charCodeAt(buf, pos + i)
+        bitBuffer = bitBuffer * 256 + b
+        bitsAvail = bitsAvail + 8
+        // Try to decode symbols while we have enough bits
+        // We must limit buffer to avoid overflow; process greedily
+        while (bitsAvail >= 5) {
+            var matched: Bool = false
+            // Try each symbol from 0-255 (not EOS=256)
+            var sym: Int = 0
+            while (sym <= 255) {
+                if (matched == false) {
+                    val codeLen = hpackHuffmanLen(sym)
+                    if (bitsAvail >= codeLen) {
+                        val code = hpackHuffmanCode(sym)
+                        // Extract top codeLen bits from bitBuffer
+                        val shift = bitsAvail - codeLen
+                        val extracted = bitBuffer / hpackPow2(shift)
+                        if (extracted == code) {
+                            result = stringConcat(result, intToChar(sym))
+                            // Remove matched bits
+                            bitBuffer = bitBuffer - extracted * hpackPow2(shift)
+                            bitsAvail = bitsAvail - codeLen
+                            matched = true
+                        }
+                    }
+                }
+                sym = sym + 1
+            }
+            if (matched == false) {
+                // Remaining bits might be EOS padding
+                bitsAvail = 0
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// == Dynamic Table (RFC 7541 Section 2.3) =====================================
+
+// Create an HPACK encoder/decoder context with dynamic table
+fun hpackCreateContext(): Map {
+    val ctx = mapCreate()
+    mapPut(ctx, "dynamicEntries", listCreate())
+    mapPut(ctx, "dynamicSize", 0)
+    mapPut(ctx, "maxSize", 4096)
+    return ctx
+}
+
+// Add an entry to the dynamic table (newest at index 0)
+// Entry size = len(name) + len(value) + 32 per RFC 7541 Section 4.1
+fun hpackDynamicAdd(ctx: Map, name: String, value: String): Unit {
+    val entrySize = stringLength(name) + stringLength(value) + 32
+    val maxSize = toInt(mapGet(ctx, "maxSize"))
+    // If single entry exceeds maxSize, evict all and don't add
+    if (entrySize > maxSize) {
+        val entries = mapGet(ctx, "dynamicEntries")
+        while (listSize(entries) > 0) {
+            listRemove(entries, listSize(entries) - 1)
+        }
+        mapPut(ctx, "dynamicSize", 0)
+        return
+    }
+    // Evict until there's room
+    hpackDynamicEvict(ctx, maxSize - entrySize)
+    // Prepend new entry
+    val entry = mapCreate()
+    mapPut(entry, "name", name)
+    mapPut(entry, "value", value)
+    val entries = mapGet(ctx, "dynamicEntries")
+    listInsert(entries, 0, entry)
+    val currentSize = toInt(mapGet(ctx, "dynamicSize"))
+    mapPut(ctx, "dynamicSize", currentSize + entrySize)
+}
+
+// Evict entries from the end until dynamicSize <= targetSize
+fun hpackDynamicEvict(ctx: Map, targetSize: Int): Unit {
+    val entries = mapGet(ctx, "dynamicEntries")
+    var currentSize: Int = toInt(mapGet(ctx, "dynamicSize"))
+    while (currentSize > targetSize) {
+        if (listSize(entries) == 0) {
+            currentSize = 0
+        } else {
+            val lastIdx = listSize(entries) - 1
+            val last = listGet(entries, lastIdx)
+            val name = toString(mapGet(last, "name"))
+            val value = toString(mapGet(last, "value"))
+            val entrySize = stringLength(name) + stringLength(value) + 32
+            currentSize = currentSize - entrySize
+            listRemove(entries, lastIdx)
+        }
+    }
+    if (currentSize < 0) { currentSize = 0 }
+    mapPut(ctx, "dynamicSize", currentSize)
+}
+
+// Resize the dynamic table maximum size, evicting as needed
+fun hpackDynamicResize(ctx: Map, newMaxSize: Int): Unit {
+    mapPut(ctx, "maxSize", newMaxSize)
+    hpackDynamicEvict(ctx, newMaxSize)
+}
+
+// Unified lookup: index 1-61 = static, 62+ = dynamic (62 = newest)
+// Returns map with "name" and "value", or empty-named map if invalid
+fun hpackLookup(ctx: Map, index: Int): Map {
+    if (index >= 1) {
+        if (index <= 61) {
+            return hpackStaticEntry(index)
+        }
+    }
+    val dynIdx = index - 62
+    val entries = mapGet(ctx, "dynamicEntries")
+    if (dynIdx >= 0) {
+        if (dynIdx < listSize(entries)) {
+            val entry = listGet(entries, dynIdx)
+            val result = mapCreate()
+            mapPut(result, "name", toString(mapGet(entry, "name")))
+            mapPut(result, "value", toString(mapGet(entry, "value")))
+            return result
+        }
+    }
+    val empty = mapCreate()
+    mapPut(empty, "name", "")
+    mapPut(empty, "value", "")
+    return empty
+}
+
+// Unified name-only lookup: index 1-61 = static, 62+ = dynamic
+fun hpackLookupName(ctx: Map, index: Int): String {
+    if (index >= 1) {
+        if (index <= 61) {
+            return hpackStaticName(index)
+        }
+    }
+    val dynIdx = index - 62
+    val entries = mapGet(ctx, "dynamicEntries")
+    if (dynIdx >= 0) {
+        if (dynIdx < listSize(entries)) {
+            val entry = listGet(entries, dynIdx)
+            return toString(mapGet(entry, "name"))
+        }
+    }
+    return ""
+}
+
+// Return the current number of entries in the dynamic table
+fun hpackDynamicTableSize(ctx: Map): Int {
+    return toInt(mapGet(ctx, "dynamicSize"))
+}
+
+// Return the number of entries in the dynamic table
+fun hpackDynamicTableLength(ctx: Map): Int {
+    val entries = mapGet(ctx, "dynamicEntries")
+    return listSize(entries)
+}
+
+// == Sensitive Header Detection ================================================
+
+// Return true if a header name is sensitive and should never be indexed
+fun hpackIsSensitive(name: String): Bool {
+    if (name == "authorization") { return true }
+    if (name == "cookie") { return true }
+    if (name == "set-cookie") { return true }
+    if (name == "proxy-authorization") { return true }
+    return false
+}
+
+// == Header Block Encoding/Decoding ===========================================
+
+// Encode a dynamic table size update instruction
+fun hpackEncodeDynamicSizeUpdate(newMaxSize: Int): String {
+    // 001xxxxx prefix, 5-bit integer
+    return hpackEncodeInt(newMaxSize, 5, 32)
+}
+
+// Encode a list of header name-value pairs into an HPACK header block
+// headers: list of maps, each with "name" and "value" keys
+// Strategy:
+//   Sensitive headers → literal-never-indexed (0x10 prefix)
+//   Non-sensitive with static name match → literal-with-incremental-indexing (0x40 prefix)
+//   Non-sensitive without static match → literal-without-indexing (0x00 prefix)
+fun hpackEncode(ctx: Map, headers: List): String {
+    var result: String = ""
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val header = listGet(headers, i)
+        val name = toString(mapGet(header, "name"))
+        val value = toString(mapGet(header, "value"))
+        if (hpackIsSensitive(name)) {
+            // Literal never indexed (Section 6.2.3)
+            val nameIdx = hpackStaticLookupName(name)
+            if (nameIdx > 0) {
+                result = stringConcat(result, hpackEncodeInt(nameIdx, 4, 16))
+                result = stringConcat(result, hpackEncodeString(value))
+            } else {
+                result = stringConcat(result, intToChar(16))
+                result = stringConcat(result, hpackEncodeString(name))
+                result = stringConcat(result, hpackEncodeString(value))
+            }
+        } else {
+            val nameIdx = hpackStaticLookupName(name)
+            if (nameIdx > 0) {
+                // Literal with incremental indexing (Section 6.2.1)
+                // 6-bit prefix: 01xxxxxx → prefix bits = 64 (0x40)
+                // nameIdx range 1-61 fits in 6 bits (max 63), so single byte: 64+idx ≤ 125
+                result = stringConcat(result, hpackEncodeInt(nameIdx, 6, 64))
+                result = stringConcat(result, hpackEncodeString(value))
+                // Add to encoder's dynamic table
+                hpackDynamicAdd(ctx, name, value)
+            } else {
+                // Literal without indexing (Section 6.2.2)
+                // 0000 0000 = 0x00
+                result = stringConcat(result, intToChar(0))
+                result = stringConcat(result, hpackEncodeString(name))
+                result = stringConcat(result, hpackEncodeString(value))
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Decode an HPACK header block into a list of header name-value maps
+// data: raw bytes, dataLen: number of bytes to decode
+fun hpackDecode(ctx: Map, buf: String, bufLen: Int): List {
+    val headers = listCreate()
+    var pos: Int = 0
+    while (pos < bufLen) {
+        val b = charCodeAt(buf, pos)
+        if (b / 128 == 1) {
+            // Indexed header field (Section 6.1): top bit is 1
+            val idxResult = hpackDecodeInt(buf, pos, 7)
+            val index = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            if (index >= 1) {
+                val entry = hpackLookup(ctx, index)
+                val entryName = toString(mapGet(entry, "name"))
+                if (stringLength(entryName) > 0) {
+                    listAppend(headers, entry)
+                }
+            }
+        } else { if (b / 64 == 1) {
+            // Literal with incremental indexing (Section 6.2.1): 01xxxxxx
+            val idxResult = hpackDecodeInt(buf, pos, 6)
+            val nameIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            var name: String = ""
+            if (nameIdx > 0) {
+                name = hpackLookupName(ctx, nameIdx)
+            } else {
+                val nameResult = hpackDecodeString(buf, pos)
+                name = toString(mapGet(nameResult, "value"))
+                pos = toInt(mapGet(nameResult, "pos"))
+            }
+            val valueResult = hpackDecodeString(buf, pos)
+            val value = toString(mapGet(valueResult, "value"))
+            pos = toInt(mapGet(valueResult, "pos"))
+            val entry = mapCreate()
+            mapPut(entry, "name", name)
+            mapPut(entry, "value", value)
+            listAppend(headers, entry)
+            // Add to dynamic table (incremental indexing)
+            hpackDynamicAdd(ctx, name, value)
+        } else { if (b / 32 == 1) {
+            // Dynamic table size update (Section 6.3): 001xxxxx
+            val sizeResult = hpackDecodeInt(buf, pos, 5)
+            val newSize = toInt(mapGet(sizeResult, "value"))
+            pos = toInt(mapGet(sizeResult, "pos"))
+            hpackDynamicResize(ctx, newSize)
+        } else { if (b / 16 == 1) {
+            // Literal never indexed (Section 6.2.3): 0001xxxx
+            val idxResult = hpackDecodeInt(buf, pos, 4)
+            val nameIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            var name: String = ""
+            if (nameIdx > 0) {
+                name = hpackLookupName(ctx, nameIdx)
+            } else {
+                val nameResult = hpackDecodeString(buf, pos)
+                name = toString(mapGet(nameResult, "value"))
+                pos = toInt(mapGet(nameResult, "pos"))
+            }
+            val valueResult = hpackDecodeString(buf, pos)
+            val value = toString(mapGet(valueResult, "value"))
+            pos = toInt(mapGet(valueResult, "pos"))
+            val entry = mapCreate()
+            mapPut(entry, "name", name)
+            mapPut(entry, "value", value)
+            listAppend(headers, entry)
+        } else {
+            // Literal without indexing (Section 6.2.2): 0000xxxx
+            val idxResult = hpackDecodeInt(buf, pos, 4)
+            val nameIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            var name: String = ""
+            if (nameIdx > 0) {
+                name = hpackLookupName(ctx, nameIdx)
+            } else {
+                val nameResult = hpackDecodeString(buf, pos)
+                name = toString(mapGet(nameResult, "value"))
+                pos = toInt(mapGet(nameResult, "pos"))
+            }
+            val valueResult = hpackDecodeString(buf, pos)
+            val value = toString(mapGet(valueResult, "value"))
+            pos = toInt(mapGet(valueResult, "pos"))
+            val entry = mapCreate()
+            mapPut(entry, "name", name)
+            mapPut(entry, "value", value)
+            listAppend(headers, entry)
+        } } } }
+    }
+    return headers
+}
+
+// == Helpers ==================================================================
+
+// Compute 2^n for small n (0-30)
+fun hpackPow2(n: Int): Int {
+    var result: Int = 1
+    var i: Int = 0
+    while (i < n) {
+        result = result * 2
+        i = i + 1
+    }
+    return result
+}
+
+// Bitwise AND for values up to 255: a & mask
+fun hpackAnd(a: Int, mask: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vm: Int = mask
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val mBit = vm - (vm / 2) * 2
+        if (aBit == 1) {
+            if (mBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vm = vm / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}

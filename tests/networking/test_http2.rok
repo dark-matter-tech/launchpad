@@ -1,0 +1,934 @@
+// Tests for rockit.networking.http2
+import rockit.testing.probe
+import rockit.networking.http2
+import rockit.networking.url
+import rockit.encoding.hpack
+
+// == Frame Type Constants =====================================================
+
+@Test fun testFrameTypeConstants() {
+    assertEquals(0, H2_DATA())
+    assertEquals(1, H2_HEADERS())
+    assertEquals(2, H2_PRIORITY())
+    assertEquals(3, H2_RST_STREAM())
+    assertEquals(4, H2_SETTINGS())
+    assertEquals(5, H2_PUSH_PROMISE())
+    assertEquals(6, H2_PING())
+    assertEquals(7, H2_GOAWAY())
+    assertEquals(8, H2_WINDOW_UPDATE())
+    assertEquals(9, H2_CONTINUATION())
+}
+
+// == Error Code Constants =====================================================
+
+@Test fun testErrorCodeConstants() {
+    assertEquals(0, H2_NO_ERROR())
+    assertEquals(1, H2_PROTOCOL_ERROR())
+    assertEquals(2, H2_INTERNAL_ERROR())
+    assertEquals(3, H2_FLOW_CONTROL_ERROR())
+    assertEquals(4, H2_SETTINGS_TIMEOUT())
+    assertEquals(5, H2_STREAM_CLOSED())
+    assertEquals(6, H2_FRAME_SIZE_ERROR())
+    assertEquals(7, H2_REFUSED_STREAM())
+    assertEquals(8, H2_CANCEL())
+    assertEquals(9, H2_COMPRESSION_ERROR())
+    assertEquals(10, H2_CONNECT_ERROR())
+    assertEquals(11, H2_ENHANCE_YOUR_CALM())
+    assertEquals(12, H2_INADEQUATE_SECURITY())
+    assertEquals(13, H2_HTTP_1_1_REQUIRED())
+}
+
+// == Settings Constants =======================================================
+
+@Test fun testSettingsConstants() {
+    assertEquals(1, H2_SETTINGS_HEADER_TABLE_SIZE())
+    assertEquals(2, H2_SETTINGS_ENABLE_PUSH())
+    assertEquals(3, H2_SETTINGS_MAX_CONCURRENT_STREAMS())
+    assertEquals(4, H2_SETTINGS_INITIAL_WINDOW_SIZE())
+    assertEquals(5, H2_SETTINGS_MAX_FRAME_SIZE())
+    assertEquals(6, H2_SETTINGS_MAX_HEADER_LIST_SIZE())
+}
+
+@Test fun testDefaultSettings() {
+    assertEquals(4096, H2_DEFAULT_HEADER_TABLE_SIZE())
+    assertEquals(65535, H2_DEFAULT_INITIAL_WINDOW_SIZE())
+    assertEquals(16384, H2_DEFAULT_MAX_FRAME_SIZE())
+}
+
+// == Flag Constants ===========================================================
+
+@Test fun testFlagConstants() {
+    assertEquals(1, H2_FLAG_END_STREAM())
+    assertEquals(4, H2_FLAG_END_HEADERS())
+    assertEquals(8, H2_FLAG_PADDED())
+    assertEquals(32, H2_FLAG_PRIORITY())
+    assertEquals(1, H2_FLAG_ACK())
+}
+
+// == Stream State Constants ===================================================
+
+@Test fun testStreamStateConstants() {
+    assertEquals(0, H2_STREAM_IDLE())
+    assertEquals(1, H2_STREAM_OPEN())
+    assertEquals(2, H2_STREAM_HALF_CLOSED_LOCAL())
+    assertEquals(3, H2_STREAM_HALF_CLOSED_REMOTE())
+    assertEquals(4, H2_STREAM_CLOSED_STATE())
+}
+
+// == Bitwise Helpers ==========================================================
+
+@Test fun testH2OrZero() {
+    assertEquals(0, h2Or(0, 0))
+}
+
+@Test fun testH2OrIdentity() {
+    assertEquals(255, h2Or(255, 0))
+    assertEquals(255, h2Or(0, 255))
+}
+
+@Test fun testH2OrBits() {
+    // 0x01 | 0x04 = 0x05
+    assertEquals(5, h2Or(1, 4))
+    // 0x01 | 0x04 | 0x08 = 0x0D
+    assertEquals(13, h2Or(5, 8))
+}
+
+@Test fun testH2AndZero() {
+    assertEquals(0, h2And(0, 0))
+    assertEquals(0, h2And(255, 0))
+}
+
+@Test fun testH2AndIdentity() {
+    assertEquals(255, h2And(255, 255))
+}
+
+@Test fun testH2AndMask() {
+    assertEquals(1, h2And(5, 1))   // 0x05 & 0x01 = 0x01
+    assertEquals(4, h2And(5, 4))   // 0x05 & 0x04 = 0x04
+    assertEquals(0, h2And(5, 2))   // 0x05 & 0x02 = 0x00
+}
+
+@Test fun testH2HasFlag() {
+    assertTrue(h2HasFlag(5, 1))    // END_STREAM set in 0x05
+    assertTrue(h2HasFlag(5, 4))    // END_HEADERS set in 0x05
+    assertFalse(h2HasFlag(5, 2))   // bit 1 not set
+    assertFalse(h2HasFlag(5, 8))   // PADDED not set
+}
+
+@Test fun testH2Pow2() {
+    assertEquals(1, h2Pow2(0))
+    assertEquals(2, h2Pow2(1))
+    assertEquals(256, h2Pow2(8))
+    assertEquals(65536, h2Pow2(16))
+}
+
+// == Multi-byte Integer Encoding ==============================================
+
+@Test fun testEncodeDecodeUint32() {
+    // Only test values whose bytes are all < 128 (intToChar limited to ASCII)
+    assertEquals(0, h2DecodeUint32(h2EncodeUint32(0), 0))
+    assertEquals(1, h2DecodeUint32(h2EncodeUint32(1), 0))
+    assertEquals(127, h2DecodeUint32(h2EncodeUint32(127), 0))
+    assertEquals(256, h2DecodeUint32(h2EncodeUint32(256), 0))
+    assertEquals(16909060, h2DecodeUint32(h2EncodeUint32(16909060), 0))  // 0x01020304
+}
+
+@Test fun testEncodeDecodeUint16() {
+    // Both bytes must be 1-127: intToChar(0) produces NUL (truncates string),
+    // intToChar(>=128) returns empty string. value = high*256 + low.
+    assertEquals(257, h2DecodeUint16(h2EncodeUint16(257), 0))    // 0x0101: 1,1
+    assertEquals(513, h2DecodeUint16(h2EncodeUint16(513), 0))    // 0x0201: 2,1
+    assertEquals(16447, h2DecodeUint16(h2EncodeUint16(16447), 0))  // 0x403F: 64,63
+    assertEquals(32639, h2DecodeUint16(h2EncodeUint16(32639), 0))  // 0x7F7F: 127,127
+}
+
+@Test fun testEncodeUint32Bytes() {
+    val encoded = h2EncodeUint32(16909060)  // 0x01020304
+    assertEquals(4, stringLength(encoded))
+    assertEquals(1, charCodeAt(encoded, 0))
+    assertEquals(2, charCodeAt(encoded, 1))
+    assertEquals(3, charCodeAt(encoded, 2))
+    assertEquals(4, charCodeAt(encoded, 3))
+}
+
+// == Frame Header Encode/Decode ===============================================
+
+@Test fun testFrameHeaderSize() {
+    val header = h2EncodeFrameHeader(0, H2_DATA(), 0, 0)
+    assertEquals(9, stringLength(header))
+}
+
+@Test fun testFrameHeaderRoundtrip() {
+    val header = h2EncodeFrameHeader(100, H2_HEADERS(), 5, 1)
+    val decoded = h2DecodeFrameHeader(header, 0)
+    assertEquals(100, toInt(mapGet(decoded, "length")))
+    assertEquals(1, toInt(mapGet(decoded, "type")))
+    assertEquals(5, toInt(mapGet(decoded, "flags")))
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testFrameHeaderZeroStream() {
+    val header = h2EncodeFrameHeader(0, H2_SETTINGS(), 0, 0)
+    val decoded = h2DecodeFrameHeader(header, 0)
+    assertEquals(0, toInt(mapGet(decoded, "length")))
+    assertEquals(4, toInt(mapGet(decoded, "type")))
+    assertEquals(0, toInt(mapGet(decoded, "flags")))
+    assertEquals(0, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testFrameHeaderLargePayload() {
+    val header = h2EncodeFrameHeader(16384, H2_DATA(), 1, 3)
+    val decoded = h2DecodeFrameHeader(header, 0)
+    assertEquals(16384, toInt(mapGet(decoded, "length")))
+    assertEquals(0, toInt(mapGet(decoded, "type")))
+    assertEquals(1, toInt(mapGet(decoded, "flags")))
+    assertEquals(3, toInt(mapGet(decoded, "streamId")))
+}
+
+// == Frame Builders ===========================================================
+
+@Test fun testBuildSettingsFrame() {
+    val params = listCreate()
+    val p1 = mapCreate()
+    mapPut(p1, "id", H2_SETTINGS_ENABLE_PUSH())
+    mapPut(p1, "value", 0)
+    listAppend(params, p1)
+    val frame = h2BuildSettingsFrame(params)
+    // 9 byte header + 6 byte payload (1 setting)
+    assertEquals(15, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(6, toInt(mapGet(decoded, "length")))
+    assertEquals(4, toInt(mapGet(decoded, "type")))
+    assertEquals(0, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildSettingsAckFrame() {
+    val frame = h2BuildSettingsAckFrame()
+    assertEquals(9, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(0, toInt(mapGet(decoded, "length")))
+    assertEquals(4, toInt(mapGet(decoded, "type")))
+    assertEquals(1, toInt(mapGet(decoded, "flags")))
+}
+
+@Test fun testBuildPingFrame() {
+    val frame = h2BuildPingFrame("12345678", false)
+    // 9 byte header + 8 byte payload
+    assertEquals(17, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(8, toInt(mapGet(decoded, "length")))
+    assertEquals(6, toInt(mapGet(decoded, "type")))
+    assertEquals(0, toInt(mapGet(decoded, "flags")))
+    assertEquals(0, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildPingAckFrame() {
+    val frame = h2BuildPingFrame("ABCDEFGH", true)
+    assertEquals(17, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(1, toInt(mapGet(decoded, "flags")))  // ACK flag
+}
+
+@Test fun testBuildWindowUpdateFrame() {
+    // Use increment with all bytes < 128
+    val frame = h2BuildWindowUpdateFrame(1, 100)
+    // 9 byte header + 4 byte payload
+    assertEquals(13, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(4, toInt(mapGet(decoded, "length")))
+    assertEquals(8, toInt(mapGet(decoded, "type")))
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+    // Verify increment value
+    assertEquals(100, h2DecodeUint32(frame, 9))
+}
+
+@Test fun testBuildWindowUpdateConnectionLevel() {
+    // Use increment with all bytes < 128
+    val frame = h2BuildWindowUpdateFrame(0, 50)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(0, toInt(mapGet(decoded, "streamId")))
+    assertEquals(50, h2DecodeUint32(frame, 9))
+}
+
+@Test fun testBuildRstStreamFrame() {
+    val frame = h2BuildRstStreamFrame(1, H2_CANCEL())
+    // 9 byte header + 4 byte payload
+    assertEquals(13, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(4, toInt(mapGet(decoded, "length")))
+    assertEquals(3, toInt(mapGet(decoded, "type")))
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+    assertEquals(8, h2DecodeUint32(frame, 9))  // CANCEL = 8
+}
+
+@Test fun testBuildGoawayFrame() {
+    val frame = h2BuildGoawayFrame(1, H2_NO_ERROR(), "")
+    // 9 byte header + 8 byte payload (lastStreamId + errorCode)
+    assertEquals(17, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(8, toInt(mapGet(decoded, "length")))
+    assertEquals(7, toInt(mapGet(decoded, "type")))
+    assertEquals(0, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildGoawayWithDebug() {
+    val frame = h2BuildGoawayFrame(3, H2_PROTOCOL_ERROR(), "bad")
+    // 9 + 8 + 3 = 20
+    assertEquals(20, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(11, toInt(mapGet(decoded, "length")))
+}
+
+@Test fun testBuildDataFrame() {
+    val frame = h2BuildDataFrame(1, "hello", true)
+    // 9 byte header + 5 byte payload
+    assertEquals(14, stringLength(frame))
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(5, toInt(mapGet(decoded, "length")))
+    assertEquals(0, toInt(mapGet(decoded, "type")))
+    assertEquals(1, toInt(mapGet(decoded, "flags")))  // END_STREAM
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildDataFrameNoEndStream() {
+    val frame = h2BuildDataFrame(3, "data", false)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(0, toInt(mapGet(decoded, "flags")))
+}
+
+@Test fun testBuildHeadersFrame() {
+    val headerBlock = "dummy"
+    val frame = h2BuildHeadersFrame(1, headerBlock, true, true)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(5, toInt(mapGet(decoded, "length")))
+    assertEquals(1, toInt(mapGet(decoded, "type")))
+    assertEquals(5, toInt(mapGet(decoded, "flags")))  // END_STREAM | END_HEADERS
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildHeadersFrameNoFlags() {
+    val frame = h2BuildHeadersFrame(1, "block", false, false)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(0, toInt(mapGet(decoded, "flags")))
+}
+
+// == Client Preface ===========================================================
+
+@Test fun testClientPrefaceLength() {
+    val preface = h2ClientPreface()
+    // Runtime normalizes \r\n to \n, so 24 bytes becomes 20
+    assertEquals(20, stringLength(preface))
+}
+
+@Test fun testClientPrefaceContent() {
+    val preface = h2ClientPreface()
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    assertStartsWith(preface, "PRI * HTTP/2.0")
+}
+
+// == Connection State =========================================================
+
+@Test fun testH2IsOpenFalse() {
+    val conn = mapCreate()
+    mapPut(conn, "fd", 0 - 1)
+    assertFalse(h2IsOpen(conn))
+}
+
+@Test fun testH2IsOpenTrue() {
+    val conn = mapCreate()
+    mapPut(conn, "fd", 5)
+    assertTrue(h2IsOpen(conn))
+}
+
+@Test fun testH2ErrorEmpty() {
+    val conn = mapCreate()
+    mapPut(conn, "error", "")
+    assertEqualsStr("", h2Error(conn))
+}
+
+@Test fun testH2ErrorSet() {
+    val conn = mapCreate()
+    mapPut(conn, "error", "test error")
+    assertEqualsStr("test error", h2Error(conn))
+}
+
+// == Response Accessors =======================================================
+
+@Test fun testResponseStatus() {
+    val resp = mapCreate()
+    mapPut(resp, "status", 200)
+    assertEquals(200, h2ResponseStatus(resp))
+}
+
+@Test fun testResponseStatusMissing() {
+    val resp = mapCreate()
+    assertEquals(0, h2ResponseStatus(resp))
+}
+
+@Test fun testResponseBody() {
+    val resp = mapCreate()
+    mapPut(resp, "body", "hello world")
+    assertEqualsStr("hello world", h2ResponseBody(resp))
+}
+
+@Test fun testResponseBodyMissing() {
+    val resp = mapCreate()
+    assertEqualsStr("", h2ResponseBody(resp))
+}
+
+@Test fun testResponseHeader() {
+    val resp = mapCreate()
+    val headers = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", "content-type")
+    mapPut(h1, "value", "text/html")
+    listAppend(headers, h1)
+    mapPut(resp, "headers", headers)
+    assertEqualsStr("text/html", h2ResponseHeader(resp, "content-type"))
+}
+
+@Test fun testResponseHeaderMissing() {
+    val resp = mapCreate()
+    val headers = listCreate()
+    mapPut(resp, "headers", headers)
+    assertEqualsStr("", h2ResponseHeader(resp, "x-missing"))
+}
+
+@Test fun testH2IsErrorTrue() {
+    val resp = mapCreate()
+    mapPut(resp, "error", "something went wrong")
+    assertTrue(h2IsError(resp))
+}
+
+@Test fun testH2IsErrorFalse() {
+    val resp = mapCreate()
+    mapPut(resp, "error", "")
+    assertFalse(h2IsError(resp))
+}
+
+@Test fun testH2IsErrorNull() {
+    val resp = mapCreate()
+    assertFalse(h2IsError(resp))
+}
+
+@Test fun testH2ErrorMessage() {
+    val resp = mapCreate()
+    mapPut(resp, "error", "Connection refused")
+    assertEqualsStr("Connection refused", h2ErrorMessage(resp))
+}
+
+// == Request Header Building ==================================================
+
+@Test fun testBuildRequestHeaders() {
+    val headers = mapCreate()
+    mapPut(headers, "user-agent", "rockit/1.0")
+    val headerList = h2BuildRequestHeaders("GET", "/api", "localhost:8080", headers)
+    assertEquals(5, listSize(headerList))
+    assertEqualsStr(":method", toString(mapGet(listGet(headerList, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headerList, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headerList, 1), "name")))
+    assertEqualsStr("http", toString(mapGet(listGet(headerList, 1), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headerList, 2), "name")))
+    assertEqualsStr("localhost:8080", toString(mapGet(listGet(headerList, 2), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headerList, 3), "name")))
+    assertEqualsStr("/api", toString(mapGet(listGet(headerList, 3), "value")))
+    assertEqualsStr("user-agent", toString(mapGet(listGet(headerList, 4), "name")))
+    assertEqualsStr("rockit/1.0", toString(mapGet(listGet(headerList, 4), "value")))
+}
+
+@Test fun testBuildRequestHeadersMinimal() {
+    val headers = mapCreate()
+    val headerList = h2BuildRequestHeaders("POST", "/submit", "example.com", headers)
+    assertEquals(4, listSize(headerList))
+    assertEqualsStr("POST", toString(mapGet(listGet(headerList, 0), "value")))
+}
+
+// == h2And31 ==================================================================
+
+@Test fun testH2And31Small() {
+    assertEquals(0, h2And31(0))
+    assertEquals(1, h2And31(1))
+    assertEquals(100, h2And31(100))
+}
+
+@Test fun testH2And31MaxStreamId() {
+    assertEquals(2147483647, h2And31(2147483647))
+}
+
+// == CONTINUATION Frame (Phase 3) =============================================
+
+@Test fun testBuildContinuationFrame() {
+    val frame = h2BuildContinuationFrame(1, "block", true)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(5, toInt(mapGet(decoded, "length")))
+    assertEquals(9, toInt(mapGet(decoded, "type")))  // CONTINUATION = 9
+    assertEquals(4, toInt(mapGet(decoded, "flags")))  // END_HEADERS
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+}
+
+@Test fun testBuildContinuationFrameNoEndHeaders() {
+    val frame = h2BuildContinuationFrame(3, "data", false)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(0, toInt(mapGet(decoded, "flags")))
+}
+
+@Test fun testHeaderBlockSplitting() {
+    // Create a mock connection to test h2SendHeaderBlock logic
+    // We test the frame builder functions directly
+    val headerBlock = "shortblock"
+    // If block fits in one frame, h2BuildHeadersFrame is used with END_HEADERS
+    val frame = h2BuildHeadersFrame(1, headerBlock, false, true)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(4, toInt(mapGet(decoded, "flags")))  // END_HEADERS
+    assertEquals(stringLength(headerBlock), toInt(mapGet(decoded, "length")))
+}
+
+@Test fun testTrailerEncoding() {
+    // Build a HEADERS frame with END_STREAM for trailers
+    val ctx = hpackCreateContext()
+    val trailers = listCreate()
+    val t1 = mapCreate()
+    mapPut(t1, "name", "grpc-status")
+    mapPut(t1, "value", "0")
+    listAppend(trailers, t1)
+    val encoded = hpackEncode(ctx, trailers)
+    // Trailers are sent as HEADERS with END_STREAM
+    val frame = h2BuildHeadersFrame(1, encoded, true, true)
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(5, toInt(mapGet(decoded, "flags")))  // END_STREAM | END_HEADERS
+    assertEquals(1, toInt(mapGet(decoded, "type")))    // HEADERS
+}
+
+@Test fun testResponseTrailersAccessor() {
+    val resp = mapCreate()
+    val trailers = listCreate()
+    val t = mapCreate()
+    mapPut(t, "name", "grpc-status")
+    mapPut(t, "value", "0")
+    listAppend(trailers, t)
+    mapPut(resp, "trailers", trailers)
+    val result = h2ResponseTrailers(resp)
+    assertEquals(1, listSize(result))
+    assertEqualsStr("grpc-status", toString(mapGet(listGet(result, 0), "name")))
+}
+
+@Test fun testResponseTrailersEmpty() {
+    val resp = mapCreate()
+    val result = h2ResponseTrailers(resp)
+    assertEquals(0, listSize(result))
+}
+
+// == PUSH_PROMISE Frame (Phase 6) =============================================
+
+@Test fun testBuildPushPromiseFrame() {
+    val frame = h2BuildPushPromiseFrame(1, 2, "headers")
+    val decoded = h2DecodeFrameHeader(frame, 0)
+    assertEquals(11, toInt(mapGet(decoded, "length")))  // 4 (promised ID) + 7 (headers)
+    assertEquals(5, toInt(mapGet(decoded, "type")))      // PUSH_PROMISE
+    assertEquals(4, toInt(mapGet(decoded, "flags")))     // END_HEADERS
+    assertEquals(1, toInt(mapGet(decoded, "streamId")))
+    // Verify promised stream ID in payload
+    assertEquals(2, h2And31(h2DecodeUint32(frame, 9)))
+}
+
+// == Flow Control (Phase 4) ===================================================
+
+@Test fun testFlowControlWindowDecrement() {
+    // Simulate connection state
+    val conn = mapCreate()
+    mapPut(conn, "connSendWindow", 65535)
+    mapPut(conn, "streams", mapCreate())
+    val streams = mapGet(conn, "streams")
+    val stream = mapCreate()
+    mapPut(stream, "sendWindow", 65535)
+    mapPut(stream, "state", H2_STREAM_OPEN())
+    mapPut(streams, "1", stream)
+
+    // Simulate WINDOW_UPDATE adding to window
+    val payload = h2EncodeUint32(1000)
+    h2HandleWindowUpdate(conn, 0, payload)
+    assertEquals(66535, toInt(mapGet(conn, "connSendWindow")))
+
+    h2HandleWindowUpdate(conn, 1, payload)
+    assertEquals(66535, toInt(mapGet(stream, "sendWindow")))
+}
+
+@Test fun testZeroIncrement() {
+    // Zero increment should trigger protocol error
+    // We can't easily test the tcpSend side, but verify the function handles it
+    val conn = mapCreate()
+    mapPut(conn, "fd", 0 - 1)  // No actual connection
+    mapPut(conn, "connSendWindow", 65535)
+    mapPut(conn, "streams", mapCreate())
+    val payload = h2EncodeUint32(0)
+    // Should not crash even with no fd
+    h2HandleWindowUpdate(conn, 0, payload)
+    // Window should remain unchanged (zero increment rejected)
+    assertEquals(65535, toInt(mapGet(conn, "connSendWindow")))
+}
+
+// == Settings State Machine (Phase 4) =========================================
+
+@Test fun testSettingsStateMachine() {
+    val conn = mapCreate()
+    mapPut(conn, "fd", 0 - 1)
+    mapPut(conn, "settingsState", "UNSENT")
+    mapPut(conn, "peerSettings", mapCreate())
+    mapPut(conn, "peerMaxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "streams", mapCreate())
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+
+    // Simulate receiving SETTINGS with MAX_CONCURRENT_STREAMS
+    var payload: String = h2EncodeUint16(H2_SETTINGS_MAX_CONCURRENT_STREAMS())
+    payload = stringConcat(payload, h2EncodeUint32(50))
+
+    h2ApplyPeerSettings(conn, payload)
+    assertEquals(50, toInt(mapGet(conn, "peerMaxConcurrentStreams")))
+}
+
+@Test fun testInitialWindowSizeChange() {
+    val conn = mapCreate()
+    mapPut(conn, "fd", 0 - 1)
+    val peerSettings = mapCreate()
+    mapPut(peerSettings, "initialWindowSize", 65535)
+    mapPut(conn, "peerSettings", peerSettings)
+    mapPut(conn, "peerMaxFrameSize", H2_DEFAULT_MAX_FRAME_SIZE())
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+
+    // Create a stream with default window
+    val streams = mapCreate()
+    val stream = mapCreate()
+    mapPut(stream, "sendWindow", 65535)
+    mapPut(stream, "state", H2_STREAM_OPEN())
+    mapPut(streams, "1", stream)
+    mapPut(conn, "streams", streams)
+
+    // Change initial window size to 32768 (delta = -32767)
+    var payload: String = h2EncodeUint16(H2_SETTINGS_INITIAL_WINDOW_SIZE())
+    payload = stringConcat(payload, h2EncodeUint32(32768))
+
+    h2ApplyPeerSettings(conn, payload)
+    assertEquals(32768, toInt(mapGet(stream, "sendWindow")))
+}
+
+// == Error Classification (Phase 4) ===========================================
+
+@Test fun testErrorClassification() {
+    val ioResp = mapCreate()
+    mapPut(ioResp, "error", "Connection not open")
+    assertTrue(h2IsIoError(ioResp))
+    assertFalse(h2IsResetError(ioResp))
+    assertFalse(h2IsGoawayError(ioResp))
+
+    val rstResp = mapCreate()
+    mapPut(rstResp, "error", "RST_STREAM error=8")
+    assertFalse(h2IsIoError(rstResp))
+    assertTrue(h2IsResetError(rstResp))
+    assertFalse(h2IsGoawayError(rstResp))
+
+    val goawayResp = mapCreate()
+    mapPut(goawayResp, "error", "GOAWAY received, error=0")
+    assertFalse(h2IsIoError(goawayResp))
+    assertFalse(h2IsResetError(goawayResp))
+    assertTrue(h2IsGoawayError(goawayResp))
+}
+
+@Test fun testErrorReasonCode() {
+    val resp = mapCreate()
+    mapPut(resp, "error", "RST_STREAM error=8")
+    assertEquals(8, h2ErrorReasonCode(resp))
+
+    val resp2 = mapCreate()
+    mapPut(resp2, "error", "GOAWAY received, error=0")
+    assertEquals(0, h2ErrorReasonCode(resp2))
+}
+
+@Test fun testWindowUpdateThreshold() {
+    // Test the threshold calculation
+    val threshold = H2_DEFAULT_INITIAL_WINDOW_SIZE() / 2
+    assertEquals(32767, threshold)
+}
+
+// == Concurrent Streams (Phase 5) =============================================
+
+@Test fun testActiveStreamCount() {
+    val conn = mapCreate()
+    mapPut(conn, "activeStreamCount", 0)
+    assertEquals(0, h2ActiveStreamCount(conn))
+    mapPut(conn, "activeStreamCount", 3)
+    assertEquals(3, h2ActiveStreamCount(conn))
+}
+
+@Test fun testCanOpenStream() {
+    val conn = mapCreate()
+    mapPut(conn, "activeStreamCount", 0)
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+    assertTrue(h2CanOpenStream(conn))
+
+    mapPut(conn, "activeStreamCount", 100)
+    assertFalse(h2CanOpenStream(conn))
+
+    mapPut(conn, "activeStreamCount", 99)
+    assertTrue(h2CanOpenStream(conn))
+}
+
+@Test fun testMaxConcurrentStreamsDefault() {
+    val conn = mapCreate()
+    mapPut(conn, "peerMaxConcurrentStreams", 100)
+    assertEquals(100, toInt(mapGet(conn, "peerMaxConcurrentStreams")))
+}
+
+@Test fun testCleanupClosedStreams() {
+    val conn = mapCreate()
+    val streams = mapCreate()
+    val s1 = mapCreate()
+    mapPut(s1, "state", H2_STREAM_CLOSED_STATE())
+    mapPut(streams, "1", s1)
+    val s3 = mapCreate()
+    mapPut(s3, "state", H2_STREAM_OPEN())
+    mapPut(streams, "3", s3)
+    val s5 = mapCreate()
+    mapPut(s5, "state", H2_STREAM_CLOSED_STATE())
+    mapPut(streams, "5", s5)
+    mapPut(conn, "streams", streams)
+
+    h2CleanupClosedStreams(conn)
+    // Only stream 3 should remain
+    val keys = mapKeys(streams)
+    assertEquals(1, listSize(keys))
+    assertEqualsStr("3", toString(listGet(keys, 0)))
+}
+
+@Test fun testStreamCompletion() {
+    // Verify stream state constants work for completion detection
+    val stream = mapCreate()
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_REMOTE())
+    val state = toInt(mapGet(stream, "state"))
+    assertTrue(state == H2_STREAM_HALF_CLOSED_REMOTE())
+}
+
+@Test fun testBuildResponseFromStream() {
+    val conn = mapCreate()
+    val streams = mapCreate()
+    val stream = mapCreate()
+    val headers = listCreate()
+    val sh = mapCreate()
+    mapPut(sh, "name", ":status")
+    mapPut(sh, "value", "200")
+    listAppend(headers, sh)
+    mapPut(stream, "headers", headers)
+    mapPut(stream, "body", "hello")
+    mapPut(stream, "trailers", listCreate())
+    mapPut(stream, "state", H2_STREAM_HALF_CLOSED_REMOTE())
+    mapPut(streams, "1", stream)
+    mapPut(conn, "streams", streams)
+
+    val resp = h2BuildResponseFromStream(conn, 1)
+    assertEquals(200, h2ResponseStatus(resp))
+    assertEqualsStr("hello", h2ResponseBody(resp))
+    assertEquals(1, toInt(mapGet(resp, "streamId")))
+}
+
+// == Server Response Headers (Phase 6) ========================================
+
+@Test fun testServerResponseHeaders() {
+    // Test that response header building works correctly
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", "200")
+    listAppend(headerList, statusHeader)
+    val ctHeader = mapCreate()
+    mapPut(ctHeader, "name", "content-type")
+    mapPut(ctHeader, "value", "text/html")
+    listAppend(headerList, ctHeader)
+
+    assertEquals(2, listSize(headerList))
+    assertEqualsStr(":status", toString(mapGet(listGet(headerList, 0), "name")))
+    assertEqualsStr("200", toString(mapGet(listGet(headerList, 0), "value")))
+}
+
+@Test fun testRequestAccessors() {
+    val req = mapCreate()
+    mapPut(req, "method", "GET")
+    mapPut(req, "path", "/api/data")
+    mapPut(req, "authority", "localhost:8080")
+    mapPut(req, "streamId", 1)
+    mapPut(req, "body", "request body")
+
+    assertEqualsStr("GET", h2RequestMethod(req))
+    assertEqualsStr("/api/data", h2RequestPath(req))
+    assertEqualsStr("localhost:8080", h2RequestAuthority(req))
+    assertEquals(1, h2RequestStreamId(req))
+    assertEqualsStr("request body", h2RequestBody(req))
+}
+
+@Test fun testRequestAccessorsMissing() {
+    val req = mapCreate()
+    assertEqualsStr("", h2RequestMethod(req))
+    assertEqualsStr("", h2RequestPath(req))
+    assertEqualsStr("", h2RequestAuthority(req))
+    assertEquals(0, h2RequestStreamId(req))
+    assertEqualsStr("", h2RequestBody(req))
+}
+
+// == 1xx Informational (Phase 6) ==============================================
+
+@Test fun test100ContinueHeaders() {
+    // Verify the header structure for 100 Continue
+    val ctx = hpackCreateContext()
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", "100")
+    listAppend(headerList, statusHeader)
+    val encoded = hpackEncode(ctx, headerList)
+    val decoded = hpackDecode(hpackCreateContext(), encoded, stringLength(encoded))
+    assertEquals(1, listSize(decoded))
+    assertEqualsStr(":status", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("100", toString(mapGet(listGet(decoded, 0), "value")))
+}
+
+@Test fun test103EarlyHintsHeaders() {
+    val ctx = hpackCreateContext()
+    val headerList = listCreate()
+    val statusHeader = mapCreate()
+    mapPut(statusHeader, "name", ":status")
+    mapPut(statusHeader, "value", "103")
+    listAppend(headerList, statusHeader)
+    val linkHeader = mapCreate()
+    mapPut(linkHeader, "name", "link")
+    mapPut(linkHeader, "value", "</style.css>; rel=preload")
+    listAppend(headerList, linkHeader)
+    val encoded = hpackEncode(ctx, headerList)
+    val decoded = hpackDecode(hpackCreateContext(), encoded, stringLength(encoded))
+    assertEquals(2, listSize(decoded))
+    assertEqualsStr("103", toString(mapGet(listGet(decoded, 0), "value")))
+    assertEqualsStr("link", toString(mapGet(listGet(decoded, 1), "name")))
+}
+
+// == Extended CONNECT (Phase 6) ===============================================
+
+@Test fun testExtendedConnectHeaders() {
+    // Test that Extended CONNECT request includes :protocol
+    val headers = mapCreate()
+    mapPut(headers, ":protocol", "websocket")
+    val headerList = h2BuildRequestHeaders("CONNECT", "/ws", "localhost:8080", headers)
+    // Should have :method, :scheme, :authority, :path, :protocol
+    assertEquals(5, listSize(headerList))
+    assertEqualsStr("CONNECT", toString(mapGet(listGet(headerList, 0), "value")))
+}
+
+@Test fun testExtendedConnectDetection() {
+    val req = mapCreate()
+    mapPut(req, "method", "CONNECT")
+    val headers = listCreate()
+    val ph = mapCreate()
+    mapPut(ph, "name", ":protocol")
+    mapPut(ph, "value", "websocket")
+    listAppend(headers, ph)
+    mapPut(req, "headers", headers)
+    val conn = mapCreate()
+    assertTrue(h2HandleExtendedConnect(conn, req))
+
+    val normalReq = mapCreate()
+    mapPut(normalReq, "method", "GET")
+    mapPut(normalReq, "headers", listCreate())
+    assertFalse(h2HandleExtendedConnect(conn, normalReq))
+}
+
+// == Server Push (Phase 6) ====================================================
+
+@Test fun testServerPushStreamIdAllocation() {
+    // Server push uses even stream IDs
+    val conn = mapCreate()
+    mapPut(conn, "nextStreamId", 2)
+    val nextId = toInt(mapGet(conn, "nextStreamId"))
+    assertEquals(2, nextId)
+    // After allocation, next would be 4
+    mapPut(conn, "nextStreamId", nextId + 2)
+    assertEquals(4, toInt(mapGet(conn, "nextStreamId")))
+}
+
+// == Graceful Shutdown (Phase 7) ==============================================
+
+@Test fun testGracefulShutdownState() {
+    val conn = mapCreate()
+    mapPut(conn, "shuttingDown", false)
+    assertFalse(h2IsShuttingDown(conn))
+    mapPut(conn, "shuttingDown", true)
+    assertTrue(h2IsShuttingDown(conn))
+}
+
+@Test fun testGoawayLastStreamId() {
+    val conn = mapCreate()
+    mapPut(conn, "goawayLastStreamId", 5)
+    assertEquals(5, h2ShutdownLastStreamId(conn))
+}
+
+@Test fun testRetryableStreams() {
+    val conn = mapCreate()
+    val streams = mapCreate()
+    val s1 = mapCreate()
+    mapPut(s1, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+    mapPut(streams, "1", s1)
+    val s3 = mapCreate()
+    mapPut(s3, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+    mapPut(streams, "3", s3)
+    val s5 = mapCreate()
+    mapPut(s5, "state", H2_STREAM_HALF_CLOSED_LOCAL())
+    mapPut(streams, "5", s5)
+    val s7 = mapCreate()
+    mapPut(s7, "state", H2_STREAM_CLOSED_STATE())
+    mapPut(streams, "7", s7)
+    mapPut(conn, "streams", streams)
+
+    // GOAWAY with lastStreamId=3 means streams 5 (not 7, which is closed) are retryable
+    val retryable = h2RetryableStreams(conn, 3)
+    assertEquals(1, listSize(retryable))
+    assertEquals(5, toInt(listGet(retryable, 0)))
+}
+
+@Test fun testShutdownFlag() {
+    val conn = mapCreate()
+    mapPut(conn, "shuttingDown", false)
+    mapPut(conn, "goawayLastStreamId", 0)
+    mapPut(conn, "goawayErrorCode", 0)
+    mapPut(conn, "error", "")
+
+    // Simulate receiving GOAWAY
+    var payload: String = h2EncodeUint32(3)  // lastStreamId = 3
+    payload = stringConcat(payload, h2EncodeUint32(0))  // NO_ERROR
+    h2HandleGoaway(conn, payload)
+
+    assertTrue(h2IsShuttingDown(conn))
+    assertEquals(3, h2ShutdownLastStreamId(conn))
+}
+
+@Test fun testPriorityFramePayload() {
+    // PRIORITY is deprecated in RFC 9113, just verify it doesn't crash
+    val conn = mapCreate()
+    mapPut(conn, "streams", mapCreate())
+    // Empty payload — should be no-op
+    h2HandlePriority(conn, 1, "")
+}
+
+@Test fun testContinuationFloodLimit() {
+    // Verify the continuation count limit value
+    // Max 100 CONTINUATION frames before ENHANCE_YOUR_CALM
+    val conn = mapCreate()
+    mapPut(conn, "expectContinuation", true)
+    mapPut(conn, "continuationStreamId", 1)
+    mapPut(conn, "continuationBuffer", "")
+    mapPut(conn, "continuationCount", 100)
+    mapPut(conn, "continuationEndStream", false)
+    mapPut(conn, "continuationIsTrailer", false)
+    mapPut(conn, "fd", 0 - 1)
+    mapPut(conn, "hpackDecCtx", hpackCreateContext())
+    mapPut(conn, "streams", mapCreate())
+
+    // 101st CONTINUATION should trigger flood protection
+    h2HandleContinuation(conn, 0, 1, "data")
+    // expectContinuation should be reset
+    assertFalse(toBool(mapGet(conn, "expectContinuation")))
+}

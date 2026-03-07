@@ -1,0 +1,138 @@
+// HTTP/2 Client Example — h2c (cleartext) prior knowledge
+//
+// Demonstrates connecting to an HTTP/2 server over cleartext TCP,
+// sending requests, and reading responses. Uses h2c via prior knowledge
+// (RFC 9113 Section 3.3), so the server must support direct HTTP/2.
+//
+// Prerequisites:
+//   Start a local h2c server. For example, using Go:
+//
+//     package main
+//     import (
+//         "fmt"
+//         "net/http"
+//         "golang.org/x/net/http2"
+//         "golang.org/x/net/http2/h2c"
+//     )
+//     func main() {
+//         h2s := &http2.Server{}
+//         mux := http.NewServeMux()
+//         mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+//             fmt.Fprintf(w, "Hello from HTTP/2! Method=%s Path=%s", r.Method, r.URL.Path)
+//         })
+//         mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+//             w.Header().Set("Content-Type", r.Header.Get("Content-Type"))
+//             io.Copy(w, r.Body)
+//         })
+//         server := &http.Server{
+//             Addr:    ":8080",
+//             Handler: h2c.NewHandler(mux, h2s),
+//         }
+//         fmt.Println("h2c server on :8080")
+//         server.ListenAndServe()
+//     }
+//
+//   Or using Python (hyper-h2):
+//     python -m http.server --protocol HTTP/2 8080
+//
+// Run:
+//   rockit run examples/networking/http2_client.rok
+
+import rockit.networking.http2
+import rockit.encoding.hpack
+import rockit.networking.url
+
+fun main(): Unit {
+    println("=== HTTP/2 Client Example ===")
+    println("")
+
+    // -- Connect to server --------------------------------------------------
+    println("Connecting to http://localhost:8080 ...")
+    val conn = h2Connect("http://localhost:8080")
+
+    if (h2IsOpen(conn) == false) {
+        println(stringConcat("ERROR: ", h2Error(conn)))
+        println("")
+        println("Make sure an h2c server is running on localhost:8080.")
+        println("See the comments at the top of this file for setup instructions.")
+        return
+    }
+    println("Connected! HTTP/2 connection established via h2c prior knowledge.")
+    println("")
+
+    // -- GET request --------------------------------------------------------
+    println("--- GET / ---")
+    val resp1 = h2Get(conn, "/")
+
+    if (h2IsError(resp1)) {
+        println(stringConcat("  Error: ", h2ErrorMessage(resp1)))
+    } else {
+        println(stringConcat("  Status: ", toString(h2ResponseStatus(resp1))))
+        println(stringConcat("  Body:   ", h2ResponseBody(resp1)))
+    }
+    println("")
+
+    // -- GET with path ------------------------------------------------------
+    println("--- GET /api/data ---")
+    val resp2 = h2Get(conn, "/api/data")
+
+    if (h2IsError(resp2)) {
+        println(stringConcat("  Error: ", h2ErrorMessage(resp2)))
+    } else {
+        println(stringConcat("  Status: ", toString(h2ResponseStatus(resp2))))
+        println(stringConcat("  Body:   ", h2ResponseBody(resp2)))
+    }
+    println("")
+
+    // -- POST request -------------------------------------------------------
+    println("--- POST /echo ---")
+    val resp3 = h2Post(conn, "/echo", "{\"message\": \"hello http2\"}", "application/json")
+
+    if (h2IsError(resp3)) {
+        println(stringConcat("  Error: ", h2ErrorMessage(resp3)))
+    } else {
+        println(stringConcat("  Status: ", toString(h2ResponseStatus(resp3))))
+        println(stringConcat("  Body:   ", h2ResponseBody(resp3)))
+        val ct = h2ResponseHeader(resp3, "content-type")
+        if (stringLength(ct) > 0) {
+            println(stringConcat("  Content-Type: ", ct))
+        }
+    }
+    println("")
+
+    // -- PUT request --------------------------------------------------------
+    println("--- PUT /echo ---")
+    val resp4 = h2Put(conn, "/echo", "updated data", "text/plain")
+
+    if (h2IsError(resp4)) {
+        println(stringConcat("  Error: ", h2ErrorMessage(resp4)))
+    } else {
+        println(stringConcat("  Status: ", toString(h2ResponseStatus(resp4))))
+        println(stringConcat("  Body:   ", h2ResponseBody(resp4)))
+    }
+    println("")
+
+    // -- DELETE request -----------------------------------------------------
+    println("--- DELETE /resource/42 ---")
+    val resp5 = h2Delete(conn, "/resource/42")
+
+    if (h2IsError(resp5)) {
+        println(stringConcat("  Error: ", h2ErrorMessage(resp5)))
+    } else {
+        println(stringConcat("  Status: ", toString(h2ResponseStatus(resp5))))
+        println(stringConcat("  Body:   ", h2ResponseBody(resp5)))
+    }
+    println("")
+
+    // -- Close connection ---------------------------------------------------
+    h2Close(conn)
+    println("Connection closed.")
+    println("")
+
+    // -- Verify closed state ------------------------------------------------
+    if (h2IsOpen(conn) == false) {
+        println("Confirmed: connection is closed.")
+    }
+
+    println("=== Done ===")
+}
