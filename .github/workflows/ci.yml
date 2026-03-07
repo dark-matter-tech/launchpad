@@ -7,7 +7,7 @@ on:
     branches: [master, develop]
 
 jobs:
-  test-stdlib:
+  test-launchpad:
     runs-on: ubuntu-22.04
     container: swift:5.10.1-jammy
     defaults:
