@@ -38,8 +38,10 @@ jobs:
 
       - name: Build compiler
         run: |
-          echo "Cloning compiler repo..."
-          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit.git /tmp/compiler
+          echo "Cloning compiler repo from Gitea..."
+          echo "machine rustygits.com login x-access-token password ${FUEL_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --depth 1 --recurse-submodules https://rustygits.com/Dark-Matter/moon.git /tmp/compiler
           cd /tmp/compiler/RockitCompiler
           echo "Building Stage 0 compiler..."
           swift build -c release
@@ -48,6 +50,8 @@ jobs:
           echo "Building runtime..."
           bash runtime/rockit/build.sh
           echo "Compiler ready"
+        env:
+          FUEL_TOKEN: ${{ secrets.FUEL_TOKEN }}
 
       - name: Run stdlib tests — core
         run: |
