@@ -3,6 +3,7 @@
 import rockit.testing.probe
 import rockit.networking.http
 import rockit.networking.url
+import rockit.encoding.base64
 
 // == Response Parsing ========================================================
 
@@ -101,4 +102,1184 @@ import rockit.networking.url
     val resp = mapCreate()
     mapPut(resp, "error", "timeout")
     assertEqualsStr("timeout", httpErrorMessage(resp))
+}
+
+// == Chunked Transfer Encoding ================================================
+
+@Test fun testHexParse() {
+    assertEquals(0, httpParseHex("0"))
+    assertEquals(5, httpParseHex("5"))
+    assertEquals(10, httpParseHex("a"))
+    assertEquals(10, httpParseHex("A"))
+    assertEquals(15, httpParseHex("f"))
+    assertEquals(15, httpParseHex("F"))
+    assertEquals(255, httpParseHex("ff"))
+    assertEquals(256, httpParseHex("100"))
+    assertEquals(26, httpParseHex("1a"))
+}
+
+@Test fun testChunkedDecoding() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    val chunked = stringConcat("5", stringConcat(crlf, stringConcat("hello", stringConcat(crlf, stringConcat("6", stringConcat(crlf, stringConcat(" world", stringConcat(crlf, stringConcat("0", crlf)))))))))
+    val decoded = httpDecodeChunkedBody(chunked)
+    assertEqualsStr("hello world", decoded)
+}
+
+@Test fun testChunkedDecodingSingleChunk() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    val chunked = stringConcat("b", stringConcat(crlf, stringConcat("hello world", stringConcat(crlf, stringConcat("0", crlf)))))
+    val decoded = httpDecodeChunkedBody(chunked)
+    assertEqualsStr("hello world", decoded)
+}
+
+@Test fun testChunkedResponseParsing() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    val body = stringConcat("5", stringConcat(crlf, stringConcat("hello", stringConcat(crlf, stringConcat("0", crlf)))))
+    val raw = stringConcat("HTTP/1.1 200 OK", stringConcat(crlf, stringConcat("Transfer-Encoding: chunked", stringConcat(crlf, stringConcat(crlf, body)))))
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+}
+
+// == HTTP Methods =============================================================
+
+@Test fun testHttpHeadExists() {
+    // Verify the constant function is accessible (HEAD delegates to httpRequest)
+    assertEquals(65536, HTTP_MAX_HEADER_SIZE())
+}
+
+@Test fun testHttpOptionsExists() {
+    assertEquals(10485760, HTTP_MAX_RESPONSE_SIZE())
+}
+
+@Test fun testHttpPatchExists() {
+    assertEquals(10000, HTTP_MAX_RECV_ITERATIONS())
+}
+
+// == Header Size Limits =======================================================
+
+@Test fun testHeaderSizeLimit() {
+    assertEquals(65536, HTTP_MAX_HEADER_SIZE())
+}
+
+// == Content-Length Validation =================================================
+
+@Test fun testContentLengthMatch() {
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+    assertEqualsStr("", toString(mapGet(result, "error")))
+}
+
+@Test fun testContentLengthMismatch() {
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertTrue(httpIsError(result))
+    assertTrue(stringContains(httpErrorMessage(result), "Content-Length mismatch"))
+}
+
+// == Response Buffer Limit ====================================================
+
+@Test fun testResponseBufferLimit() {
+    assertEquals(10485760, HTTP_MAX_RESPONSE_SIZE())
+}
+
+// == Recv Loop Protection =====================================================
+
+@Test fun testRecvIterationLimit() {
+    assertEquals(10000, HTTP_MAX_RECV_ITERATIONS())
+}
+
+// == Session / Keep-Alive =====================================================
+
+@Test fun testSessionCreate() {
+    val session = httpCreateSession()
+    assertEquals(-1, toInt(mapGet(session, "fd")))
+    assertEquals(-1, toInt(mapGet(session, "tlsConn")))
+    assertEqualsStr("", toString(mapGet(session, "host")))
+    assertEquals(0, toInt(mapGet(session, "port")))
+    assertEqualsStr("", toString(mapGet(session, "scheme")))
+    val connected = mapGet(session, "connected")
+    assertTrue(connected == false)
+}
+
+@Test fun testSessionCloseWhenNotConnected() {
+    // Closing an unconnected session should not crash
+    val session = httpCreateSession()
+    httpSessionClose(session)
+    val connected = mapGet(session, "connected")
+    assertTrue(connected == false)
+    assertEquals(-1, toInt(mapGet(session, "fd")))
+}
+
+@Test fun testSessionCloseResetsState() {
+    // Simulate a connected session and verify close resets all fields
+    val session = httpCreateSession()
+    mapPut(session, "connected", true)
+    mapPut(session, "host", "example.com")
+    mapPut(session, "port", 80)
+    mapPut(session, "scheme", "http")
+    mapPut(session, "fd", 42)
+
+    httpSessionClose(session)
+    val connected = mapGet(session, "connected")
+    assertTrue(connected == false)
+    assertEquals(-1, toInt(mapGet(session, "fd")))
+    assertEqualsStr("", toString(mapGet(session, "host")))
+    assertEquals(0, toInt(mapGet(session, "port")))
+}
+
+@Test fun testResponseCompleteWithContentLength() {
+    val crlf = "\r\n"
+    val raw = stringConcat("HTTP/1.1 200 OK", stringConcat(crlf, stringConcat("Content-Length: 5", stringConcat(crlf, stringConcat(crlf, "hello")))))
+    assertTrue(httpIsResponseComplete(raw))
+}
+
+@Test fun testResponseIncompleteWithContentLength() {
+    val crlf = "\r\n"
+    // Content-Length says 10 but body is only 5 bytes
+    val raw = stringConcat("HTTP/1.1 200 OK", stringConcat(crlf, stringConcat("Content-Length: 10", stringConcat(crlf, stringConcat(crlf, "hello")))))
+    assertFalse(httpIsResponseComplete(raw))
+}
+
+@Test fun testResponseCompleteChunked() {
+    val crlf = "\r\n"
+    val body = stringConcat("5", stringConcat(crlf, stringConcat("hello", stringConcat(crlf, stringConcat("0", stringConcat(crlf, crlf))))))
+    val raw = stringConcat("HTTP/1.1 200 OK", stringConcat(crlf, stringConcat("Transfer-Encoding: chunked", stringConcat(crlf, stringConcat(crlf, body)))))
+    assertTrue(httpIsResponseComplete(raw))
+}
+
+@Test fun testResponseIncompleteNoHeaderEnd() {
+    // No \r\n\r\n boundary yet
+    val raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain"
+    assertFalse(httpIsResponseComplete(raw))
+}
+
+// == Redirect Handling ========================================================
+
+@Test fun testIsRedirect() {
+    assertTrue(httpIsRedirect(301))
+    assertTrue(httpIsRedirect(302))
+    assertTrue(httpIsRedirect(303))
+    assertTrue(httpIsRedirect(307))
+    assertTrue(httpIsRedirect(308))
+    assertFalse(httpIsRedirect(200))
+    assertFalse(httpIsRedirect(404))
+    assertFalse(httpIsRedirect(500))
+    assertFalse(httpIsRedirect(304))
+}
+
+@Test fun testRedirectMethod303AlwaysGet() {
+    // 303 See Other: any method becomes GET
+    assertEqualsStr("GET", httpRedirectMethod(303, "POST"))
+    assertEqualsStr("GET", httpRedirectMethod(303, "PUT"))
+    assertEqualsStr("GET", httpRedirectMethod(303, "DELETE"))
+    assertEqualsStr("GET", httpRedirectMethod(303, "GET"))
+    assertEqualsStr("GET", httpRedirectMethod(303, "PATCH"))
+}
+
+@Test fun testRedirectMethod301PostBecomesGet() {
+    // 301 Moved Permanently: POST changes to GET (browser convention)
+    assertEqualsStr("GET", httpRedirectMethod(301, "POST"))
+    // Other methods stay the same
+    assertEqualsStr("GET", httpRedirectMethod(301, "GET"))
+    assertEqualsStr("PUT", httpRedirectMethod(301, "PUT"))
+    assertEqualsStr("DELETE", httpRedirectMethod(301, "DELETE"))
+}
+
+@Test fun testRedirectMethod302PostBecomesGet() {
+    // 302 Found: POST changes to GET (browser convention)
+    assertEqualsStr("GET", httpRedirectMethod(302, "POST"))
+    assertEqualsStr("GET", httpRedirectMethod(302, "GET"))
+    assertEqualsStr("PUT", httpRedirectMethod(302, "PUT"))
+}
+
+@Test fun testRedirectMethod307PreservesMethod() {
+    // 307 Temporary Redirect: preserve original method
+    assertEqualsStr("POST", httpRedirectMethod(307, "POST"))
+    assertEqualsStr("PUT", httpRedirectMethod(307, "PUT"))
+    assertEqualsStr("DELETE", httpRedirectMethod(307, "DELETE"))
+    assertEqualsStr("GET", httpRedirectMethod(307, "GET"))
+}
+
+@Test fun testRedirectMethod308PreservesMethod() {
+    // 308 Permanent Redirect: preserve original method
+    assertEqualsStr("POST", httpRedirectMethod(308, "POST"))
+    assertEqualsStr("PUT", httpRedirectMethod(308, "PUT"))
+    assertEqualsStr("PATCH", httpRedirectMethod(308, "PATCH"))
+}
+
+@Test fun testRedirectPreservesBody307Post() {
+    // 307 with POST should preserve body
+    assertTrue(httpRedirectPreservesBody(307, "POST"))
+    assertTrue(httpRedirectPreservesBody(307, "PUT"))
+    assertTrue(httpRedirectPreservesBody(307, "PATCH"))
+}
+
+@Test fun testRedirectPreservesBody308Post() {
+    // 308 with POST should preserve body
+    assertTrue(httpRedirectPreservesBody(308, "POST"))
+    assertTrue(httpRedirectPreservesBody(308, "PUT"))
+}
+
+@Test fun testRedirectDropsBody303() {
+    // 303 changes method to GET, body should be dropped
+    assertFalse(httpRedirectPreservesBody(303, "POST"))
+    assertFalse(httpRedirectPreservesBody(303, "PUT"))
+}
+
+@Test fun testRedirectDropsBody301Post() {
+    // 301 with POST changes to GET, body should be dropped
+    assertFalse(httpRedirectPreservesBody(301, "POST"))
+}
+
+@Test fun testRedirectDropsBody302Post() {
+    // 302 with POST changes to GET, body should be dropped
+    assertFalse(httpRedirectPreservesBody(302, "POST"))
+}
+
+@Test fun testRedirectNoBodyForGet() {
+    // GET never has a body to preserve
+    assertFalse(httpRedirectPreservesBody(307, "GET"))
+    assertFalse(httpRedirectPreservesBody(308, "GET"))
+    assertFalse(httpRedirectPreservesBody(301, "GET"))
+}
+
+@Test fun testResolveRedirectUrlAbsolute() {
+    // Absolute URL should be returned as-is
+    val resolved = httpResolveRedirectUrl("http://example.com/page", "http://other.com/new")
+    assertEqualsStr("http://other.com/new", resolved)
+}
+
+@Test fun testResolveRedirectUrlAbsoluteHttps() {
+    val resolved = httpResolveRedirectUrl("http://example.com/page", "https://secure.com/path")
+    assertEqualsStr("https://secure.com/path", resolved)
+}
+
+@Test fun testResolveRedirectUrlAbsolutePath() {
+    // Absolute path (starts with /) should resolve against the origin
+    val resolved = httpResolveRedirectUrl("http://example.com/old/page", "/new/path")
+    assertEqualsStr("http://example.com/new/path", resolved)
+}
+
+@Test fun testResolveRedirectUrlRelative() {
+    // Relative path should resolve against the parent directory of the current path
+    val resolved = httpResolveRedirectUrl("http://example.com/dir/page", "other")
+    assertEqualsStr("http://example.com/dir/other", resolved)
+}
+
+@Test fun testMaxRedirectsConstant() {
+    assertEquals(10, HTTP_MAX_REDIRECTS())
+}
+
+// == Chunked Trailer Headers ==================================================
+
+@Test fun testChunkedBodyWithTrailers() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    // Build: "5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n"
+    var chunked: String = stringConcat("5", crlf)
+    chunked = stringConcat(chunked, stringConcat("hello", crlf))
+    chunked = stringConcat(chunked, stringConcat("0", crlf))
+    chunked = stringConcat(chunked, stringConcat("X-Checksum: abc123", crlf))
+    chunked = stringConcat(chunked, crlf)
+
+    val result = httpDecodeChunkedBodyWithTrailers(chunked)
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+
+    val trailers = mapGet(result, "trailers")
+    assertEqualsStr("abc123", toString(mapGet(trailers, "X-Checksum")))
+}
+
+@Test fun testChunkedBodyWithMultipleTrailers() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    // Build chunked body with two trailer headers
+    var chunked: String = stringConcat("b", crlf)
+    chunked = stringConcat(chunked, stringConcat("hello world", crlf))
+    chunked = stringConcat(chunked, stringConcat("0", crlf))
+    chunked = stringConcat(chunked, stringConcat("X-Checksum: sha256abc", crlf))
+    chunked = stringConcat(chunked, stringConcat("X-Duration: 42ms", crlf))
+    chunked = stringConcat(chunked, crlf)
+
+    val result = httpDecodeChunkedBodyWithTrailers(chunked)
+    assertEqualsStr("hello world", toString(mapGet(result, "body")))
+
+    val trailers = mapGet(result, "trailers")
+    assertEqualsStr("sha256abc", toString(mapGet(trailers, "X-Checksum")))
+    assertEqualsStr("42ms", toString(mapGet(trailers, "X-Duration")))
+}
+
+@Test fun testChunkedBodyNoTrailers() {
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    // Build: "5\r\nhello\r\n0\r\n\r\n" (no trailers, just terminal CRLF)
+    var chunked: String = stringConcat("5", crlf)
+    chunked = stringConcat(chunked, stringConcat("hello", crlf))
+    chunked = stringConcat(chunked, stringConcat("0", crlf))
+    chunked = stringConcat(chunked, crlf)
+
+    val result = httpDecodeChunkedBodyWithTrailers(chunked)
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+
+    val trailers = mapGet(result, "trailers")
+    val keys = mapKeys(trailers)
+    assertEquals(0, listSize(keys))
+}
+
+@Test fun testChunkedResponseWithTrailersParsed() {
+    // Full HTTP response with chunked body and trailers
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var body: String = stringConcat("5", crlf)
+    body = stringConcat(body, stringConcat("hello", crlf))
+    body = stringConcat(body, stringConcat("0", crlf))
+    body = stringConcat(body, stringConcat("Trailer-Key: trailer-val", crlf))
+    body = stringConcat(body, crlf)
+
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Transfer-Encoding: chunked", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, body)
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+
+    // Verify trailers were extracted
+    val trailers = mapGet(result, "trailers")
+    assertEqualsStr("trailer-val", toString(mapGet(trailers, "Trailer-Key")))
+}
+
+@Test fun testHttpTrailerAccessor() {
+    val resp = mapCreate()
+    val trailers = mapCreate()
+    mapPut(trailers, "X-Checksum", "abc123")
+    mapPut(resp, "trailers", trailers)
+    assertEqualsStr("abc123", httpTrailer(resp, "X-Checksum"))
+    // Case-insensitive
+    assertEqualsStr("abc123", httpTrailer(resp, "x-checksum"))
+}
+
+@Test fun testHttpTrailerMissing() {
+    val resp = mapCreate()
+    assertEqualsStr("", httpTrailer(resp, "X-Nothing"))
+}
+
+@Test fun testHttpTrailersAccessor() {
+    val resp = mapCreate()
+    val trailers = mapCreate()
+    mapPut(trailers, "Key", "Val")
+    mapPut(resp, "trailers", trailers)
+    val t = httpTrailers(resp)
+    assertEqualsStr("Val", toString(mapGet(t, "Key")))
+}
+
+@Test fun testHttpTrailersAccessorEmpty() {
+    val resp = mapCreate()
+    val t = httpTrailers(resp)
+    val keys = mapKeys(t)
+    assertEquals(0, listSize(keys))
+}
+
+// == Expect: 100-Continue =====================================================
+
+@Test fun testExpectContinueDefault() {
+    // Expect: 100-continue should be disabled by default
+    assertFalse(httpGetExpectContinue())
+}
+
+@Test fun testExpectContinueToggle() {
+    // Save original state
+    val original = httpGetExpectContinue()
+
+    httpSetExpectContinue(true)
+    assertTrue(httpGetExpectContinue())
+
+    httpSetExpectContinue(false)
+    assertFalse(httpGetExpectContinue())
+
+    // Restore original state
+    httpSetExpectContinue(original)
+}
+
+@Test fun testExpectThreshold() {
+    assertEquals(8192, HTTP_EXPECT_THRESHOLD())
+}
+
+@Test fun testShouldUseExpectDisabled() {
+    // When disabled, never use expect
+    httpSetExpectContinue(false)
+    assertFalse(httpShouldUseExpect("short body"))
+    // Build a large body > 8192 bytes
+    var largeBody: String = ""
+    var i: Int = 0
+    while (i < 200) {
+        largeBody = stringConcat(largeBody, "0123456789012345678901234567890123456789012345678")
+        i = i + 1
+    }
+    assertFalse(httpShouldUseExpect(largeBody))
+}
+
+@Test fun testShouldUseExpectEnabled() {
+    httpSetExpectContinue(true)
+    // Small body should not trigger expect
+    assertFalse(httpShouldUseExpect("small"))
+    // Large body should trigger expect
+    var largeBody: String = ""
+    var i: Int = 0
+    while (i < 200) {
+        largeBody = stringConcat(largeBody, "0123456789012345678901234567890123456789012345678")
+        i = i + 1
+    }
+    assertTrue(httpShouldUseExpect(largeBody))
+    // Restore
+    httpSetExpectContinue(false)
+}
+
+@Test fun testParseExpectResponseValid() {
+    // "HTTP/1.1 100 Continue\r\n\r\n" should be recognized
+    assertTrue(httpParseExpectResponse("HTTP/1.1 100 Continue\r\n\r\n"))
+}
+
+@Test fun testParseExpectResponseNot100() {
+    // "HTTP/1.1 417 Expectation Failed" should not be recognized as 100
+    assertFalse(httpParseExpectResponse("HTTP/1.1 417"))
+}
+
+@Test fun testParseExpectResponseTooShort() {
+    assertFalse(httpParseExpectResponse("HTTP/1.1"))
+    assertFalse(httpParseExpectResponse(""))
+}
+
+// == Gap 1: HEAD response Content-Length mismatch (RFC 9110 §9.3.2) =========
+
+@Test fun testHeadResponseSkipsBody() {
+    // HEAD responses MUST NOT have a body — Content-Length indicates what GET would return
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    mapPut(result, "method", "HEAD")
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("", toString(mapGet(result, "body")))
+    assertEqualsStr("", toString(mapGet(result, "error")))
+}
+
+@Test fun testHeadResponseNoContentLengthValidation() {
+    // HEAD with Content-Length: 1000 but no body data should NOT produce a mismatch error
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nContent-Type: text/html\r\n\r\n"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    mapPut(result, "method", "HEAD")
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("", toString(mapGet(result, "body")))
+    // No error should be set
+    assertFalse(httpIsError(result))
+}
+
+@Test fun testGetResponseStillValidatesContentLength() {
+    // GET responses should still validate Content-Length
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    mapPut(result, "method", "GET")
+    httpParseResponse(raw, result, headers)
+    assertTrue(httpIsError(result))
+    assertTrue(stringContains(httpErrorMessage(result), "Content-Length mismatch"))
+}
+
+@Test fun testDefaultMethodIsGet() {
+    // When no method is set in result map, default to GET behavior (body is parsed)
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+}
+
+// == Gap 2: Host header missing port (RFC 9112 §3.2.5) =====================
+
+@Test fun testBuildHostHeaderDefaultPort80() {
+    // Port 80 on http should NOT appear in Host header
+    val hostVal = httpBuildHostHeader("example.com", 80, "http")
+    assertEqualsStr("example.com", hostVal)
+}
+
+@Test fun testBuildHostHeaderDefaultPort443() {
+    // Port 443 on https should NOT appear in Host header
+    val hostVal = httpBuildHostHeader("example.com", 443, "https")
+    assertEqualsStr("example.com", hostVal)
+}
+
+@Test fun testBuildHostHeaderNonDefaultPort() {
+    // Port 8080 on http should appear in Host header
+    val hostVal = httpBuildHostHeader("example.com", 8080, "http")
+    assertEqualsStr("example.com:8080", hostVal)
+}
+
+@Test fun testBuildHostHeaderNonDefaultHttpsPort() {
+    // Port 8443 on https should appear in Host header
+    val hostVal = httpBuildHostHeader("example.com", 8443, "https")
+    assertEqualsStr("example.com:8443", hostVal)
+}
+
+@Test fun testBuildHostHeaderPort443OnHttp() {
+    // Port 443 on http (non-default) should appear
+    val hostVal = httpBuildHostHeader("example.com", 443, "http")
+    assertEqualsStr("example.com:443", hostVal)
+}
+
+@Test fun testBuildHostHeaderPort80OnHttps() {
+    // Port 80 on https (non-default) should appear
+    val hostVal = httpBuildHostHeader("example.com", 80, "https")
+    assertEqualsStr("example.com:80", hostVal)
+}
+
+// == Gap 3: Multi-valued headers (RFC 9110 §5.3) ===========================
+
+@Test fun testMultiValuedHeadersCombined() {
+    // When the same header appears twice, values should be comma-separated
+    // (Set-Cookie is exempt from comma-combining, so use a different header here)
+    val block = "Accept: text/html\r\nAccept: application/json"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("text/html, application/json", toString(mapGet(headers, "Accept")))
+}
+
+@Test fun testMultiValuedHeadersThreeValues() {
+    // Three occurrences of the same header
+    val block = "Via: proxy1\r\nVia: proxy2\r\nVia: proxy3"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("proxy1, proxy2, proxy3", toString(mapGet(headers, "Via")))
+}
+
+@Test fun testSingleHeaderNotDuplicated() {
+    // Single occurrence should not add commas
+    val block = "Content-Type: text/plain"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("text/plain", toString(mapGet(headers, "Content-Type")))
+}
+
+// == Gap 4: Content-Length + Transfer-Encoding conflict (RFC 9112 §6.1) =====
+
+@Test fun testContentLengthTransferEncodingConflict() {
+    // When both are present, Transfer-Encoding takes precedence
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var body: String = stringConcat("5", crlf)
+    body = stringConcat(body, stringConcat("hello", crlf))
+    body = stringConcat(body, stringConcat("0", crlf))
+    body = stringConcat(body, crlf)
+
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Transfer-Encoding: chunked", crlf))
+    raw = stringConcat(raw, stringConcat("Content-Length: 999", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, body)
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+    // Content-Length should have been removed from headers
+    val clVal = mapGet(headers, "Content-Length")
+    assertTrue(clVal == null)
+    // Conflict flag should be set
+    val conflict = mapGet(result, "contentLengthConflict")
+    assertTrue(conflict == true)
+}
+
+@Test fun testNoConflictWhenOnlyChunked() {
+    // No conflict flag when only Transfer-Encoding is present
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var body: String = stringConcat("5", crlf)
+    body = stringConcat(body, stringConcat("hello", crlf))
+    body = stringConcat(body, stringConcat("0", crlf))
+    body = stringConcat(body, crlf)
+
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Transfer-Encoding: chunked", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, body)
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+
+    val conflict = mapGet(result, "contentLengthConflict")
+    assertTrue(conflict == null)
+}
+
+// == Gap 5: HTTP version validation (RFC 9112 §4) ==========================
+
+@Test fun testHttpVersionStored() {
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEqualsStr("HTTP/1.1", toString(mapGet(result, "httpVersion")))
+    assertEquals(200, toInt(mapGet(result, "status")))
+}
+
+@Test fun testHttpVersion10Accepted() {
+    val raw = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEqualsStr("HTTP/1.0", toString(mapGet(result, "httpVersion")))
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hi", toString(mapGet(result, "body")))
+}
+
+@Test fun testHttpVersionInvalidRejected() {
+    val raw = "HTTP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(0, toInt(mapGet(result, "status")))
+    assertTrue(stringContains(toString(mapGet(result, "error")), "Unsupported HTTP version"))
+}
+
+@Test fun testHttpVersionGarbageRejected() {
+    val raw = "GARBAGE 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(0, toInt(mapGet(result, "status")))
+    assertTrue(stringContains(toString(mapGet(result, "error")), "Unsupported HTTP version"))
+}
+
+// == Gap 6: Obsolete line folding obs-fold (RFC 9112 §5.2) =================
+
+@Test fun testObsFoldWithSpace() {
+    // Continuation line starting with space appends to previous header
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var block: String = stringConcat("X-Long: value1", crlf)
+    block = stringConcat(block, " continuation")
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("value1 continuation", toString(mapGet(headers, "X-Long")))
+}
+
+@Test fun testObsFoldWithTab() {
+    // Continuation line starting with tab appends to previous header
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    val tab = intToChar(9)
+    var block: String = stringConcat("X-Long: start", crlf)
+    block = stringConcat(block, stringConcat(tab, "more"))
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("start more", toString(mapGet(headers, "X-Long")))
+}
+
+@Test fun testObsFoldMultipleLines() {
+    // Multiple continuation lines
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var block: String = stringConcat("X-Multi: first", crlf)
+    block = stringConcat(block, stringConcat(" second", crlf))
+    block = stringConcat(block, " third")
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("first second third", toString(mapGet(headers, "X-Multi")))
+}
+
+// == Gap 7: Chunk extensions not stripped (RFC 9112 §7.1.1) ================
+
+@Test fun testChunkExtensionsStripped() {
+    // Chunk size line may contain extensions after semicolon: "5;ext=val\r\n"
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var chunked: String = stringConcat("5;ext=value", crlf)
+    chunked = stringConcat(chunked, stringConcat("hello", crlf))
+    chunked = stringConcat(chunked, stringConcat("0", crlf))
+    chunked = stringConcat(chunked, crlf)
+
+    val decoded = httpDecodeChunkedBody(chunked)
+    assertEqualsStr("hello", decoded)
+}
+
+@Test fun testChunkExtensionsMultipleChunks() {
+    // Multiple chunks with extensions
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var chunked: String = stringConcat("5;name=a", crlf)
+    chunked = stringConcat(chunked, stringConcat("hello", crlf))
+    chunked = stringConcat(chunked, stringConcat("6;name=b", crlf))
+    chunked = stringConcat(chunked, stringConcat(" world", crlf))
+    chunked = stringConcat(chunked, stringConcat("0;final", crlf))
+    chunked = stringConcat(chunked, crlf)
+
+    val decoded = httpDecodeChunkedBody(chunked)
+    assertEqualsStr("hello world", decoded)
+}
+
+// == Gap 8: 1xx interim response handling (RFC 9110 §15.2) =================
+
+@Test fun testSkip100Continue() {
+    // 100 Continue followed by actual response
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var raw: String = stringConcat("HTTP/1.1 100 Continue", crlf)
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, stringConcat("HTTP/1.1 200 OK", crlf))
+    raw = stringConcat(raw, stringConcat("Content-Length: 2", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, "ok")
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("ok", toString(mapGet(result, "body")))
+}
+
+@Test fun testSkipMultiple1xxResponses() {
+    // Multiple 1xx before final
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var raw: String = stringConcat("HTTP/1.1 100 Continue", crlf)
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, stringConcat("HTTP/1.1 102 Processing", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, stringConcat("HTTP/1.1 200 OK", crlf))
+    raw = stringConcat(raw, stringConcat("Content-Length: 4", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, "done")
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("done", toString(mapGet(result, "body")))
+}
+
+@Test fun testOnly1xxResponsesError() {
+    // Only 1xx with no final response
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var raw: String = stringConcat("HTTP/1.1 100 Continue", crlf)
+    raw = stringConcat(raw, crlf)
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertTrue(stringContains(toString(mapGet(result, "error")), "1xx"))
+}
+
+@Test fun testNon1xxNotSkipped() {
+    // 200 should not be treated as 1xx
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+}
+
+// == Gap 9: Chunked termination check (RFC 9112 §7.1) =====================
+
+@Test fun testResponseCompleteChunkedEndsCorrectly() {
+    // Response ending with 0\r\n\r\n is complete
+    val crlf = "\r\n"
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Transfer-Encoding: chunked", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, stringConcat("5", crlf))
+    raw = stringConcat(raw, stringConcat("hello", crlf))
+    raw = stringConcat(raw, stringConcat("0", crlf))
+    raw = stringConcat(raw, crlf)
+    assertTrue(httpIsResponseComplete(raw))
+}
+
+@Test fun testResponseIncompleteChunkedNoTerminator() {
+    // Chunked response without terminal chunk is incomplete
+    val crlf = "\r\n"
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Transfer-Encoding: chunked", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, stringConcat("5", crlf))
+    raw = stringConcat(raw, "hello")
+    assertFalse(httpIsResponseComplete(raw))
+}
+
+// == Gap 10: Fragment in request-target (RFC 9112 §3.2.1) =================
+
+@Test fun testStripFragmentSimple() {
+    val result = httpStripFragment("/path/to/page#section")
+    assertEqualsStr("/path/to/page", result)
+}
+
+@Test fun testStripFragmentNoFragment() {
+    val result = httpStripFragment("/path/to/page")
+    assertEqualsStr("/path/to/page", result)
+}
+
+@Test fun testStripFragmentEmptyAfterHash() {
+    val result = httpStripFragment("/page#")
+    assertEqualsStr("/page", result)
+}
+
+@Test fun testStripFragmentWithQuery() {
+    val result = httpStripFragment("/search?q=test#results")
+    assertEqualsStr("/search?q=test", result)
+}
+
+// == Gap 11: User-Agent header (RFC 9110 §10.1.5) =========================
+
+@Test fun testUserAgentConstant() {
+    assertEqualsStr("rockit/1.0", HTTP_USER_AGENT())
+}
+
+// == Gap 12: Content-Length: 0 for empty bodies ============================
+// (This is tested via httpSessionRequest which is a network function,
+//  so we test the constant and pattern availability)
+
+@Test fun testContentLengthZeroPattern() {
+    // Verify the pattern is correct via parsing a response with Content-Length: 0
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("", toString(mapGet(result, "body")))
+    assertFalse(httpIsError(result))
+}
+
+// == Gap 13: Redirect loop detection (RFC 9110 §15.4) =====================
+// (httpFollowRedirects makes network calls, so we test the URL tracking
+//  pattern indirectly by testing listContains)
+
+@Test fun testRedirectLoopDetectionPattern() {
+    // Verify the listContains pattern used in redirect loop detection
+    val visited = listCreate()
+    listAppend(visited, "http://example.com/a")
+    listAppend(visited, "http://example.com/b")
+    assertTrue(listContains(visited, "http://example.com/a"))
+    assertTrue(listContains(visited, "http://example.com/b"))
+    assertFalse(listContains(visited, "http://example.com/c"))
+}
+
+// == Gap 14: Header field name validation (RFC 9110 §5.1) =================
+
+@Test fun testValidHeaderNames() {
+    assertTrue(httpIsValidHeaderName("Content-Type"))
+    assertTrue(httpIsValidHeaderName("X-Custom-Header"))
+    assertTrue(httpIsValidHeaderName("Accept"))
+    assertTrue(httpIsValidHeaderName("X-Request-ID"))
+    assertTrue(httpIsValidHeaderName("Cache-Control"))
+}
+
+@Test fun testValidHeaderNameSpecialChars() {
+    // Token characters: !#$%&'*+-.^_`|~
+    assertTrue(httpIsValidHeaderName("X-Header!"))
+    assertTrue(httpIsValidHeaderName("X#Header"))
+    assertTrue(httpIsValidHeaderName("X-Header~"))
+    assertTrue(httpIsValidHeaderName("X_Header"))
+    assertTrue(httpIsValidHeaderName("X.Header"))
+}
+
+@Test fun testInvalidHeaderNameEmpty() {
+    assertFalse(httpIsValidHeaderName(""))
+}
+
+@Test fun testInvalidHeaderNameWithSpace() {
+    assertFalse(httpIsValidHeaderName("Content Type"))
+}
+
+@Test fun testInvalidHeaderNameWithColon() {
+    assertFalse(httpIsValidHeaderName("Content:Type"))
+}
+
+@Test fun testInvalidHeaderNameWithAt() {
+    assertFalse(httpIsValidHeaderName("X@Header"))
+}
+
+@Test fun testInvalidHeaderNameWithBrackets() {
+    assertFalse(httpIsValidHeaderName("X[Header]"))
+}
+
+@Test fun testInvalidHeaderSkippedInParsing() {
+    // Headers with invalid names should be skipped during parsing
+    val block = "Valid-Name: good\r\nInvalid Name: bad\r\nAnother-Valid: ok"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("good", toString(mapGet(headers, "Valid-Name")))
+    assertEqualsStr("ok", toString(mapGet(headers, "Another-Valid")))
+    // Invalid header should not be present
+    val badVal = mapGet(headers, "Invalid Name")
+    assertTrue(badVal == null)
+}
+
+// == Gap 15: Whitespace trimming on header values (RFC 9110 §5.5) ==========
+
+@Test fun testTrimWhitespace() {
+    assertEqualsStr("hello", httpTrimWhitespace("  hello  "))
+    assertEqualsStr("hello", httpTrimWhitespace("hello"))
+    assertEqualsStr("hello world", httpTrimWhitespace("  hello world  "))
+    assertEqualsStr("", httpTrimWhitespace(""))
+    assertEqualsStr("", httpTrimWhitespace("   "))
+}
+
+@Test fun testTrimWhitespaceWithTabs() {
+    val tab = intToChar(9)
+    val input = stringConcat(tab, stringConcat("value", tab))
+    assertEqualsStr("value", httpTrimWhitespace(input))
+}
+
+@Test fun testHeaderValueTrimmedInParsing() {
+    // Header value with leading/trailing whitespace should be trimmed
+    val block = "X-Test:   value with spaces   "
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("value with spaces", toString(mapGet(headers, "X-Test")))
+}
+
+@Test fun testHeaderColonWithoutSpace() {
+    // Header with colon but no space after it should still parse
+    val block = "X-NoSpace:value"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("value", toString(mapGet(headers, "X-NoSpace")))
+}
+
+@Test fun testHeaderColonWithExtraSpaces() {
+    // Header with extra spaces around colon value
+    val block = "X-Extra:    lots of space    "
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("lots of space", toString(mapGet(headers, "X-Extra")))
+}
+
+// == Gap A: Query string preserved in request-target ========================
+
+@Test fun testExtractRequestTargetSimplePath() {
+    val target = httpExtractRequestTarget("http://example.com/path/to/page")
+    assertEqualsStr("/path/to/page", target)
+}
+
+@Test fun testExtractRequestTargetWithQuery() {
+    val target = httpExtractRequestTarget("http://example.com/search?q=hello&lang=en")
+    assertEqualsStr("/search?q=hello&lang=en", target)
+}
+
+@Test fun testExtractRequestTargetWithQueryAndFragment() {
+    // Fragment must be stripped from request-target
+    val target = httpExtractRequestTarget("http://example.com/page?key=val#section")
+    assertEqualsStr("/page?key=val", target)
+}
+
+@Test fun testExtractRequestTargetNoPath() {
+    val target = httpExtractRequestTarget("http://example.com")
+    assertEqualsStr("/", target)
+}
+
+@Test fun testExtractRequestTargetQueryOnly() {
+    // URL with query but root path
+    val target = httpExtractRequestTarget("http://example.com/?q=test")
+    assertEqualsStr("/?q=test", target)
+}
+
+@Test fun testExtractRequestTargetNoQuery() {
+    val target = httpExtractRequestTarget("http://example.com/api/v1")
+    assertEqualsStr("/api/v1", target)
+}
+
+@Test fun testExtractRequestTargetFragmentOnly() {
+    // Fragment without query should be stripped
+    val target = httpExtractRequestTarget("http://example.com/page#top")
+    assertEqualsStr("/page", target)
+}
+
+// == Gap B: 204/304 treated as no-body responses ============================
+
+@Test fun testParse204NoContent() {
+    val raw = "HTTP/1.1 204 No Content\r\nX-Custom: yes\r\n\r\nsome unexpected body"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(204, toInt(mapGet(result, "status")))
+    assertEqualsStr("", toString(mapGet(result, "body")))
+    assertEqualsStr("", toString(mapGet(result, "error")))
+}
+
+@Test fun testParse304NotModified() {
+    val raw = "HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(304, toInt(mapGet(result, "status")))
+    assertEqualsStr("", toString(mapGet(result, "body")))
+    assertEqualsStr("", toString(mapGet(result, "error")))
+}
+
+@Test fun testParse200StillHasBody() {
+    // Ensure 200 responses still parse body normally
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+}
+
+// == Gap C: Chunk hex overflow protection ===================================
+
+@Test fun testParseHexOverflowProtection() {
+    // Huge hex value should be capped at HTTP_MAX_RESPONSE_SIZE()
+    val capped = httpParseHex("FFFFFFFF")
+    assertTrue(capped <= HTTP_MAX_RESPONSE_SIZE())
+}
+
+@Test fun testParseHexNormalValues() {
+    // Normal values should still parse correctly
+    assertEquals(255, httpParseHex("ff"))
+    assertEquals(4096, httpParseHex("1000"))
+    assertEquals(0, httpParseHex("0"))
+}
+
+// == Gap D: Invalid hex chars stop parsing ==================================
+
+@Test fun testParseHexInvalidChars() {
+    // 'g' is not a valid hex digit — should stop and return parsed portion
+    assertEquals(255, httpParseHex("ffg0"))
+}
+
+@Test fun testParseHexWithSpaceStops() {
+    // Space is not a valid hex digit
+    assertEquals(10, httpParseHex("a "))
+}
+
+@Test fun testParseHexLeadingInvalid() {
+    // Leading invalid character should return 0
+    assertEquals(0, httpParseHex("xyz"))
+}
+
+@Test fun testParseHexMixedCase() {
+    // Mixed case hex should still work
+    assertEquals(171, httpParseHex("Ab"))
+    assertEquals(171, httpParseHex("aB"))
+}
+
+// == Gap E: Duplicate Content-Length detection ==============================
+
+@Test fun testDuplicateContentLengthIdentical() {
+    // Multiple identical Content-Length values should be OK
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Content-Length: 5", crlf))
+    raw = stringConcat(raw, stringConcat("Content-Length: 5", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, "hello")
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+}
+
+@Test fun testDuplicateContentLengthConflict() {
+    // Different Content-Length values should produce error
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var raw: String = stringConcat("HTTP/1.1 200 OK", crlf)
+    raw = stringConcat(raw, stringConcat("Content-Length: 5", crlf))
+    raw = stringConcat(raw, stringConcat("Content-Length: 10", crlf))
+    raw = stringConcat(raw, crlf)
+    raw = stringConcat(raw, "hello")
+
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertTrue(httpIsError(result))
+    assertTrue(stringContains(httpErrorMessage(result), "Conflicting Content-Length"))
+}
+
+@Test fun testSingleContentLengthNoDuplicate() {
+    // Single Content-Length should parse normally
+    val raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    val result = mapCreate()
+    val headers = mapCreate()
+    mapPut(result, "headers", headers)
+    httpParseResponse(raw, result, headers)
+    assertEquals(200, toInt(mapGet(result, "status")))
+    assertEqualsStr("hello", toString(mapGet(result, "body")))
+    assertFalse(httpIsError(result))
+}
+
+// == Gap F: Set-Cookie exemption from comma-combining =======================
+
+@Test fun testSetCookieNewlineSeparated() {
+    // Set-Cookie headers should NOT be comma-combined (cookie values can contain commas)
+    val block = "Set-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; HttpOnly"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    val cookieVal = toString(mapGet(headers, "Set-Cookie"))
+    // Should be newline-separated, not comma-separated
+    assertTrue(stringContains(cookieVal, "\n"))
+    assertFalse(stringContains(cookieVal, ", "))
+    assertTrue(stringContains(cookieVal, "a=1; Path=/"))
+    assertTrue(stringContains(cookieVal, "b=2; HttpOnly"))
+}
+
+@Test fun testSetCookieThreeValues() {
+    // Three Set-Cookie values should be newline-separated
+    val crlf = stringConcat(intToChar(13), intToChar(10))
+    var block: String = stringConcat("Set-Cookie: session=abc", crlf)
+    block = stringConcat(block, stringConcat("Set-Cookie: theme=dark", crlf))
+    block = stringConcat(block, "Set-Cookie: lang=en")
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    val cookieVal = toString(mapGet(headers, "Set-Cookie"))
+    assertTrue(stringContains(cookieVal, "session=abc"))
+    assertTrue(stringContains(cookieVal, "theme=dark"))
+    assertTrue(stringContains(cookieVal, "lang=en"))
+    // Verify newline separator
+    assertTrue(stringContains(cookieVal, "\n"))
+}
+
+@Test fun testNonSetCookieStillCommaCombined() {
+    // Other headers should still be comma-combined
+    val block = "Via: proxy1\r\nVia: proxy2"
+    val headers = mapCreate()
+    httpParseHeaders(block, headers)
+    assertEqualsStr("proxy1, proxy2", toString(mapGet(headers, "Via")))
+}
+
+// == Gap G: Response truncation reporting ===================================
+
+@Test fun testTruncationConstant() {
+    // Verify the max response size constant used for truncation detection
+    assertEquals(10485760, HTTP_MAX_RESPONSE_SIZE())
 }

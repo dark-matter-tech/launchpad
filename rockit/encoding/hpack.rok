@@ -13,6 +13,16 @@
 //   val encoded = hpackEncode(ctx, headers)
 //   val decoded = hpackDecode(ctx, data, dataLen)
 
+// == Byte Helpers =============================================================
+
+// intToChar only handles 0-127 (ASCII). This helper uses stringFromCharCodes
+// to support the full 0-255 byte range needed for binary protocol encoding.
+fun hpackByteToChar(b: Int): String {
+    val codes = listCreate()
+    listAppend(codes, b)
+    return stringFromCharCodes(codes)
+}
+
 // == Representation Type Constants ============================================
 
 // Indexed header field representation (Section 6.1)
@@ -155,15 +165,15 @@ fun hpackStaticLookupName(name: String): Int {
 fun hpackEncodeInt(value: Int, prefixSize: Int, prefixBits: Int): String {
     val maxPrefix = hpackPow2(prefixSize) - 1
     if (value < maxPrefix) {
-        return intToChar(prefixBits + value)
+        return hpackByteToChar(prefixBits + value)
     }
-    var result: String = intToChar(prefixBits + maxPrefix)
+    var result: String = hpackByteToChar(prefixBits + maxPrefix)
     var remaining: Int = value - maxPrefix
     while (remaining >= 128) {
-        result = stringConcat(result, intToChar(128 + remaining - (remaining / 128) * 128))
+        result = stringConcat(result, hpackByteToChar(128 + remaining - (remaining / 128) * 128))
         remaining = remaining / 128
     }
-    result = stringConcat(result, intToChar(remaining))
+    result = stringConcat(result, hpackByteToChar(remaining))
     return result
 }
 
@@ -175,6 +185,7 @@ fun hpackDecodeInt(buf: String, pos: Int, prefixSize: Int): Map {
     if (pos >= bufLen) {
         mapPut(result, "value", 0)
         mapPut(result, "pos", pos)
+        mapPut(result, "overflow", false)
         return result
     }
     val maxPrefix = hpackPow2(prefixSize) - 1
@@ -185,11 +196,13 @@ fun hpackDecodeInt(buf: String, pos: Int, prefixSize: Int): Map {
     if (value < maxPrefix) {
         mapPut(result, "value", value)
         mapPut(result, "pos", newPos)
+        mapPut(result, "overflow", false)
         return result
     }
     // Multi-byte integer
     var m: Int = 0
     var done: Bool = false
+    var overflow: Bool = false
     while (done == false) {
         if (newPos >= bufLen) {
             done = true
@@ -201,20 +214,40 @@ fun hpackDecodeInt(buf: String, pos: Int, prefixSize: Int): Map {
                 done = true
             }
             m = m + 7
+            // Gap H3: Overflow detection — signal error after 4 continuation groups (28 bits)
+            if (m > 28) {
+                overflow = true
+                done = true
+            }
+            // Clamp to max 32-bit signed integer
+            if (value > 2147483647) {
+                overflow = true
+                value = 2147483647
+                done = true
+            }
         }
     }
     mapPut(result, "value", value)
     mapPut(result, "pos", newPos)
+    mapPut(result, "overflow", overflow)
     return result
 }
 
 // == String Encoding/Decoding (RFC 7541 Section 5.2) ==========================
 
-// Encode a string literal (raw, no Huffman: H=0)
+// Encode a string literal, choosing Huffman (H=1) when shorter than raw (H=0)
 fun hpackEncodeString(s: String): String {
-    val len = stringLength(s)
-    // H=0 means prefix bits are 0, prefix size is 7
-    var result: String = hpackEncodeInt(len, 7, 0)
+    val rawLen = stringLength(s)
+    val huffLen = hpackHuffmanEncodedLength(s)
+    if (huffLen < rawLen) {
+        // Huffman encoding is shorter — use H=1 (prefix bits = 128)
+        val huffBytes = hpackHuffmanEncode(s)
+        var result: String = hpackEncodeInt(huffLen, 7, 128)
+        result = stringConcat(result, huffBytes)
+        return result
+    }
+    // Raw encoding — H=0 means prefix bits are 0, prefix size is 7
+    var result: String = hpackEncodeInt(rawLen, 7, 0)
     result = stringConcat(result, s)
     return result
 }
@@ -247,7 +280,7 @@ fun hpackDecodeString(buf: String, pos: Int): Map {
     var i: Int = 0
     while (i < strLen) {
         if (newPos + i < bufLen) {
-            s = stringConcat(s, intToChar(charCodeAt(buf, newPos + i)))
+            s = stringConcat(s, hpackByteToChar(charCodeAt(buf, newPos + i)))
         }
         i = i + 1
     }
@@ -260,282 +293,303 @@ fun hpackDecodeString(buf: String, pos: Int): Map {
 
 // Get the Huffman code for a symbol (0-256). Symbol 256 = EOS.
 // Returns the code as an integer.
+// Values from RFC 7541 Appendix B.
 fun hpackHuffmanCode(sym: Int): Int {
-    if (sym == 0) { return 8184 }          // 13 bits
-    if (sym == 1) { return 8388568 }       // 23 bits
-    if (sym == 2) { return 268435426 }     // 28 bits
-    if (sym == 3) { return 268435427 }     // 28 bits
-    if (sym == 4) { return 268435428 }     // 28 bits
-    if (sym == 5) { return 268435429 }     // 28 bits
-    if (sym == 6) { return 268435430 }     // 28 bits
-    if (sym == 7) { return 268435431 }     // 28 bits
-    if (sym == 8) { return 268435432 }     // 28 bits
-    if (sym == 9) { return 16777194 }      // 24 bits
-    if (sym == 10) { return 1073741820 }   // 30 bits
-    if (sym == 11) { return 268435433 }    // 28 bits
-    if (sym == 12) { return 268435434 }    // 28 bits
-    if (sym == 13) { return 1073741821 }   // 30 bits
-    if (sym == 14) { return 268435435 }    // 28 bits
-    if (sym == 15) { return 268435436 }    // 28 bits
-    if (sym == 16) { return 268435437 }    // 28 bits
-    if (sym == 17) { return 268435438 }    // 28 bits
-    if (sym == 18) { return 268435439 }    // 28 bits
-    if (sym == 19) { return 268435440 }    // 28 bits
-    if (sym == 20) { return 268435441 }    // 28 bits
-    if (sym == 21) { return 268435442 }    // 28 bits
-    if (sym == 22) { return 1073741822 }   // 30 bits
-    if (sym == 23) { return 268435443 }    // 28 bits
-    if (sym == 24) { return 268435444 }    // 28 bits
-    if (sym == 25) { return 268435445 }    // 28 bits
-    if (sym == 26) { return 268435446 }    // 28 bits
-    if (sym == 27) { return 268435447 }    // 28 bits
-    if (sym == 28) { return 268435448 }    // 28 bits
-    if (sym == 29) { return 268435449 }    // 28 bits
-    if (sym == 30) { return 268435450 }    // 28 bits
-    if (sym == 31) { return 268435451 }    // 28 bits
-    if (sym == 32) { return 20 }           // 6 bits  (space)
-    if (sym == 33) { return 1016 }         // 10 bits !
-    if (sym == 34) { return 1017 }         // 10 bits "
-    if (sym == 35) { return 4084 }         // 12 bits #
-    if (sym == 36) { return 8185 }         // 13 bits $
-    if (sym == 37) { return 21 }           // 6 bits  %
-    if (sym == 38) { return 248 }          // 8 bits  &
-    if (sym == 39) { return 2042 }         // 11 bits '
-    if (sym == 40) { return 1018 }         // 10 bits (
-    if (sym == 41) { return 1019 }         // 10 bits )
-    if (sym == 42) { return 249 }          // 8 bits  *
-    if (sym == 43) { return 2043 }         // 11 bits +
-    if (sym == 44) { return 250 }          // 8 bits  ,
-    if (sym == 45) { return 22 }           // 6 bits  -
-    if (sym == 46) { return 23 }           // 6 bits  .
-    if (sym == 47) { return 24 }           // 6 bits  /
-    if (sym == 48) { return 0 }            // 5 bits  0
-    if (sym == 49) { return 1 }            // 5 bits  1
-    if (sym == 50) { return 2 }            // 5 bits  2
-    if (sym == 51) { return 25 }           // 6 bits  3
-    if (sym == 52) { return 26 }           // 6 bits  4
-    if (sym == 53) { return 27 }           // 6 bits  5
-    if (sym == 54) { return 28 }           // 6 bits  6
-    if (sym == 55) { return 29 }           // 6 bits  7
-    if (sym == 56) { return 30 }           // 6 bits  8
-    if (sym == 57) { return 31 }           // 6 bits  9
-    if (sym == 58) { return 92 }           // 7 bits  :
-    if (sym == 59) { return 251 }          // 8 bits  ;
-    if (sym == 60) { return 32764 }        // 15 bits <
-    if (sym == 61) { return 32 }           // 6 bits  =
-    if (sym == 62) { return 32765 }        // 15 bits >
-    if (sym == 63) { return 1020 }         // 10 bits ?
-    if (sym == 64) { return 32766 }        // 15 bits @
-    if (sym == 65) { return 33 }           // 6 bits  A
-    if (sym == 66) { return 34 }           // 6 bits  B
-    if (sym == 67) { return 35 }           // 6 bits  C
-    if (sym == 68) { return 36 }           // 6 bits  D
-    if (sym == 69) { return 37 }           // 6 bits  E
-    if (sym == 70) { return 38 }           // 6 bits  F
-    if (sym == 71) { return 39 }           // 6 bits  G
-    if (sym == 72) { return 40 }           // 6 bits  H
-    if (sym == 73) { return 41 }           // 6 bits  I
-    if (sym == 74) { return 42 }           // 6 bits  J
-    if (sym == 75) { return 43 }           // 6 bits  K
-    if (sym == 76) { return 44 }           // 6 bits  L
-    if (sym == 77) { return 45 }           // 6 bits  M
-    if (sym == 78) { return 46 }           // 6 bits  N
-    if (sym == 79) { return 47 }           // 6 bits  O
-    if (sym == 80) { return 48 }           // 6 bits  P
-    if (sym == 81) { return 49 }           // 6 bits  Q
-    if (sym == 82) { return 50 }           // 6 bits  R
-    if (sym == 83) { return 51 }           // 6 bits  S
-    if (sym == 84) { return 52 }           // 6 bits  T
-    if (sym == 85) { return 53 }           // 6 bits  U
-    if (sym == 86) { return 54 }           // 6 bits  V
-    if (sym == 87) { return 55 }           // 6 bits  W
-    if (sym == 88) { return 56 }           // 6 bits  X
-    if (sym == 89) { return 57 }           // 6 bits  Y
-    if (sym == 90) { return 58 }           // 6 bits  Z
-    if (sym == 91) { return 252 }          // 8 bits  [
-    if (sym == 92) { return 2044 }         // 11 bits backslash
-    if (sym == 93) { return 253 }          // 8 bits  ]
-    if (sym == 94) { return 8186 }         // 13 bits ^
-    if (sym == 95) { return 93 }           // 7 bits  _
-    if (sym == 96) { return 16380 }        // 14 bits `
-    if (sym == 97) { return 3 }            // 5 bits  a
-    if (sym == 98) { return 4 }            // 5 bits  b
-    if (sym == 99) { return 5 }            // 5 bits  c
-    if (sym == 100) { return 6 }           // 5 bits  d
-    if (sym == 101) { return 7 }           // 5 bits  e
-    if (sym == 102) { return 8 }           // 5 bits  f
-    if (sym == 103) { return 9 }           // 5 bits  g
-    if (sym == 104) { return 10 }          // 5 bits  h
-    if (sym == 105) { return 11 }          // 5 bits  i
-    if (sym == 106) { return 94 }          // 7 bits  j
-    if (sym == 107) { return 95 }          // 7 bits  k
-    if (sym == 108) { return 12 }          // 5 bits  l
-    if (sym == 109) { return 13 }          // 5 bits  m
-    if (sym == 110) { return 14 }          // 5 bits  n
-    if (sym == 111) { return 15 }          // 5 bits  o
-    if (sym == 112) { return 16 }          // 5 bits  p
-    if (sym == 113) { return 59 }          // 6 bits  q
-    if (sym == 114) { return 17 }          // 5 bits  r
-    if (sym == 115) { return 18 }          // 5 bits  s
-    if (sym == 116) { return 19 }          // 5 bits  t
-    if (sym == 117) { return 60 }          // 6 bits  u
-    if (sym == 118) { return 61 }          // 6 bits  v
-    if (sym == 119) { return 62 }          // 6 bits  w
-    if (sym == 120) { return 96 }          // 7 bits  x
-    if (sym == 121) { return 97 }          // 7 bits  y
-    if (sym == 122) { return 98 }          // 7 bits  z
-    if (sym == 123) { return 16381 }       // 14 bits {
-    if (sym == 124) { return 4085 }        // 12 bits |
-    if (sym == 125) { return 16382 }       // 14 bits }
-    if (sym == 126) { return 8187 }        // 13 bits ~
-    if (sym == 127) { return 268435452 }   // 28 bits
-    if (sym == 128) { return 268435453 }   // 28 bits
-    if (sym == 129) { return 268435454 }   // 28 bits
-    if (sym == 130) { return 268435455 }   // 28 bits
-    if (sym == 131) { return 536870896 }   // 29 bits
-    if (sym == 132) { return 536870897 }   // 29 bits
-    if (sym == 133) { return 536870898 }   // 29 bits
-    if (sym == 134) { return 536870899 }   // 29 bits
-    if (sym == 135) { return 536870900 }   // 29 bits
-    if (sym == 136) { return 536870901 }   // 29 bits
-    if (sym == 137) { return 536870902 }   // 29 bits
-    if (sym == 138) { return 536870903 }   // 29 bits
-    if (sym == 139) { return 536870904 }   // 29 bits
-    if (sym == 140) { return 536870905 }   // 29 bits
-    if (sym == 141) { return 536870906 }   // 29 bits
-    if (sym == 142) { return 536870907 }   // 29 bits
-    if (sym == 143) { return 536870908 }   // 29 bits
-    if (sym == 144) { return 536870909 }   // 29 bits
-    if (sym == 145) { return 536870910 }   // 29 bits
-    if (sym == 146) { return 536870911 }   // 29 bits
-    if (sym == 147) { return 1073741824 }  // 30 bits
-    if (sym == 148) { return 1073741825 }  // 30 bits
-    if (sym == 149) { return 1073741826 }  // 30 bits
-    if (sym == 150) { return 1073741827 }  // 30 bits
-    if (sym == 151) { return 1073741828 }  // 30 bits
-    if (sym == 152) { return 1073741829 }  // 30 bits
-    if (sym == 153) { return 1073741830 }  // 30 bits
-    if (sym == 154) { return 1073741831 }  // 30 bits
-    if (sym == 155) { return 1073741832 }  // 30 bits
-    if (sym == 156) { return 1073741833 }  // 30 bits
-    if (sym == 157) { return 1073741834 }  // 30 bits
-    if (sym == 158) { return 1073741835 }  // 30 bits
-    if (sym == 159) { return 1073741836 }  // 30 bits
-    if (sym == 160) { return 1073741837 }  // 30 bits
-    if (sym == 161) { return 1073741838 }  // 30 bits
-    if (sym == 162) { return 1073741839 }  // 30 bits
-    if (sym == 163) { return 1073741840 }  // 30 bits
-    if (sym == 164) { return 1073741841 }  // 30 bits
-    if (sym == 165) { return 1073741842 }  // 30 bits
-    if (sym == 166) { return 1073741843 }  // 30 bits
-    if (sym == 167) { return 1073741844 }  // 30 bits
-    if (sym == 168) { return 1073741845 }  // 30 bits
-    if (sym == 169) { return 1073741846 }  // 30 bits
-    if (sym == 170) { return 1073741847 }  // 30 bits
-    if (sym == 171) { return 1073741848 }  // 30 bits
-    if (sym == 172) { return 1073741849 }  // 30 bits
-    if (sym == 173) { return 1073741850 }  // 30 bits
-    if (sym == 174) { return 1073741851 }  // 30 bits
-    if (sym == 175) { return 1073741852 }  // 30 bits
-    if (sym == 176) { return 1073741853 }  // 30 bits
-    if (sym == 177) { return 1073741854 }  // 30 bits
-    if (sym == 178) { return 1073741855 }  // 30 bits
-    if (sym == 179) { return 1073741856 }  // 30 bits
-    if (sym == 180) { return 1073741857 }  // 30 bits
-    if (sym == 181) { return 1073741858 }  // 30 bits
-    if (sym == 182) { return 1073741859 }  // 30 bits
-    if (sym == 183) { return 1073741860 }  // 30 bits
-    if (sym == 184) { return 1073741861 }  // 30 bits
-    if (sym == 185) { return 1073741862 }  // 30 bits
-    if (sym == 186) { return 1073741863 }  // 30 bits
-    if (sym == 187) { return 1073741864 }  // 30 bits
-    if (sym == 188) { return 1073741865 }  // 30 bits
-    if (sym == 189) { return 1073741866 }  // 30 bits
-    if (sym == 190) { return 1073741867 }  // 30 bits
-    if (sym == 191) { return 1073741868 }  // 30 bits
-    if (sym == 192) { return 1073741869 }  // 30 bits
-    if (sym == 193) { return 1073741870 }  // 30 bits
-    if (sym == 194) { return 1073741871 }  // 30 bits
-    if (sym == 195) { return 1073741872 }  // 30 bits
-    if (sym == 196) { return 1073741873 }  // 30 bits
-    if (sym == 197) { return 1073741874 }  // 30 bits
-    if (sym == 198) { return 1073741875 }  // 30 bits
-    if (sym == 199) { return 1073741876 }  // 30 bits
-    if (sym == 200) { return 1073741877 }  // 30 bits
-    if (sym == 201) { return 1073741878 }  // 30 bits
-    if (sym == 202) { return 1073741879 }  // 30 bits
-    if (sym == 203) { return 2097123 }     // 21 bits
-    if (sym == 204) { return 16777195 }    // 24 bits
-    if (sym == 205) { return 2097124 }     // 21 bits
-    if (sym == 206) { return 2097125 }     // 21 bits
-    if (sym == 207) { return 2097126 }     // 21 bits
-    if (sym == 208) { return 2097127 }     // 21 bits
-    if (sym == 209) { return 2097128 }     // 21 bits
-    if (sym == 210) { return 2097129 }     // 21 bits
-    if (sym == 211) { return 2097130 }     // 21 bits
-    if (sym == 212) { return 2097131 }     // 21 bits
-    if (sym == 213) { return 2097132 }     // 21 bits
-    if (sym == 214) { return 2097133 }     // 21 bits
-    if (sym == 215) { return 2097134 }     // 21 bits
-    if (sym == 216) { return 2097135 }     // 21 bits
-    if (sym == 217) { return 2097136 }     // 21 bits
-    if (sym == 218) { return 2097137 }     // 21 bits
-    if (sym == 219) { return 2097138 }     // 21 bits
-    if (sym == 220) { return 2097139 }     // 21 bits
-    if (sym == 221) { return 2097140 }     // 21 bits
-    if (sym == 222) { return 2097141 }     // 21 bits
-    if (sym == 223) { return 2097142 }     // 21 bits
-    if (sym == 224) { return 2097143 }     // 21 bits
-    if (sym == 225) { return 2097144 }     // 21 bits
-    if (sym == 226) { return 2097145 }     // 21 bits
-    if (sym == 227) { return 2097146 }     // 21 bits
-    if (sym == 228) { return 2097147 }     // 21 bits
-    if (sym == 229) { return 2097148 }     // 21 bits
-    if (sym == 230) { return 2097149 }     // 21 bits
-    if (sym == 231) { return 2097150 }     // 21 bits
-    if (sym == 232) { return 2097151 }     // 21 bits
-    if (sym == 233) { return 16777196 }    // 24 bits
-    if (sym == 234) { return 16777197 }    // 24 bits
-    if (sym == 235) { return 16777198 }    // 24 bits
-    if (sym == 236) { return 16777199 }    // 24 bits
-    if (sym == 237) { return 16777200 }    // 24 bits
-    if (sym == 238) { return 16777201 }    // 24 bits
-    if (sym == 239) { return 16777202 }    // 24 bits
-    if (sym == 240) { return 16777203 }    // 24 bits
-    if (sym == 241) { return 16777204 }    // 24 bits
-    if (sym == 242) { return 16777205 }    // 24 bits
-    if (sym == 243) { return 16777206 }    // 24 bits
-    if (sym == 244) { return 16777207 }    // 24 bits
-    if (sym == 245) { return 16777208 }    // 24 bits
-    if (sym == 246) { return 16777209 }    // 24 bits
-    if (sym == 247) { return 16777210 }    // 24 bits
-    if (sym == 248) { return 16777211 }    // 24 bits
-    if (sym == 249) { return 16777212 }    // 24 bits
-    if (sym == 250) { return 16777213 }    // 24 bits
-    if (sym == 251) { return 16777214 }    // 24 bits
-    if (sym == 252) { return 16777215 }    // 24 bits
-    if (sym == 253) { return 33554400 }    // 25 bits
-    if (sym == 254) { return 33554401 }    // 25 bits
-    if (sym == 255) { return 33554402 }    // 25 bits
-    if (sym == 256) { return 1073741823 }  // 30 bits EOS
+    if (sym == 0) { return 8184 }
+    if (sym == 1) { return 8388568 }
+    if (sym == 2) { return 268435426 }
+    if (sym == 3) { return 268435427 }
+    if (sym == 4) { return 268435428 }
+    if (sym == 5) { return 268435429 }
+    if (sym == 6) { return 268435430 }
+    if (sym == 7) { return 268435431 }
+    if (sym == 8) { return 268435432 }
+    if (sym == 9) { return 16777194 }
+    if (sym == 10) { return 1073741820 }
+    if (sym == 11) { return 268435433 }
+    if (sym == 12) { return 268435434 }
+    if (sym == 13) { return 1073741821 }
+    if (sym == 14) { return 268435435 }
+    if (sym == 15) { return 268435436 }
+    if (sym == 16) { return 268435437 }
+    if (sym == 17) { return 268435438 }
+    if (sym == 18) { return 268435439 }
+    if (sym == 19) { return 268435440 }
+    if (sym == 20) { return 268435441 }
+    if (sym == 21) { return 268435442 }
+    if (sym == 22) { return 1073741822 }
+    if (sym == 23) { return 268435443 }
+    if (sym == 24) { return 268435444 }
+    if (sym == 25) { return 268435445 }
+    if (sym == 26) { return 268435446 }
+    if (sym == 27) { return 268435447 }
+    if (sym == 28) { return 268435448 }
+    if (sym == 29) { return 268435449 }
+    if (sym == 30) { return 268435450 }
+    if (sym == 31) { return 268435451 }
+    if (sym == 32) { return 20 }
+    if (sym == 33) { return 1016 }
+    if (sym == 34) { return 1017 }
+    if (sym == 35) { return 4090 }
+    if (sym == 36) { return 8185 }
+    if (sym == 37) { return 21 }
+    if (sym == 38) { return 248 }
+    if (sym == 39) { return 2042 }
+    if (sym == 40) { return 1018 }
+    if (sym == 41) { return 1019 }
+    if (sym == 42) { return 249 }
+    if (sym == 43) { return 2043 }
+    if (sym == 44) { return 250 }
+    if (sym == 45) { return 22 }
+    if (sym == 46) { return 23 }
+    if (sym == 47) { return 24 }
+    if (sym == 48) { return 0 }
+    if (sym == 49) { return 1 }
+    if (sym == 50) { return 2 }
+    if (sym == 51) { return 25 }
+    if (sym == 52) { return 26 }
+    if (sym == 53) { return 27 }
+    if (sym == 54) { return 28 }
+    if (sym == 55) { return 29 }
+    if (sym == 56) { return 30 }
+    if (sym == 57) { return 31 }
+    if (sym == 58) { return 92 }
+    if (sym == 59) { return 251 }
+    if (sym == 60) { return 32764 }
+    if (sym == 61) { return 32 }
+    if (sym == 62) { return 4091 }
+    if (sym == 63) { return 1020 }
+    if (sym == 64) { return 8186 }
+    if (sym == 65) { return 33 }
+    if (sym == 66) { return 93 }
+    if (sym == 67) { return 94 }
+    if (sym == 68) { return 95 }
+    if (sym == 69) { return 96 }
+    if (sym == 70) { return 97 }
+    if (sym == 71) { return 98 }
+    if (sym == 72) { return 99 }
+    if (sym == 73) { return 100 }
+    if (sym == 74) { return 101 }
+    if (sym == 75) { return 102 }
+    if (sym == 76) { return 103 }
+    if (sym == 77) { return 104 }
+    if (sym == 78) { return 105 }
+    if (sym == 79) { return 106 }
+    if (sym == 80) { return 107 }
+    if (sym == 81) { return 108 }
+    if (sym == 82) { return 109 }
+    if (sym == 83) { return 110 }
+    if (sym == 84) { return 111 }
+    if (sym == 85) { return 112 }
+    if (sym == 86) { return 113 }
+    if (sym == 87) { return 114 }
+    if (sym == 88) { return 252 }
+    if (sym == 89) { return 115 }
+    if (sym == 90) { return 253 }
+    if (sym == 91) { return 8187 }
+    if (sym == 92) { return 524272 }
+    if (sym == 93) { return 8188 }
+    if (sym == 94) { return 16380 }
+    if (sym == 95) { return 34 }
+    if (sym == 96) { return 32765 }
+    if (sym == 97) { return 3 }
+    if (sym == 98) { return 35 }
+    if (sym == 99) { return 4 }
+    if (sym == 100) { return 36 }
+    if (sym == 101) { return 5 }
+    if (sym == 102) { return 37 }
+    if (sym == 103) { return 38 }
+    if (sym == 104) { return 39 }
+    if (sym == 105) { return 6 }
+    if (sym == 106) { return 116 }
+    if (sym == 107) { return 117 }
+    if (sym == 108) { return 40 }
+    if (sym == 109) { return 41 }
+    if (sym == 110) { return 42 }
+    if (sym == 111) { return 7 }
+    if (sym == 112) { return 43 }
+    if (sym == 113) { return 118 }
+    if (sym == 114) { return 44 }
+    if (sym == 115) { return 8 }
+    if (sym == 116) { return 9 }
+    if (sym == 117) { return 45 }
+    if (sym == 118) { return 119 }
+    if (sym == 119) { return 120 }
+    if (sym == 120) { return 121 }
+    if (sym == 121) { return 122 }
+    if (sym == 122) { return 123 }
+    if (sym == 123) { return 32766 }
+    if (sym == 124) { return 2044 }
+    if (sym == 125) { return 16381 }
+    if (sym == 126) { return 8189 }
+    if (sym == 127) { return 268435452 }
+    if (sym == 128) { return 1048550 }
+    if (sym == 129) { return 4194258 }
+    if (sym == 130) { return 1048551 }
+    if (sym == 131) { return 1048552 }
+    if (sym == 132) { return 4194259 }
+    if (sym == 133) { return 4194260 }
+    if (sym == 134) { return 4194261 }
+    if (sym == 135) { return 8388569 }
+    if (sym == 136) { return 4194262 }
+    if (sym == 137) { return 8388570 }
+    if (sym == 138) { return 8388571 }
+    if (sym == 139) { return 8388572 }
+    if (sym == 140) { return 8388573 }
+    if (sym == 141) { return 8388574 }
+    if (sym == 142) { return 16777195 }
+    if (sym == 143) { return 8388575 }
+    if (sym == 144) { return 16777196 }
+    if (sym == 145) { return 16777197 }
+    if (sym == 146) { return 4194263 }
+    if (sym == 147) { return 8388576 }
+    if (sym == 148) { return 16777198 }
+    if (sym == 149) { return 8388577 }
+    if (sym == 150) { return 8388578 }
+    if (sym == 151) { return 8388579 }
+    if (sym == 152) { return 8388580 }
+    if (sym == 153) { return 2097116 }
+    if (sym == 154) { return 4194264 }
+    if (sym == 155) { return 8388581 }
+    if (sym == 156) { return 4194265 }
+    if (sym == 157) { return 8388582 }
+    if (sym == 158) { return 8388583 }
+    if (sym == 159) { return 16777199 }
+    if (sym == 160) { return 4194266 }
+    if (sym == 161) { return 2097117 }
+    if (sym == 162) { return 1048553 }
+    if (sym == 163) { return 4194267 }
+    if (sym == 164) { return 4194268 }
+    if (sym == 165) { return 8388584 }
+    if (sym == 166) { return 8388585 }
+    if (sym == 167) { return 2097118 }
+    if (sym == 168) { return 8388586 }
+    if (sym == 169) { return 4194269 }
+    if (sym == 170) { return 4194270 }
+    if (sym == 171) { return 16777200 }
+    if (sym == 172) { return 2097119 }
+    if (sym == 173) { return 4194271 }
+    if (sym == 174) { return 8388587 }
+    if (sym == 175) { return 8388588 }
+    if (sym == 176) { return 2097120 }
+    if (sym == 177) { return 2097121 }
+    if (sym == 178) { return 4194272 }
+    if (sym == 179) { return 2097122 }
+    if (sym == 180) { return 8388589 }
+    if (sym == 181) { return 4194273 }
+    if (sym == 182) { return 8388590 }
+    if (sym == 183) { return 8388591 }
+    if (sym == 184) { return 1048554 }
+    if (sym == 185) { return 4194274 }
+    if (sym == 186) { return 4194275 }
+    if (sym == 187) { return 4194276 }
+    if (sym == 188) { return 8388592 }
+    if (sym == 189) { return 4194277 }
+    if (sym == 190) { return 4194278 }
+    if (sym == 191) { return 8388593 }
+    if (sym == 192) { return 67108832 }
+    if (sym == 193) { return 67108833 }
+    if (sym == 194) { return 1048555 }
+    if (sym == 195) { return 524273 }
+    if (sym == 196) { return 4194279 }
+    if (sym == 197) { return 8388594 }
+    if (sym == 198) { return 4194280 }
+    if (sym == 199) { return 33554412 }
+    if (sym == 200) { return 67108834 }
+    if (sym == 201) { return 67108835 }
+    if (sym == 202) { return 67108836 }
+    if (sym == 203) { return 134217694 }
+    if (sym == 204) { return 134217695 }
+    if (sym == 205) { return 67108837 }
+    if (sym == 206) { return 16777201 }
+    if (sym == 207) { return 33554413 }
+    if (sym == 208) { return 524274 }
+    if (sym == 209) { return 2097123 }
+    if (sym == 210) { return 67108838 }
+    if (sym == 211) { return 134217696 }
+    if (sym == 212) { return 134217697 }
+    if (sym == 213) { return 67108839 }
+    if (sym == 214) { return 134217698 }
+    if (sym == 215) { return 16777202 }
+    if (sym == 216) { return 2097124 }
+    if (sym == 217) { return 2097125 }
+    if (sym == 218) { return 67108840 }
+    if (sym == 219) { return 67108841 }
+    if (sym == 220) { return 268435453 }
+    if (sym == 221) { return 134217699 }
+    if (sym == 222) { return 134217700 }
+    if (sym == 223) { return 134217701 }
+    if (sym == 224) { return 1048556 }
+    if (sym == 225) { return 16777203 }
+    if (sym == 226) { return 1048557 }
+    if (sym == 227) { return 2097126 }
+    if (sym == 228) { return 4194281 }
+    if (sym == 229) { return 2097127 }
+    if (sym == 230) { return 2097128 }
+    if (sym == 231) { return 8388595 }
+    if (sym == 232) { return 4194282 }
+    if (sym == 233) { return 4194283 }
+    if (sym == 234) { return 33554414 }
+    if (sym == 235) { return 33554415 }
+    if (sym == 236) { return 16777204 }
+    if (sym == 237) { return 16777205 }
+    if (sym == 238) { return 67108842 }
+    if (sym == 239) { return 8388596 }
+    if (sym == 240) { return 67108843 }
+    if (sym == 241) { return 134217702 }
+    if (sym == 242) { return 67108844 }
+    if (sym == 243) { return 67108845 }
+    if (sym == 244) { return 134217703 }
+    if (sym == 245) { return 134217704 }
+    if (sym == 246) { return 134217705 }
+    if (sym == 247) { return 134217706 }
+    if (sym == 248) { return 134217707 }
+    if (sym == 249) { return 268435454 }
+    if (sym == 250) { return 134217708 }
+    if (sym == 251) { return 134217709 }
+    if (sym == 252) { return 134217710 }
+    if (sym == 253) { return 134217711 }
+    if (sym == 254) { return 134217712 }
+    if (sym == 255) { return 67108846 }
+    if (sym == 256) { return 1073741823 }
     return 0
 }
 
 // Get the Huffman code length in bits for a symbol (0-256)
+// Values from RFC 7541 Appendix B.
 fun hpackHuffmanLen(sym: Int): Int {
-    if (sym <= 1) {
-        if (sym == 0) { return 13 }
-        return 23
-    }
-    if (sym >= 2) { if (sym <= 9) {
-        if (sym <= 8) { return 28 }
-        return 24
-    } }
+    if (sym == 0) { return 13 }
+    if (sym == 1) { return 23 }
+    if (sym == 2) { return 28 }
+    if (sym == 3) { return 28 }
+    if (sym == 4) { return 28 }
+    if (sym == 5) { return 28 }
+    if (sym == 6) { return 28 }
+    if (sym == 7) { return 28 }
+    if (sym == 8) { return 28 }
+    if (sym == 9) { return 24 }
     if (sym == 10) { return 30 }
-    if (sym >= 11) { if (sym <= 12) { return 28 } }
+    if (sym == 11) { return 28 }
+    if (sym == 12) { return 28 }
     if (sym == 13) { return 30 }
-    if (sym >= 14) { if (sym <= 31) { return 28 } }
+    if (sym == 14) { return 28 }
+    if (sym == 15) { return 28 }
+    if (sym == 16) { return 28 }
+    if (sym == 17) { return 28 }
+    if (sym == 18) { return 28 }
+    if (sym == 19) { return 28 }
+    if (sym == 20) { return 28 }
+    if (sym == 21) { return 28 }
     if (sym == 22) { return 30 }
+    if (sym == 23) { return 28 }
+    if (sym == 24) { return 28 }
+    if (sym == 25) { return 28 }
+    if (sym == 26) { return 28 }
+    if (sym == 27) { return 28 }
+    if (sym == 28) { return 28 }
+    if (sym == 29) { return 28 }
+    if (sym == 30) { return 28 }
+    if (sym == 31) { return 28 }
     if (sym == 32) { return 6 }
     if (sym == 33) { return 10 }
     if (sym == 34) { return 10 }
@@ -549,45 +603,217 @@ fun hpackHuffmanLen(sym: Int): Int {
     if (sym == 42) { return 8 }
     if (sym == 43) { return 11 }
     if (sym == 44) { return 8 }
-    if (sym >= 45) { if (sym <= 47) { return 6 } }
-    if (sym >= 48) { if (sym <= 50) { return 5 } }
-    if (sym >= 51) { if (sym <= 57) { return 6 } }
+    if (sym == 45) { return 6 }
+    if (sym == 46) { return 6 }
+    if (sym == 47) { return 6 }
+    if (sym == 48) { return 5 }
+    if (sym == 49) { return 5 }
+    if (sym == 50) { return 5 }
+    if (sym == 51) { return 6 }
+    if (sym == 52) { return 6 }
+    if (sym == 53) { return 6 }
+    if (sym == 54) { return 6 }
+    if (sym == 55) { return 6 }
+    if (sym == 56) { return 6 }
+    if (sym == 57) { return 6 }
     if (sym == 58) { return 7 }
     if (sym == 59) { return 8 }
     if (sym == 60) { return 15 }
     if (sym == 61) { return 6 }
-    if (sym == 62) { return 15 }
+    if (sym == 62) { return 12 }
     if (sym == 63) { return 10 }
-    if (sym == 64) { return 15 }
-    if (sym >= 65) { if (sym <= 90) { return 6 } }
-    if (sym == 91) { return 8 }
-    if (sym == 92) { return 11 }
-    if (sym == 93) { return 8 }
-    if (sym == 94) { return 13 }
-    if (sym == 95) { return 7 }
-    if (sym == 96) { return 14 }
-    if (sym >= 97) { if (sym <= 99) { return 5 } }
-    if (sym >= 100) { if (sym <= 102) { return 5 } }
-    if (sym >= 103) { if (sym <= 105) { return 5 } }
+    if (sym == 64) { return 13 }
+    if (sym == 65) { return 6 }
+    if (sym == 66) { return 7 }
+    if (sym == 67) { return 7 }
+    if (sym == 68) { return 7 }
+    if (sym == 69) { return 7 }
+    if (sym == 70) { return 7 }
+    if (sym == 71) { return 7 }
+    if (sym == 72) { return 7 }
+    if (sym == 73) { return 7 }
+    if (sym == 74) { return 7 }
+    if (sym == 75) { return 7 }
+    if (sym == 76) { return 7 }
+    if (sym == 77) { return 7 }
+    if (sym == 78) { return 7 }
+    if (sym == 79) { return 7 }
+    if (sym == 80) { return 7 }
+    if (sym == 81) { return 7 }
+    if (sym == 82) { return 7 }
+    if (sym == 83) { return 7 }
+    if (sym == 84) { return 7 }
+    if (sym == 85) { return 7 }
+    if (sym == 86) { return 7 }
+    if (sym == 87) { return 7 }
+    if (sym == 88) { return 8 }
+    if (sym == 89) { return 7 }
+    if (sym == 90) { return 8 }
+    if (sym == 91) { return 13 }
+    if (sym == 92) { return 19 }
+    if (sym == 93) { return 13 }
+    if (sym == 94) { return 14 }
+    if (sym == 95) { return 6 }
+    if (sym == 96) { return 15 }
+    if (sym == 97) { return 5 }
+    if (sym == 98) { return 6 }
+    if (sym == 99) { return 5 }
+    if (sym == 100) { return 6 }
+    if (sym == 101) { return 5 }
+    if (sym == 102) { return 6 }
+    if (sym == 103) { return 6 }
+    if (sym == 104) { return 6 }
+    if (sym == 105) { return 5 }
     if (sym == 106) { return 7 }
     if (sym == 107) { return 7 }
-    if (sym >= 108) { if (sym <= 112) { return 5 } }
-    if (sym == 113) { return 6 }
-    if (sym >= 114) { if (sym <= 116) { return 5 } }
-    if (sym >= 117) { if (sym <= 119) { return 6 } }
-    if (sym >= 120) { if (sym <= 122) { return 7 } }
-    if (sym == 123) { return 14 }
-    if (sym == 124) { return 12 }
+    if (sym == 108) { return 6 }
+    if (sym == 109) { return 6 }
+    if (sym == 110) { return 6 }
+    if (sym == 111) { return 5 }
+    if (sym == 112) { return 6 }
+    if (sym == 113) { return 7 }
+    if (sym == 114) { return 6 }
+    if (sym == 115) { return 5 }
+    if (sym == 116) { return 5 }
+    if (sym == 117) { return 6 }
+    if (sym == 118) { return 7 }
+    if (sym == 119) { return 7 }
+    if (sym == 120) { return 7 }
+    if (sym == 121) { return 7 }
+    if (sym == 122) { return 7 }
+    if (sym == 123) { return 15 }
+    if (sym == 124) { return 11 }
     if (sym == 125) { return 14 }
     if (sym == 126) { return 13 }
-    if (sym >= 127) { if (sym <= 130) { return 28 } }
-    if (sym >= 131) { if (sym <= 146) { return 29 } }
-    if (sym >= 147) { if (sym <= 202) { return 30 } }
-    if (sym == 203) { return 21 }
-    if (sym == 204) { return 24 }
-    if (sym >= 205) { if (sym <= 232) { return 21 } }
-    if (sym >= 233) { if (sym <= 252) { return 24 } }
-    if (sym >= 253) { if (sym <= 255) { return 25 } }
+    if (sym == 127) { return 28 }
+    if (sym == 128) { return 20 }
+    if (sym == 129) { return 22 }
+    if (sym == 130) { return 20 }
+    if (sym == 131) { return 20 }
+    if (sym == 132) { return 22 }
+    if (sym == 133) { return 22 }
+    if (sym == 134) { return 22 }
+    if (sym == 135) { return 23 }
+    if (sym == 136) { return 22 }
+    if (sym == 137) { return 23 }
+    if (sym == 138) { return 23 }
+    if (sym == 139) { return 23 }
+    if (sym == 140) { return 23 }
+    if (sym == 141) { return 23 }
+    if (sym == 142) { return 24 }
+    if (sym == 143) { return 23 }
+    if (sym == 144) { return 24 }
+    if (sym == 145) { return 24 }
+    if (sym == 146) { return 22 }
+    if (sym == 147) { return 23 }
+    if (sym == 148) { return 24 }
+    if (sym == 149) { return 23 }
+    if (sym == 150) { return 23 }
+    if (sym == 151) { return 23 }
+    if (sym == 152) { return 23 }
+    if (sym == 153) { return 21 }
+    if (sym == 154) { return 22 }
+    if (sym == 155) { return 23 }
+    if (sym == 156) { return 22 }
+    if (sym == 157) { return 23 }
+    if (sym == 158) { return 23 }
+    if (sym == 159) { return 24 }
+    if (sym == 160) { return 22 }
+    if (sym == 161) { return 21 }
+    if (sym == 162) { return 20 }
+    if (sym == 163) { return 22 }
+    if (sym == 164) { return 22 }
+    if (sym == 165) { return 23 }
+    if (sym == 166) { return 23 }
+    if (sym == 167) { return 21 }
+    if (sym == 168) { return 23 }
+    if (sym == 169) { return 22 }
+    if (sym == 170) { return 22 }
+    if (sym == 171) { return 24 }
+    if (sym == 172) { return 21 }
+    if (sym == 173) { return 22 }
+    if (sym == 174) { return 23 }
+    if (sym == 175) { return 23 }
+    if (sym == 176) { return 21 }
+    if (sym == 177) { return 21 }
+    if (sym == 178) { return 22 }
+    if (sym == 179) { return 21 }
+    if (sym == 180) { return 23 }
+    if (sym == 181) { return 22 }
+    if (sym == 182) { return 23 }
+    if (sym == 183) { return 23 }
+    if (sym == 184) { return 20 }
+    if (sym == 185) { return 22 }
+    if (sym == 186) { return 22 }
+    if (sym == 187) { return 22 }
+    if (sym == 188) { return 23 }
+    if (sym == 189) { return 22 }
+    if (sym == 190) { return 22 }
+    if (sym == 191) { return 23 }
+    if (sym == 192) { return 26 }
+    if (sym == 193) { return 26 }
+    if (sym == 194) { return 20 }
+    if (sym == 195) { return 19 }
+    if (sym == 196) { return 22 }
+    if (sym == 197) { return 23 }
+    if (sym == 198) { return 22 }
+    if (sym == 199) { return 25 }
+    if (sym == 200) { return 26 }
+    if (sym == 201) { return 26 }
+    if (sym == 202) { return 26 }
+    if (sym == 203) { return 27 }
+    if (sym == 204) { return 27 }
+    if (sym == 205) { return 26 }
+    if (sym == 206) { return 24 }
+    if (sym == 207) { return 25 }
+    if (sym == 208) { return 19 }
+    if (sym == 209) { return 21 }
+    if (sym == 210) { return 26 }
+    if (sym == 211) { return 27 }
+    if (sym == 212) { return 27 }
+    if (sym == 213) { return 26 }
+    if (sym == 214) { return 27 }
+    if (sym == 215) { return 24 }
+    if (sym == 216) { return 21 }
+    if (sym == 217) { return 21 }
+    if (sym == 218) { return 26 }
+    if (sym == 219) { return 26 }
+    if (sym == 220) { return 28 }
+    if (sym == 221) { return 27 }
+    if (sym == 222) { return 27 }
+    if (sym == 223) { return 27 }
+    if (sym == 224) { return 20 }
+    if (sym == 225) { return 24 }
+    if (sym == 226) { return 20 }
+    if (sym == 227) { return 21 }
+    if (sym == 228) { return 22 }
+    if (sym == 229) { return 21 }
+    if (sym == 230) { return 21 }
+    if (sym == 231) { return 23 }
+    if (sym == 232) { return 22 }
+    if (sym == 233) { return 22 }
+    if (sym == 234) { return 25 }
+    if (sym == 235) { return 25 }
+    if (sym == 236) { return 24 }
+    if (sym == 237) { return 24 }
+    if (sym == 238) { return 26 }
+    if (sym == 239) { return 23 }
+    if (sym == 240) { return 26 }
+    if (sym == 241) { return 27 }
+    if (sym == 242) { return 26 }
+    if (sym == 243) { return 26 }
+    if (sym == 244) { return 27 }
+    if (sym == 245) { return 27 }
+    if (sym == 246) { return 27 }
+    if (sym == 247) { return 27 }
+    if (sym == 248) { return 27 }
+    if (sym == 249) { return 28 }
+    if (sym == 250) { return 27 }
+    if (sym == 251) { return 27 }
+    if (sym == 252) { return 27 }
+    if (sym == 253) { return 27 }
+    if (sym == 254) { return 27 }
+    if (sym == 255) { return 26 }
     if (sym == 256) { return 30 }
     return 0
 }
@@ -598,42 +824,133 @@ fun hpackHuffmanDecode(buf: String, pos: Int, byteLen: Int): String {
     var result: String = ""
     var bitBuffer: Int = 0
     var bitsAvail: Int = 0
+    var decodeError: Bool = false
     var i: Int = 0
     while (i < byteLen) {
         val b = charCodeAt(buf, pos + i)
         bitBuffer = bitBuffer * 256 + b
         bitsAvail = bitsAvail + 8
         // Try to decode symbols while we have enough bits
-        // We must limit buffer to avoid overflow; process greedily
-        while (bitsAvail >= 5) {
-            var matched: Bool = false
-            // Try each symbol from 0-255 (not EOS=256)
-            var sym: Int = 0
-            while (sym <= 255) {
-                if (matched == false) {
-                    val codeLen = hpackHuffmanLen(sym)
-                    if (bitsAvail >= codeLen) {
-                        val code = hpackHuffmanCode(sym)
-                        // Extract top codeLen bits from bitBuffer
-                        val shift = bitsAvail - codeLen
-                        val extracted = bitBuffer / hpackPow2(shift)
-                        if (extracted == code) {
-                            result = stringConcat(result, intToChar(sym))
-                            // Remove matched bits
-                            bitBuffer = bitBuffer - extracted * hpackPow2(shift)
-                            bitsAvail = bitsAvail - codeLen
-                            matched = true
-                        }
+        var keepDecoding: Bool = true
+        while (keepDecoding) {
+            if (bitsAvail < 5) {
+                keepDecoding = false
+            } else {
+                var matched: Bool = false
+                // Gap H2: Check for EOS symbol (256) before checking 0-255
+                // EOS symbol has code length 30, so only check if we have enough bits
+                if (bitsAvail >= 30) {
+                    val eosCode = hpackHuffmanCode(256)
+                    val eosShift = bitsAvail - 30
+                    val eosExtracted = bitBuffer / hpackPow2(eosShift)
+                    if (eosExtracted == eosCode) {
+                        // RFC 7541 Section 5.2: EOS symbol MUST NOT be decoded
+                        decodeError = true
+                        keepDecoding = false
+                        matched = true
                     }
                 }
-                sym = sym + 1
-            }
-            if (matched == false) {
-                // Remaining bits might be EOS padding
-                bitsAvail = 0
+                // Try each symbol from 0-255
+                var sym: Int = 0
+                while (sym <= 255) {
+                    if (matched == false) {
+                        val codeLen = hpackHuffmanLen(sym)
+                        if (bitsAvail >= codeLen) {
+                            val code = hpackHuffmanCode(sym)
+                            // Extract top codeLen bits from bitBuffer
+                            val shift = bitsAvail - codeLen
+                            val extracted = bitBuffer / hpackPow2(shift)
+                            if (extracted == code) {
+                                result = stringConcat(result, hpackByteToChar(sym))
+                                // Remove matched bits
+                                bitBuffer = bitBuffer - extracted * hpackPow2(shift)
+                                bitsAvail = bitsAvail - codeLen
+                                matched = true
+                            }
+                        }
+                    }
+                    sym = sym + 1
+                }
+                if (matched == false) {
+                    // Not enough bits to match — need more data from next byte
+                    keepDecoding = false
+                }
             }
         }
         i = i + 1
+    }
+    // Gap H1: Validate Huffman padding (RFC 7541 Section 5.2)
+    // After decoding, remaining bits must be fewer than 8 and all 1s (EOS prefix)
+    if (bitsAvail > 0) {
+        if (bitsAvail > 7) {
+            // Padding exceeds 7 bits — MUST be treated as decoding error
+            decodeError = true
+        } else {
+            // Check that remaining bits are all 1s
+            val padMask = hpackPow2(bitsAvail) - 1
+            if (bitBuffer != padMask) {
+                // Padding is not EOS prefix (not all 1s) — MUST be decoding error
+                decodeError = true
+            }
+        }
+    }
+    if (decodeError) {
+        return "hpack-huffman-error"
+    }
+    return result
+}
+
+// == Huffman Encoding (RFC 7541 Appendix B) ===================================
+
+// Compute the Huffman encoded length in bytes for a string.
+// Sums the bit lengths for each character and rounds up to full bytes.
+fun hpackHuffmanEncodedLength(s: String): Int {
+    var totalBits: Int = 0
+    var i: Int = 0
+    val sLen = stringLength(s)
+    while (i < sLen) {
+        val ch = charCodeAt(s, i)
+        totalBits = totalBits + hpackHuffmanLen(ch)
+        i = i + 1
+    }
+    // Round up to bytes: (totalBits + 7) / 8
+    return (totalBits + 7) / 8
+}
+
+// Huffman encode a string per RFC 7541 Appendix B.
+// Bit-packs symbols using hpackHuffmanCode()/hpackHuffmanLen(), then pads
+// remaining bits with EOS prefix (all 1s).
+fun hpackHuffmanEncode(s: String): String {
+    var result: String = ""
+    var bitBuffer: Int = 0
+    var bitsInBuffer: Int = 0
+    var i: Int = 0
+    val sLen = stringLength(s)
+    while (i < sLen) {
+        val ch = charCodeAt(s, i)
+        val code = hpackHuffmanCode(ch)
+        val codeLen = hpackHuffmanLen(ch)
+        // Shift bitBuffer left by codeLen bits and add the code
+        // Since no bitwise OR, we use addition (bits don't overlap)
+        bitBuffer = bitBuffer * hpackPow2(codeLen) + code
+        bitsInBuffer = bitsInBuffer + codeLen
+        // Extract complete bytes from the buffer
+        while (bitsInBuffer >= 8) {
+            bitsInBuffer = bitsInBuffer - 8
+            val byteVal = bitBuffer / hpackPow2(bitsInBuffer)
+            result = stringConcat(result, hpackByteToChar(byteVal))
+            // Remove the extracted byte from the buffer
+            bitBuffer = bitBuffer - byteVal * hpackPow2(bitsInBuffer)
+        }
+        i = i + 1
+    }
+    // Pad remaining bits with 1s (EOS prefix pattern)
+    if (bitsInBuffer > 0) {
+        val padBits = 8 - bitsInBuffer
+        // Shift left by padBits and fill with 1s
+        val padMask = hpackPow2(padBits) - 1
+        val lastByte = bitBuffer * hpackPow2(padBits) + padMask
+        result = stringConcat(result, hpackByteToChar(lastByte))
     }
     return result
 }
@@ -646,7 +963,16 @@ fun hpackCreateContext(): Map {
     mapPut(ctx, "dynamicEntries", listCreate())
     mapPut(ctx, "dynamicSize", 0)
     mapPut(ctx, "maxSize", 4096)
+    mapPut(ctx, "protocolMaxSize", 4096)
+    mapPut(ctx, "maxHeaderFieldSize", 8192)
+    mapPut(ctx, "maxTotalDecodedSize", 65536)
     return ctx
+}
+
+// Set the protocol-level maximum dynamic table size (e.g., SETTINGS_HEADER_TABLE_SIZE)
+// hpackDynamicResize will reject sizes exceeding this limit.
+fun hpackSetProtocolMaxSize(ctx: Map, maxSize: Int): Unit {
+    mapPut(ctx, "protocolMaxSize", maxSize)
 }
 
 // Add an entry to the dynamic table (newest at index 0)
@@ -658,7 +984,7 @@ fun hpackDynamicAdd(ctx: Map, name: String, value: String): Unit {
     if (entrySize > maxSize) {
         val entries = mapGet(ctx, "dynamicEntries")
         while (listSize(entries) > 0) {
-            listRemove(entries, listSize(entries) - 1)
+            listRemoveAt(entries, listSize(entries) - 1)
         }
         mapPut(ctx, "dynamicSize", 0)
         return
@@ -669,8 +995,16 @@ fun hpackDynamicAdd(ctx: Map, name: String, value: String): Unit {
     val entry = mapCreate()
     mapPut(entry, "name", name)
     mapPut(entry, "value", value)
-    val entries = mapGet(ctx, "dynamicEntries")
-    listInsert(entries, 0, entry)
+    val oldEntries = mapGet(ctx, "dynamicEntries")
+    val newEntries = listCreate()
+    listAppend(newEntries, entry)
+    var _hi: Int = 0
+    while (_hi < listSize(oldEntries)) {
+        listAppend(newEntries, listGet(oldEntries, _hi))
+        _hi = _hi + 1
+    }
+    mapPut(ctx, "dynamicEntries", newEntries)
+    val entries = newEntries
     val currentSize = toInt(mapGet(ctx, "dynamicSize"))
     mapPut(ctx, "dynamicSize", currentSize + entrySize)
 }
@@ -689,7 +1023,7 @@ fun hpackDynamicEvict(ctx: Map, targetSize: Int): Unit {
             val value = toString(mapGet(last, "value"))
             val entrySize = stringLength(name) + stringLength(value) + 32
             currentSize = currentSize - entrySize
-            listRemove(entries, lastIdx)
+            listRemoveAt(entries, lastIdx)
         }
     }
     if (currentSize < 0) { currentSize = 0 }
@@ -698,6 +1032,10 @@ fun hpackDynamicEvict(ctx: Map, targetSize: Int): Unit {
 
 // Resize the dynamic table maximum size, evicting as needed
 fun hpackDynamicResize(ctx: Map, newMaxSize: Int): Unit {
+    val protocolMax = toInt(mapGet(ctx, "protocolMaxSize"))
+    if (newMaxSize > protocolMax) {
+        return
+    }
     mapPut(ctx, "maxSize", newMaxSize)
     hpackDynamicEvict(ctx, newMaxSize)
 }
@@ -756,6 +1094,16 @@ fun hpackDynamicTableLength(ctx: Map): Int {
     return listSize(entries)
 }
 
+// Set the maximum allowed size of a single header field (name + value + 32)
+fun hpackSetMaxHeaderFieldSize(ctx: Map, maxSize: Int): Unit {
+    mapPut(ctx, "maxHeaderFieldSize", maxSize)
+}
+
+// Set the maximum allowed total decoded size for a header block
+fun hpackSetMaxTotalDecodedSize(ctx: Map, maxSize: Int): Unit {
+    mapPut(ctx, "maxTotalDecodedSize", maxSize)
+}
+
 // == Sensitive Header Detection ================================================
 
 // Return true if a header name is sensitive and should never be indexed
@@ -777,10 +1125,13 @@ fun hpackEncodeDynamicSizeUpdate(newMaxSize: Int): String {
 
 // Encode a list of header name-value pairs into an HPACK header block
 // headers: list of maps, each with "name" and "value" keys
-// Strategy:
-//   Sensitive headers → literal-never-indexed (0x10 prefix)
-//   Non-sensitive with static name match → literal-with-incremental-indexing (0x40 prefix)
-//   Non-sensitive without static match → literal-without-indexing (0x00 prefix)
+// Strategy (in priority order):
+//   1. Exact static table match → indexed representation (0x80 prefix, Section 6.1)
+//   2. Exact dynamic table match → indexed representation (0x80 prefix, Section 6.1)
+//   3. Sensitive headers → literal-never-indexed (0x10 prefix, Section 6.2.3)
+//   4. Dynamic table name-only match → literal-with-incremental-indexing (0x40 prefix)
+//   5. Static table name-only match → literal-with-incremental-indexing (0x40 prefix)
+//   6. No match → literal-with-incremental-indexing, new name (0x40 prefix)
 fun hpackEncode(ctx: Map, headers: List): String {
     var result: String = ""
     var i: Int = 0
@@ -788,35 +1139,100 @@ fun hpackEncode(ctx: Map, headers: List): String {
         val header = listGet(headers, i)
         val name = toString(mapGet(header, "name"))
         val value = toString(mapGet(header, "value"))
-        if (hpackIsSensitive(name)) {
-            // Literal never indexed (Section 6.2.3)
-            val nameIdx = hpackStaticLookupName(name)
-            if (nameIdx > 0) {
-                result = stringConcat(result, hpackEncodeInt(nameIdx, 4, 16))
-                result = stringConcat(result, hpackEncodeString(value))
-            } else {
-                result = stringConcat(result, intToChar(16))
-                result = stringConcat(result, hpackEncodeString(name))
-                result = stringConcat(result, hpackEncodeString(value))
+        var encoded: Bool = false
+
+        // 1. Check for exact static table match (Section 6.1 — Indexed Representation)
+        val exactIdx = hpackStaticLookup(name, value)
+        if (exactIdx > 0) {
+            // Indexed header field: 1xxxxxxx, 7-bit prefix
+            result = stringConcat(result, hpackEncodeInt(exactIdx, 7, 128))
+            encoded = true
+        }
+
+        // 2. Check for exact dynamic table match (Section 6.1 — Indexed Representation)
+        if (encoded == false) {
+            val dynEntries = mapGet(ctx, "dynamicEntries")
+            var dynExactIdx: Int = 0
+            var di: Int = 0
+            while (di < listSize(dynEntries)) {
+                val dynEntry = listGet(dynEntries, di)
+                if (toString(mapGet(dynEntry, "name")) == name) {
+                    if (toString(mapGet(dynEntry, "value")) == value) {
+                        if (dynExactIdx == 0) {
+                            dynExactIdx = 62 + di
+                        }
+                    }
+                }
+                di = di + 1
             }
-        } else {
+            if (dynExactIdx > 0) {
+                result = stringConcat(result, hpackEncodeInt(dynExactIdx, 7, 128))
+                encoded = true
+            }
+        }
+
+        // 3. Sensitive headers use never-indexed encoding (Section 6.2.3)
+        if (encoded == false) {
+            if (hpackIsSensitive(name)) {
+                val nameIdx = hpackStaticLookupName(name)
+                if (nameIdx > 0) {
+                    result = stringConcat(result, hpackEncodeInt(nameIdx, 4, 16))
+                    result = stringConcat(result, hpackEncodeString(value))
+                } else {
+                    result = stringConcat(result, hpackByteToChar(16))
+                    result = stringConcat(result, hpackEncodeString(name))
+                    result = stringConcat(result, hpackEncodeString(value))
+                }
+                encoded = true
+            }
+        }
+
+        // 4. Check dynamic table for name-only match (literal with incremental indexing)
+        if (encoded == false) {
+            val dynEntries2 = mapGet(ctx, "dynamicEntries")
+            var dynNameIdx: Int = 0
+            var dni: Int = 0
+            while (dni < listSize(dynEntries2)) {
+                val dynEntry = listGet(dynEntries2, dni)
+                if (toString(mapGet(dynEntry, "name")) == name) {
+                    if (dynNameIdx == 0) {
+                        dynNameIdx = 62 + dni
+                    }
+                }
+                dni = dni + 1
+            }
+            if (dynNameIdx > 0) {
+                // Literal with incremental indexing, referencing dynamic table name
+                result = stringConcat(result, hpackEncodeInt(dynNameIdx, 6, 64))
+                result = stringConcat(result, hpackEncodeString(value))
+                hpackDynamicAdd(ctx, name, value)
+                encoded = true
+            }
+        }
+
+        // 5. Check static table for name-only match (literal with incremental indexing)
+        if (encoded == false) {
             val nameIdx = hpackStaticLookupName(name)
             if (nameIdx > 0) {
                 // Literal with incremental indexing (Section 6.2.1)
                 // 6-bit prefix: 01xxxxxx → prefix bits = 64 (0x40)
-                // nameIdx range 1-61 fits in 6 bits (max 63), so single byte: 64+idx ≤ 125
                 result = stringConcat(result, hpackEncodeInt(nameIdx, 6, 64))
                 result = stringConcat(result, hpackEncodeString(value))
-                // Add to encoder's dynamic table
                 hpackDynamicAdd(ctx, name, value)
-            } else {
-                // Literal without indexing (Section 6.2.2)
-                // 0000 0000 = 0x00
-                result = stringConcat(result, intToChar(0))
-                result = stringConcat(result, hpackEncodeString(name))
-                result = stringConcat(result, hpackEncodeString(value))
+                encoded = true
             }
         }
+
+        // 6. No match anywhere — literal with incremental indexing, new name
+        if (encoded == false) {
+            // Literal with incremental indexing (Section 6.2.1), new name
+            // 0100 0000 = 0x40 (incremental indexing, name index 0)
+            result = stringConcat(result, hpackByteToChar(64))
+            result = stringConcat(result, hpackEncodeString(name))
+            result = stringConcat(result, hpackEncodeString(value))
+            hpackDynamicAdd(ctx, name, value)
+        }
+
         i = i + 1
     }
     return result
@@ -824,25 +1240,67 @@ fun hpackEncode(ctx: Map, headers: List): String {
 
 // Decode an HPACK header block into a list of header name-value maps
 // data: raw bytes, dataLen: number of bytes to decode
+// Includes HPACK bomb protection (max field size, max total decoded size)
+// and RFC 7541 Section 4.2 size update validation (must be at start of block).
 fun hpackDecode(ctx: Map, buf: String, bufLen: Int): List {
     val headers = listCreate()
     var pos: Int = 0
+    var seenNonUpdate: Bool = false
+    var totalDecodedSize: Int = 0
+    val maxHeaderFieldSize = toInt(mapGet(ctx, "maxHeaderFieldSize"))
+    val maxTotalDecodedSize = toInt(mapGet(ctx, "maxTotalDecodedSize"))
     while (pos < bufLen) {
         val b = charCodeAt(buf, pos)
         if (b / 128 == 1) {
             // Indexed header field (Section 6.1): top bit is 1
+            seenNonUpdate = true
             val idxResult = hpackDecodeInt(buf, pos, 7)
             val index = toInt(mapGet(idxResult, "value"))
             pos = toInt(mapGet(idxResult, "pos"))
+            // Gap H3: Check for integer overflow
+            val idxOverflow = mapGet(idxResult, "overflow")
+            if (idxOverflow == true) {
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "integer overflow in indexed header")
+                listAppend(headers, errEntry)
+                return headers
+            }
+            // Gap H4: Index 0 is invalid (RFC 7541 Section 6.1)
+            if (index == 0) {
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "indexed header field index 0 is invalid")
+                listAppend(headers, errEntry)
+                return headers
+            }
             if (index >= 1) {
                 val entry = hpackLookup(ctx, index)
                 val entryName = toString(mapGet(entry, "name"))
                 if (stringLength(entryName) > 0) {
-                    listAppend(headers, entry)
+                    val entryValue = toString(mapGet(entry, "value"))
+                    val fieldSize = stringLength(entryName) + stringLength(entryValue) + 32
+                    if (fieldSize > maxHeaderFieldSize) {
+                        val errEntry = mapCreate()
+                        mapPut(errEntry, "name", "hpack-error")
+                        mapPut(errEntry, "value", "header field exceeds max size")
+                        listAppend(headers, errEntry)
+                    } else {
+                        totalDecodedSize = totalDecodedSize + fieldSize
+                        if (totalDecodedSize > maxTotalDecodedSize) {
+                            val errEntry = mapCreate()
+                            mapPut(errEntry, "name", "hpack-error")
+                            mapPut(errEntry, "value", "total decoded size exceeds limit")
+                            listAppend(headers, errEntry)
+                        } else {
+                            listAppend(headers, entry)
+                        }
+                    }
                 }
             }
         } else { if (b / 64 == 1) {
             // Literal with incremental indexing (Section 6.2.1): 01xxxxxx
+            seenNonUpdate = true
             val idxResult = hpackDecodeInt(buf, pos, 6)
             val nameIdx = toInt(mapGet(idxResult, "value"))
             pos = toInt(mapGet(idxResult, "pos"))
@@ -857,20 +1315,47 @@ fun hpackDecode(ctx: Map, buf: String, bufLen: Int): List {
             val valueResult = hpackDecodeString(buf, pos)
             val value = toString(mapGet(valueResult, "value"))
             pos = toInt(mapGet(valueResult, "pos"))
-            val entry = mapCreate()
-            mapPut(entry, "name", name)
-            mapPut(entry, "value", value)
-            listAppend(headers, entry)
-            // Add to dynamic table (incremental indexing)
-            hpackDynamicAdd(ctx, name, value)
+            val fieldSize = stringLength(name) + stringLength(value) + 32
+            if (fieldSize > maxHeaderFieldSize) {
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "header field exceeds max size")
+                listAppend(headers, errEntry)
+            } else {
+                totalDecodedSize = totalDecodedSize + fieldSize
+                if (totalDecodedSize > maxTotalDecodedSize) {
+                    val errEntry = mapCreate()
+                    mapPut(errEntry, "name", "hpack-error")
+                    mapPut(errEntry, "value", "total decoded size exceeds limit")
+                    listAppend(headers, errEntry)
+                } else {
+                    val entry = mapCreate()
+                    mapPut(entry, "name", name)
+                    mapPut(entry, "value", value)
+                    listAppend(headers, entry)
+                    // Add to dynamic table (incremental indexing)
+                    hpackDynamicAdd(ctx, name, value)
+                }
+            }
         } else { if (b / 32 == 1) {
             // Dynamic table size update (Section 6.3): 001xxxxx
-            val sizeResult = hpackDecodeInt(buf, pos, 5)
-            val newSize = toInt(mapGet(sizeResult, "value"))
-            pos = toInt(mapGet(sizeResult, "pos"))
-            hpackDynamicResize(ctx, newSize)
+            if (seenNonUpdate == true) {
+                // RFC 7541 Section 4.2: size updates MUST appear at start of block
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "dynamic table size update not at start of block")
+                listAppend(headers, errEntry)
+                val sizeResult = hpackDecodeInt(buf, pos, 5)
+                pos = toInt(mapGet(sizeResult, "pos"))
+            } else {
+                val sizeResult = hpackDecodeInt(buf, pos, 5)
+                val newSize = toInt(mapGet(sizeResult, "value"))
+                pos = toInt(mapGet(sizeResult, "pos"))
+                hpackDynamicResize(ctx, newSize)
+            }
         } else { if (b / 16 == 1) {
             // Literal never indexed (Section 6.2.3): 0001xxxx
+            seenNonUpdate = true
             val idxResult = hpackDecodeInt(buf, pos, 4)
             val nameIdx = toInt(mapGet(idxResult, "value"))
             pos = toInt(mapGet(idxResult, "pos"))
@@ -885,12 +1370,29 @@ fun hpackDecode(ctx: Map, buf: String, bufLen: Int): List {
             val valueResult = hpackDecodeString(buf, pos)
             val value = toString(mapGet(valueResult, "value"))
             pos = toInt(mapGet(valueResult, "pos"))
-            val entry = mapCreate()
-            mapPut(entry, "name", name)
-            mapPut(entry, "value", value)
-            listAppend(headers, entry)
+            val fieldSize = stringLength(name) + stringLength(value) + 32
+            if (fieldSize > maxHeaderFieldSize) {
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "header field exceeds max size")
+                listAppend(headers, errEntry)
+            } else {
+                totalDecodedSize = totalDecodedSize + fieldSize
+                if (totalDecodedSize > maxTotalDecodedSize) {
+                    val errEntry = mapCreate()
+                    mapPut(errEntry, "name", "hpack-error")
+                    mapPut(errEntry, "value", "total decoded size exceeds limit")
+                    listAppend(headers, errEntry)
+                } else {
+                    val entry = mapCreate()
+                    mapPut(entry, "name", name)
+                    mapPut(entry, "value", value)
+                    listAppend(headers, entry)
+                }
+            }
         } else {
             // Literal without indexing (Section 6.2.2): 0000xxxx
+            seenNonUpdate = true
             val idxResult = hpackDecodeInt(buf, pos, 4)
             val nameIdx = toInt(mapGet(idxResult, "value"))
             pos = toInt(mapGet(idxResult, "pos"))
@@ -905,10 +1407,26 @@ fun hpackDecode(ctx: Map, buf: String, bufLen: Int): List {
             val valueResult = hpackDecodeString(buf, pos)
             val value = toString(mapGet(valueResult, "value"))
             pos = toInt(mapGet(valueResult, "pos"))
-            val entry = mapCreate()
-            mapPut(entry, "name", name)
-            mapPut(entry, "value", value)
-            listAppend(headers, entry)
+            val fieldSize = stringLength(name) + stringLength(value) + 32
+            if (fieldSize > maxHeaderFieldSize) {
+                val errEntry = mapCreate()
+                mapPut(errEntry, "name", "hpack-error")
+                mapPut(errEntry, "value", "header field exceeds max size")
+                listAppend(headers, errEntry)
+            } else {
+                totalDecodedSize = totalDecodedSize + fieldSize
+                if (totalDecodedSize > maxTotalDecodedSize) {
+                    val errEntry = mapCreate()
+                    mapPut(errEntry, "name", "hpack-error")
+                    mapPut(errEntry, "value", "total decoded size exceeds limit")
+                    listAppend(headers, errEntry)
+                } else {
+                    val entry = mapCreate()
+                    mapPut(entry, "name", name)
+                    mapPut(entry, "value", value)
+                    listAppend(headers, entry)
+                }
+            }
         } } } }
     }
     return headers

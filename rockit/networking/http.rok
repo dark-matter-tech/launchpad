@@ -1,8 +1,9 @@
 // rockit.networking.http — HTTP/1.1 client
 //
-// Provides HTTP request methods (GET, POST, PUT, DELETE) over plain TCP
-// for HTTP, with native TLS for HTTPS via OpenSSL. Response parsing
-// extracts status code, headers, and body.
+// Provides HTTP request methods (GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH)
+// over plain TCP for HTTP, with native TLS for HTTPS via OpenSSL. Response
+// parsing extracts status code, headers, and body. Supports chunked transfer
+// encoding, header size limits, and Content-Length validation per RFC 9112.
 //
 // Standards: RFC 9110 — HTTP Semantics; RFC 9112 — HTTP/1.1
 //
@@ -13,10 +14,207 @@
 //   println(httpStatus(resp))
 //   println(httpBody(resp))
 
+// == Constants ================================================================
+
+// Maximum allowed size for a single header line (64 KB)
+fun HTTP_MAX_HEADER_SIZE(): Int { return 65536 }
+
+// Maximum allowed total response size (10 MB)
+fun HTTP_MAX_RESPONSE_SIZE(): Int { return 10485760 }
+
+// Maximum recv loop iterations to prevent infinite loops
+fun HTTP_MAX_RECV_ITERATIONS(): Int { return 10000 }
+
+// Default maximum number of redirects to follow
+fun HTTP_MAX_REDIRECTS(): Int { return 10 }
+
+// Body size threshold for Expect: 100-continue (8192 bytes)
+fun HTTP_EXPECT_THRESHOLD(): Int { return 8192 }
+
+// Default User-Agent string (RFC 9110 Section 10.1.5)
+fun HTTP_USER_AGENT(): String { return "rockit/1.0" }
+
+// Global configuration flag for Expect: 100-continue
+// When enabled, requests with body > HTTP_EXPECT_THRESHOLD() will send
+// Expect: 100-continue and wait for a 100 response before sending the body
+var httpExpectContinueEnabled: Bool = false
+
+// == Utility Functions ========================================================
+
+// Strip fragment component from a URI path (RFC 9112 Section 3.2.1)
+// A client MUST NOT send a fragment in the request-target
+fun httpStripFragment(path: String): String {
+    val hashIdx = stringIndexOf(path, "#")
+    if (hashIdx >= 0) {
+        return substring(path, 0, hashIdx)
+    }
+    return path
+}
+
+// Validate an HTTP header field name (RFC 9110 Section 5.1)
+// Only token characters are allowed: !#$%&'*+-.^_`|~ plus digits and letters
+// No control chars, no spaces, no delimiters like (),:;<=>?@[\]{}"/
+fun httpIsValidHeaderName(name: String): Bool {
+    val len = stringLength(name)
+    if (len == 0) { return false }
+    var i: Int = 0
+    while (i < len) {
+        val c = charCodeAt(name, i)
+        var valid: Bool = false
+        // A-Z (65-90)
+        if (c >= 65) { if (c <= 90) { valid = true } }
+        // a-z (97-122)
+        if (c >= 97) { if (c <= 122) { valid = true } }
+        // 0-9 (48-57)
+        if (c >= 48) { if (c <= 57) { valid = true } }
+        // ! (33)
+        if (c == 33) { valid = true }
+        // # (35)
+        if (c == 35) { valid = true }
+        // $ (36)
+        if (c == 36) { valid = true }
+        // % (37)
+        if (c == 37) { valid = true }
+        // & (38)
+        if (c == 38) { valid = true }
+        // ' (39)
+        if (c == 39) { valid = true }
+        // * (42)
+        if (c == 42) { valid = true }
+        // + (43)
+        if (c == 43) { valid = true }
+        // - (45)
+        if (c == 45) { valid = true }
+        // . (46)
+        if (c == 46) { valid = true }
+        // ^ (94)
+        if (c == 94) { valid = true }
+        // _ (95)
+        if (c == 95) { valid = true }
+        // ` (96)
+        if (c == 96) { valid = true }
+        // | (124)
+        if (c == 124) { valid = true }
+        // ~ (126)
+        if (c == 126) { valid = true }
+        if (valid == false) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Build Host header value with port for non-default ports (RFC 9112 Section 3.2.5)
+// Port must be included when it differs from the scheme default (80 for http, 443 for https)
+fun httpBuildHostHeader(host: String, port: Int, scheme: String): String {
+    var includePort: Bool = true
+    if (scheme == "http") {
+        if (port == 80) { includePort = false }
+    }
+    if (scheme == "https") {
+        if (port == 443) { includePort = false }
+    }
+    if (includePort) {
+        return stringConcat(host, stringConcat(":", toString(port)))
+    }
+    return host
+}
+
+// Trim leading and trailing whitespace (spaces and tabs) from a string (RFC 9110 Section 5.5)
+fun httpTrimWhitespace(str: String): String {
+    val len = stringLength(str)
+    if (len == 0) { return "" }
+    // Find start (skip leading spaces/tabs)
+    var start: Int = 0
+    var startDone: Bool = false
+    while (startDone == false) {
+        if (start >= len) {
+            startDone = true
+        } else {
+            val c = charCodeAt(str, start)
+            if (c == 32) {
+                start = start + 1
+            } else {
+                if (c == 9) {
+                    start = start + 1
+                } else {
+                    startDone = true
+                }
+            }
+        }
+    }
+    if (start >= len) { return "" }
+    // Find end (skip trailing spaces/tabs)
+    var end: Int = len - 1
+    var endDone: Bool = false
+    while (endDone == false) {
+        if (end < start) {
+            endDone = true
+        } else {
+            val c = charCodeAt(str, end)
+            if (c == 32) {
+                end = end - 1
+            } else {
+                if (c == 9) {
+                    end = end - 1
+                } else {
+                    endDone = true
+                }
+            }
+        }
+    }
+    return substring(str, start, end + 1)
+}
+
+// Extract the request-target from a URL (path + query, no fragment)
+// RFC 9112 Section 3.2: request-target must include query but not fragment
+fun httpExtractRequestTarget(url: String): String {
+    val path = urlExtractPath(url)
+    // Look for '?' in the URL to extract the query string
+    val idx = stringIndexOf(url, "://")
+    var searchStart: Int = 0
+    if (idx >= 0) { searchStart = idx + 3 }
+    // Skip past host:port to find the query string in the URL
+    val len = stringLength(url)
+    var qPos: Int = -1
+    var i: Int = searchStart
+    while (i < len) {
+        val ch = charCodeAt(url, i)
+        if (ch == 63) {  // '?'
+            if (qPos < 0) { qPos = i }
+        }
+        i = i + 1
+    }
+    var target: String = path
+    if (qPos >= 0) {
+        // Extract query (everything from '?' up to '#' or end)
+        var qEnd: Int = len
+        var j: Int = qPos + 1
+        while (j < len) {
+            if (charCodeAt(url, j) == 35) {  // '#'
+                if (qEnd == len) { qEnd = j }
+            }
+            j = j + 1
+        }
+        val query = substring(url, qPos, qEnd)
+        target = stringConcat(path, query)
+    }
+    return httpStripFragment(target)
+}
+
 // == Core Request ============================================================
 
 // Send an HTTP request, auto-detecting HTTP vs HTTPS
+// When Expect: 100-continue is enabled and body exceeds threshold, uses the Expect flow
 fun httpRequest(method: String, url: String, headers: Map, body: String): Map {
+    if (httpExpectContinueEnabled) {
+        if (stringLength(body) > HTTP_EXPECT_THRESHOLD()) {
+            val scheme = urlExtractScheme(url)
+            if (scheme == "https") {
+                return httpRequestSecureWithExpect(method, url, headers, body)
+            }
+            return httpRequestRawWithExpect(method, url, headers, body)
+        }
+    }
     val scheme = urlExtractScheme(url)
     if (scheme == "https") {
         return httpRequestSecure(method, url, headers, body)
@@ -55,6 +253,25 @@ fun httpPut(url: String, body: String, contentType: String): Map {
 fun httpDelete(url: String): Map {
     val headers = mapCreate()
     return httpRequest("DELETE", url, headers, "")
+}
+
+// Send a HEAD request
+fun httpHead(url: String): Map {
+    val headers = mapCreate()
+    return httpRequest("HEAD", url, headers, "")
+}
+
+// Send an OPTIONS request
+fun httpOptions(url: String): Map {
+    val headers = mapCreate()
+    return httpRequest("OPTIONS", url, headers, "")
+}
+
+// Send a PATCH request with body and content type
+fun httpPatch(url: String, body: String, contentType: String): Map {
+    val headers = mapCreate()
+    mapPut(headers, "Content-Type", contentType)
+    return httpRequest("PATCH", url, headers, body)
 }
 
 // == Response Accessors ======================================================
@@ -102,6 +319,35 @@ fun httpHeaders(r: Map): Map {
     return v
 }
 
+// Return all trailer headers from a chunked response as a Map
+fun httpTrailers(r: Map): Map {
+    val v = mapGet(r, "trailers")
+    if (v == null) { return mapCreate() }
+    return v
+}
+
+// Return the value of a trailer header (case-insensitive lookup)
+fun httpTrailer(r: Map, name: String): String {
+    val trailers = mapGet(r, "trailers")
+    if (trailers == null) { return "" }
+    // Try exact match first
+    val v = mapGet(trailers, name)
+    if (v != null) { return toString(v) }
+    // Fall back to case-insensitive search
+    val lowerName = urlToLower(name)
+    val keys = mapKeys(trailers)
+    var i: Int = 0
+    while (i < listSize(keys)) {
+        val k = toString(listGet(keys, i))
+        if (urlToLower(k) == lowerName) {
+            val val2 = mapGet(trailers, k)
+            if (val2 != null) { return toString(val2) }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
 // Return true if the response is an error
 fun httpIsError(r: Map): Bool {
     val v = mapGet(r, "error")
@@ -124,11 +370,13 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
     val result = mapCreate()
     val respHeaders = mapCreate()
     mapPut(result, "headers", respHeaders)
+    mapPut(result, "method", method)
 
     // Parse URL using shared url.rok functions
     val host = urlExtractHost(url)
     val port = urlExtractPort(url)
-    val path = urlExtractPath(url)
+    val scheme = urlExtractScheme(url)
+    val path = httpExtractRequestTarget(url)
 
     if (stringLength(host) == 0) {
         mapPut(result, "status", 0)
@@ -147,8 +395,10 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
     }
 
     // Build request
+    val hostHeader = httpBuildHostHeader(host, port, scheme)
     var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
-    req = stringConcat(req, stringConcat(stringConcat("Host: ", host), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", hostHeader), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("User-Agent: ", HTTP_USER_AGENT()), "\r\n"))
 
     // Add custom headers
     val hdrKeys = mapKeys(headers)
@@ -182,15 +432,31 @@ fun httpRequestRaw(method: String, url: String, headers: Map, body: String): Map
     // Receive response
     var response: String = ""
     var done: Bool = false
+    var iterations: Int = 0
     while (done == false) {
-        val chunk = tcpRecv(fd, 8192)
-        if (stringLength(chunk) == 0) {
+        if (iterations > HTTP_MAX_RECV_ITERATIONS()) {
             done = true
         } else {
-            response = stringConcat(response, chunk)
+            if (stringLength(response) > HTTP_MAX_RESPONSE_SIZE()) {
+                done = true
+            } else {
+                val chunk = tcpRecv(fd, 8192)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    response = stringConcat(response, chunk)
+                }
+            }
         }
+        iterations = iterations + 1
     }
     tcpClose(fd)
+
+    // == Gap G: Response truncation reporting ==================================
+    if (stringLength(response) >= HTTP_MAX_RESPONSE_SIZE()) {
+        mapPut(result, "error", "Response truncated: exceeded max size")
+        mapPut(result, "truncated", true)
+    }
 
     // Parse response
     httpParseResponse(response, result, respHeaders)
@@ -204,10 +470,12 @@ fun httpRequestSecure(method: String, url: String, headers: Map, body: String): 
     val result = mapCreate()
     val respHeaders = mapCreate()
     mapPut(result, "headers", respHeaders)
+    mapPut(result, "method", method)
 
     val host = urlExtractHost(url)
     val port = urlExtractPort(url)
-    val path = urlExtractPath(url)
+    val scheme = urlExtractScheme(url)
+    val path = httpExtractRequestTarget(url)
 
     if (stringLength(host) == 0) {
         mapPut(result, "status", 0)
@@ -235,8 +503,10 @@ fun httpRequestSecure(method: String, url: String, headers: Map, body: String): 
     }
 
     // Build request
+    val hostHeader = httpBuildHostHeader(host, port, scheme)
     var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
-    req = stringConcat(req, stringConcat(stringConcat("Host: ", host), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", hostHeader), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("User-Agent: ", HTTP_USER_AGENT()), "\r\n"))
 
     // Add custom headers
     val hdrKeys = mapKeys(headers)
@@ -270,15 +540,31 @@ fun httpRequestSecure(method: String, url: String, headers: Map, body: String): 
     // Receive response
     var response: String = ""
     var done: Bool = false
+    var iterations: Int = 0
     while (done == false) {
-        val chunk = tlsRecv(conn, 8192)
-        if (stringLength(chunk) == 0) {
+        if (iterations > HTTP_MAX_RECV_ITERATIONS()) {
             done = true
         } else {
-            response = stringConcat(response, chunk)
+            if (stringLength(response) > HTTP_MAX_RESPONSE_SIZE()) {
+                done = true
+            } else {
+                val chunk = tlsRecv(conn, 8192)
+                if (stringLength(chunk) == 0) {
+                    done = true
+                } else {
+                    response = stringConcat(response, chunk)
+                }
+            }
         }
+        iterations = iterations + 1
     }
     tlsClose(conn)
+
+    // == Gap G: Response truncation reporting ==================================
+    if (stringLength(response) >= HTTP_MAX_RESPONSE_SIZE()) {
+        mapPut(result, "error", "Response truncated: exceeded max size")
+        mapPut(result, "truncated", true)
+    }
 
     // Parse response
     httpParseResponse(response, result, respHeaders)
@@ -288,8 +574,13 @@ fun httpRequestSecure(method: String, url: String, headers: Map, body: String): 
 // == Response Parsing ========================================================
 
 // Parse a raw HTTP response string into result and header maps
+// Reads "method" from the result map to handle HEAD responses (Gap 1, RFC 9110 Section 9.3.2)
+// Handles 1xx interim responses by skipping them (Gap 8, RFC 9110 Section 15.2)
+// Validates HTTP version (Gap 5, RFC 9112 Section 4)
+// Detects Content-Length + Transfer-Encoding conflict (Gap 4, RFC 9112 Section 6.1)
 fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
-    val len = stringLength(response)
+    var resp: String = response
+    var len: Int = stringLength(resp)
     if (len == 0) {
         mapPut(result, "status", 0)
         mapPut(result, "body", "")
@@ -297,19 +588,84 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
         return
     }
 
+    // Determine the method from result map (set by request builders)
+    var reqMethod: String = "GET"
+    val methodVal = mapGet(result, "method")
+    if (methodVal != null) {
+        reqMethod = toString(methodVal)
+    }
+
+    // == Gap 8: Skip 1xx interim responses ===================================
+    var skip1xx: Bool = true
+    while (skip1xx) {
+        val interimNewline = stringIndexOf(resp, "\r\n")
+        if (interimNewline < 0) {
+            skip1xx = false
+        } else {
+            val interimStatusLine = substring(resp, 0, interimNewline)
+            val interimSpaceIdx = stringIndexOf(interimStatusLine, " ")
+            if (interimSpaceIdx < 0) {
+                skip1xx = false
+            } else {
+                val interimAfterSpace = substring(interimStatusLine, interimSpaceIdx + 1, stringLength(interimStatusLine))
+                val interimSpaceIdx2 = stringIndexOf(interimAfterSpace, " ")
+                var interimStatusStr: String = interimAfterSpace
+                if (interimSpaceIdx2 >= 0) {
+                    interimStatusStr = substring(interimAfterSpace, 0, interimSpaceIdx2)
+                }
+                val interimStatus = toInt(interimStatusStr)
+                if (interimStatus >= 100) {
+                    if (interimStatus <= 199) {
+                        // This is a 1xx response — skip past it
+                        val interimEnd = stringIndexOf(resp, "\r\n\r\n")
+                        if (interimEnd < 0) {
+                            // Incomplete 1xx, cannot skip
+                            skip1xx = false
+                        } else {
+                            resp = substring(resp, interimEnd + 4, stringLength(resp))
+                            len = stringLength(resp)
+                            if (len == 0) {
+                                mapPut(result, "status", 0)
+                                mapPut(result, "body", "")
+                                mapPut(result, "error", "Only 1xx responses received")
+                                return
+                            }
+                        }
+                    } else {
+                        skip1xx = false
+                    }
+                } else {
+                    skip1xx = false
+                }
+            }
+        }
+    }
+
     // Find end of status line
-    val firstNewline = stringIndexOf(response, "\r\n")
+    val firstNewline = stringIndexOf(resp, "\r\n")
     if (firstNewline < 0) {
         mapPut(result, "status", 0)
-        mapPut(result, "body", response)
+        mapPut(result, "body", resp)
         mapPut(result, "error", "Malformed response")
         return
     }
 
-    // Parse status code from "HTTP/1.1 200 OK"
-    val statusLine = substring(response, 0, firstNewline)
+    // Parse status line: "HTTP/1.1 200 OK"
+    val statusLine = substring(resp, 0, firstNewline)
+
+    // == Gap 5: Validate HTTP version ========================================
     val spaceIdx = stringIndexOf(statusLine, " ")
     if (spaceIdx >= 0) {
+        val httpVersionStr = substring(statusLine, 0, spaceIdx)
+        mapPut(result, "httpVersion", httpVersionStr)
+        if (httpVersionStr != "HTTP/1.1") {
+            if (httpVersionStr != "HTTP/1.0") {
+                mapPut(result, "status", 0)
+                mapPut(result, "body", "")
+                mapPut(result, "error", stringConcat("Unsupported HTTP version: ", httpVersionStr))
+                return
+            }
+        }
         val afterSpace = substring(statusLine, spaceIdx + 1, stringLength(statusLine))
         val spaceIdx2 = stringIndexOf(afterSpace, " ")
         var statusStr: String = afterSpace
@@ -319,33 +675,137 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
         mapPut(result, "status", toInt(statusStr))
     } else {
         mapPut(result, "status", 0)
+        mapPut(result, "httpVersion", "")
     }
 
     // Find header/body boundary (\r\n\r\n)
-    val headerEnd = stringIndexOf(response, "\r\n\r\n")
+    val headerEnd = stringIndexOf(resp, "\r\n\r\n")
     if (headerEnd < 0) {
         mapPut(result, "body", "")
         return
     }
 
     // Parse headers
-    val headerBlock = substring(response, firstNewline + 2, headerEnd)
+    val headerBlock = substring(resp, firstNewline + 2, headerEnd)
     httpParseHeaders(headerBlock, respHeaders)
+
+    // == Gap 1: HEAD responses have no body ==================================
+    if (reqMethod == "HEAD") {
+        mapPut(result, "body", "")
+        mapPut(result, "error", "")
+        return
+    }
+
+    // == Gap B: 204 No Content and 304 Not Modified have no body ==============
+    val parsedStatus = toInt(mapGet(result, "status"))
+    if (parsedStatus == 204) {
+        mapPut(result, "body", "")
+        mapPut(result, "error", "")
+        return
+    }
+    if (parsedStatus == 304) {
+        mapPut(result, "body", "")
+        mapPut(result, "error", "")
+        return
+    }
 
     // Body is everything after \r\n\r\n
     val bodyStart = headerEnd + 4
+    var rawBody: String = ""
     if (bodyStart < len) {
-        mapPut(result, "body", substring(response, bodyStart, len))
+        rawBody = substring(resp, bodyStart, len)
+    }
+
+    // Check for chunked transfer encoding
+    val teHeader = mapGet(respHeaders, "Transfer-Encoding")
+    var isChunked: Bool = false
+    if (teHeader != null) {
+        if (stringContains(urlToLower(toString(teHeader)), "chunked")) {
+            isChunked = true
+        }
+    }
+
+    // == Gap 4: Content-Length + Transfer-Encoding conflict ===================
+    val clHeaderConflict = mapGet(respHeaders, "Content-Length")
+    if (isChunked) {
+        if (clHeaderConflict != null) {
+            // Transfer-Encoding takes precedence; remove Content-Length
+            mapPut(respHeaders, "Content-Length", null)
+            mapPut(result, "contentLengthConflict", true)
+        }
+    }
+
+    if (isChunked) {
+        val chunkedResult = httpDecodeChunkedBodyWithTrailers(rawBody)
+        mapPut(result, "body", mapGet(chunkedResult, "body"))
+        mapPut(result, "trailers", mapGet(chunkedResult, "trailers"))
     } else {
-        mapPut(result, "body", "")
+        mapPut(result, "body", rawBody)
+        // Content-Length validation (non-chunked only)
+        val clHeader = mapGet(respHeaders, "Content-Length")
+        if (clHeader != null) {
+            val clStr = toString(clHeader)
+            // == Gap E: Duplicate Content-Length detection (smuggling prevention) ==
+            // If Content-Length was combined from multiple headers, it contains commas
+            val commaIdx = stringIndexOf(clStr, ",")
+            if (commaIdx >= 0) {
+                // Split on comma and verify all values are identical
+                var clCheckPos: Int = 0
+                var clCheckLen: Int = stringLength(clStr)
+                var firstClVal: String = ""
+                var clConflict: Bool = false
+                var clFirst: Bool = true
+                var clCheckDone: Bool = false
+                while (clCheckDone == false) {
+                    if (clCheckPos >= clCheckLen) {
+                        clCheckDone = true
+                    } else {
+                        // Find next comma
+                        var nextComma: Int = clCheckLen
+                        var ci: Int = clCheckPos
+                        while (ci < clCheckLen) {
+                            if (charCodeAt(clStr, ci) == 44) {  // ','
+                                if (nextComma == clCheckLen) { nextComma = ci }
+                            }
+                            ci = ci + 1
+                        }
+                        val segment = httpTrimWhitespace(substring(clStr, clCheckPos, nextComma))
+                        if (clFirst) {
+                            firstClVal = segment
+                            clFirst = false
+                        } else {
+                            if (segment != firstClVal) {
+                                clConflict = true
+                            }
+                        }
+                        clCheckPos = nextComma + 1
+                    }
+                }
+                if (clConflict) {
+                    mapPut(result, "error", "Conflicting Content-Length values")
+                    return
+                }
+            }
+            val expectedLen = toInt(toString(clHeader))
+            val actualLen = stringLength(rawBody)
+            if (actualLen != expectedLen) {
+                mapPut(result, "error", stringConcat("Content-Length mismatch: expected ", stringConcat(toString(expectedLen), stringConcat(", got ", toString(actualLen)))))
+                return
+            }
+        }
     }
     mapPut(result, "error", "")
 }
 
 // Parse a block of HTTP headers into a Map
+// Handles obs-fold continuation lines (Gap 6, RFC 9112 Section 5.2)
+// Combines multi-valued headers with comma separator (Gap 3, RFC 9110 Section 5.3)
+// Validates header field names (Gap 14, RFC 9110 Section 5.1)
+// Trims whitespace from header values (Gap 15, RFC 9110 Section 5.5)
 fun httpParseHeaders(block: String, headers: Map): Unit {
     val len = stringLength(block)
     var pos: Int = 0
+    var lastKey: String = ""
 
     while (pos < len) {
         var lineEnd: Int = len
@@ -361,12 +821,75 @@ fun httpParseHeaders(block: String, headers: Map): Unit {
             i = i + 1
         }
 
-        val line = substring(block, pos, lineEnd)
-        val colonIdx = stringIndexOf(line, ": ")
-        if (colonIdx > 0) {
-            val key = substring(line, 0, colonIdx)
-            val value = substring(line, colonIdx + 2, stringLength(line))
-            mapPut(headers, key, value)
+        val lineLen = lineEnd - pos
+        // Skip header lines that exceed the maximum allowed size
+        if (lineLen <= HTTP_MAX_HEADER_SIZE()) {
+            val line = substring(block, pos, lineEnd)
+
+            // == Gap 6: Check for obs-fold continuation (starts with space or tab) ==
+            if (stringLength(line) > 0) {
+                val firstChar = charCodeAt(line, 0)
+                if (firstChar == 32) {
+                    // Space continuation line — append to previous header
+                    if (stringLength(lastKey) > 0) {
+                        val existing = mapGet(headers, lastKey)
+                        if (existing != null) {
+                            val foldedVal = httpTrimWhitespace(line)
+                            mapPut(headers, lastKey, stringConcat(stringConcat(toString(existing), " "), foldedVal))
+                        }
+                    }
+                } else {
+                    if (firstChar == 9) {
+                        // Tab continuation line — append to previous header
+                        if (stringLength(lastKey) > 0) {
+                            val existing = mapGet(headers, lastKey)
+                            if (existing != null) {
+                                val foldedVal = httpTrimWhitespace(line)
+                                mapPut(headers, lastKey, stringConcat(stringConcat(toString(existing), " "), foldedVal))
+                            }
+                        }
+                    } else {
+                        // Normal header line — find colon
+                        // Gap 15: Handle both ": " and ":" (colon without space)
+                        val colonIdx = stringIndexOf(line, ":")
+                        if (colonIdx > 0) {
+                            val key = substring(line, 0, colonIdx)
+                            // == Gap 14: Validate header name ==
+                            if (httpIsValidHeaderName(key)) {
+                                // Value starts after colon (skip optional space)
+                                var valueStart: Int = colonIdx + 1
+                                if (valueStart < stringLength(line)) {
+                                    if (charCodeAt(line, valueStart) == 32) {
+                                        valueStart = valueStart + 1
+                                    }
+                                }
+                                var rawValue: String = ""
+                                if (valueStart < stringLength(line)) {
+                                    rawValue = substring(line, valueStart, stringLength(line))
+                                }
+                                // == Gap 15: Trim whitespace from header value ==
+                                val value = httpTrimWhitespace(rawValue)
+
+                                // == Gap 3: Multi-valued headers — combine with comma ==
+                                // == Gap F: Set-Cookie exemption — use newline separator ==
+                                val existingVal = mapGet(headers, key)
+                                if (existingVal != null) {
+                                    val lowerKey = urlToLower(key)
+                                    if (lowerKey == "set-cookie") {
+                                        // Set-Cookie values can contain commas, so use newline separator
+                                        mapPut(headers, key, stringConcat(stringConcat(toString(existingVal), "\n"), value))
+                                    } else {
+                                        mapPut(headers, key, stringConcat(stringConcat(toString(existingVal), ", "), value))
+                                    }
+                                } else {
+                                    mapPut(headers, key, value)
+                                }
+                                lastKey = key
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if (lineEnd < len) {
@@ -375,4 +898,914 @@ fun httpParseHeaders(block: String, headers: Map): Unit {
             pos = len
         }
     }
+}
+
+// == Chunked Transfer Encoding ================================================
+
+// Parse a hexadecimal string to an integer
+// Gap C: Overflow guard — caps at HTTP_MAX_RESPONSE_SIZE() to prevent integer overflow
+// Gap D: Invalid hex chars stop parsing (validHex flag)
+fun httpParseHex(hexStr: String): Int {
+    val len = stringLength(hexStr)
+    var result: Int = 0
+    var i: Int = 0
+    while (i < len) {
+        val c = charCodeAt(hexStr, i)
+        var digit: Int = -1
+        if (c >= 48) {
+            if (c <= 57) {
+                // '0'-'9' → 0-9
+                digit = c - 48
+            }
+        }
+        if (c >= 97) {
+            if (c <= 102) {
+                // 'a'-'f' → 10-15
+                digit = c - 87
+            }
+        }
+        if (c >= 65) {
+            if (c <= 70) {
+                // 'A'-'F' → 10-15
+                digit = c - 55
+            }
+        }
+        // Gap D: Invalid hex character — stop parsing and return what we have
+        if (digit < 0) {
+            return result
+        }
+        result = result * 16 + digit
+        // Gap C: Overflow guard — cap at max response size
+        if (result > HTTP_MAX_RESPONSE_SIZE()) {
+            return HTTP_MAX_RESPONSE_SIZE()
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Decode a chunked transfer-encoded body (RFC 9112 Section 7.1)
+// Format: chunk-size (hex) CRLF chunk-data CRLF ... 0 CRLF CRLF
+fun httpDecodeChunkedBody(raw: String): String {
+    val result = httpDecodeChunkedBodyWithTrailers(raw)
+    return toString(mapGet(result, "body"))
+}
+
+// Decode a chunked transfer-encoded body with trailer header support (RFC 9112 Section 7.1)
+// Returns a Map with "body" (decoded body string) and "trailers" (Map of trailer headers)
+// After the terminal 0-size chunk, optional trailer headers may appear before the final CRLF
+fun httpDecodeChunkedBodyWithTrailers(raw: String): Map {
+    val result = mapCreate()
+    val trailers = mapCreate()
+    mapPut(result, "trailers", trailers)
+
+    val len = stringLength(raw)
+    var pos: Int = 0
+    var decoded: String = ""
+
+    var done: Bool = false
+    while (done == false) {
+        if (pos >= len) {
+            done = true
+        } else {
+            // Find the end of the chunk-size line
+            val crlfIdx = httpIndexOfCrlf(raw, pos)
+            if (crlfIdx < 0) {
+                done = true
+            } else {
+                var sizeStr: String = substring(raw, pos, crlfIdx)
+                // == Gap 7: Strip chunk extensions after semicolon ==
+                val semiIdx = stringIndexOf(sizeStr, ";")
+                if (semiIdx >= 0) {
+                    sizeStr = substring(sizeStr, 0, semiIdx)
+                }
+                val chunkSize = httpParseHex(sizeStr)
+                if (chunkSize == 0) {
+                    // Terminal chunk found — parse optional trailer headers
+                    // Position is right after "0\r\n"
+                    val trailerStart = crlfIdx + 2
+                    if (trailerStart < len) {
+                        // Check if there are trailer headers before the final CRLF
+                        // Trailers end with a CRLF (empty line)
+                        val remaining = substring(raw, trailerStart, len)
+                        // If remaining starts with \r\n, no trailers
+                        val remainLen = stringLength(remaining)
+                        if (remainLen >= 2) {
+                            if (charCodeAt(remaining, 0) == 13) {
+                                if (charCodeAt(remaining, 1) == 10) {
+                                    // No trailers, just the final CRLF
+                                }
+                            } else {
+                                // Parse trailer headers
+                                // Find the end of trailers (empty line: \r\n\r\n or end of string)
+                                val trailerEnd = stringIndexOf(remaining, "\r\n\r\n")
+                                var trailerBlock: String = remaining
+                                if (trailerEnd >= 0) {
+                                    trailerBlock = substring(remaining, 0, trailerEnd)
+                                }
+                                httpParseHeaders(trailerBlock, trailers)
+                            }
+                        }
+                    }
+                    done = true
+                } else {
+                    val chunkStart = crlfIdx + 2
+                    val chunkEnd = chunkStart + chunkSize
+                    if (chunkEnd > len) {
+                        done = true
+                    } else {
+                        decoded = stringConcat(decoded, substring(raw, chunkStart, chunkEnd))
+                        // Skip past chunk data and trailing CRLF
+                        pos = chunkEnd + 2
+                    }
+                }
+            }
+        }
+    }
+
+    mapPut(result, "body", decoded)
+    return result
+}
+
+// Find the index of CRLF (\r\n) in a string starting from a given position
+fun httpIndexOfCrlf(str: String, start: Int): Int {
+    val len = stringLength(str)
+    var i: Int = start
+    while (i < len - 1) {
+        if (charCodeAt(str, i) == 13) {
+            if (charCodeAt(str, i + 1) == 10) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Find the last index of a character (by char code) in a string, or -1 if not found
+fun httpLastIndexOfChar(str: String, charCode: Int): Int {
+    val len = stringLength(str)
+    var result: Int = -1
+    var i: Int = 0
+    while (i < len) {
+        if (charCodeAt(str, i) == charCode) {
+            result = i
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// == Keep-Alive / Connection Reuse (Session) ==================================
+
+// Create an HTTP session for connection reuse (keep-alive)
+// Returns a session map with connection state
+fun httpCreateSession(): Map {
+    val session = mapCreate()
+    mapPut(session, "fd", -1)
+    mapPut(session, "tlsConn", -1)
+    mapPut(session, "tlsCtx", -1)
+    mapPut(session, "host", "")
+    mapPut(session, "port", 0)
+    mapPut(session, "scheme", "")
+    mapPut(session, "connected", false)
+    return session
+}
+
+// Close the session's current connection
+fun httpSessionClose(session: Map): Unit {
+    val connected = mapGet(session, "connected")
+    if (connected == true) {
+        val scheme = toString(mapGet(session, "scheme"))
+        if (scheme == "https") {
+            val tlsConn = toInt(mapGet(session, "tlsConn"))
+            if (tlsConn >= 0) {
+                tlsClose(tlsConn)
+            }
+        } else {
+            val fd = toInt(mapGet(session, "fd"))
+            if (fd >= 0) {
+                tcpClose(fd)
+            }
+        }
+        mapPut(session, "fd", -1)
+        mapPut(session, "tlsConn", -1)
+        mapPut(session, "tlsCtx", -1)
+        mapPut(session, "connected", false)
+        mapPut(session, "host", "")
+        mapPut(session, "port", 0)
+        mapPut(session, "scheme", "")
+    }
+}
+
+// Send data over the session's transport (TLS or TCP)
+fun httpSessionSend(session: Map, payload: String): Int {
+    val scheme = toString(mapGet(session, "scheme"))
+    if (scheme == "https") {
+        val tlsConn = toInt(mapGet(session, "tlsConn"))
+        return tlsSend(tlsConn, payload)
+    }
+    val fd = toInt(mapGet(session, "fd"))
+    return tcpSend(fd, payload)
+}
+
+// Receive data over the session's transport (TLS or TCP)
+fun httpSessionRecv(session: Map, maxBytes: Int): String {
+    val scheme = toString(mapGet(session, "scheme"))
+    if (scheme == "https") {
+        val tlsConn = toInt(mapGet(session, "tlsConn"))
+        return tlsRecv(tlsConn, maxBytes)
+    }
+    val fd = toInt(mapGet(session, "fd"))
+    return tcpRecv(fd, maxBytes)
+}
+
+// Ensure the session is connected to the given host:port, reconnecting if needed
+fun httpSessionEnsureConnection(session: Map, scheme: String, host: String, port: Int): Map {
+    val result = mapCreate()
+    val currentHost = toString(mapGet(session, "host"))
+    val currentPort = toInt(mapGet(session, "port"))
+    val currentScheme = toString(mapGet(session, "scheme"))
+    val connected = mapGet(session, "connected")
+
+    // If already connected to the same target, reuse
+    if (connected == true) {
+        if (currentHost == host) {
+            if (currentPort == port) {
+                if (currentScheme == scheme) {
+                    mapPut(result, "ok", true)
+                    mapPut(result, "error", "")
+                    return result
+                }
+            }
+        }
+        // Different target — close and reconnect
+        httpSessionClose(session)
+    }
+
+    // Connect to new target
+    if (scheme == "https") {
+        val ctx = tlsCreateContext()
+        if (ctx < 0) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "Failed to create TLS context")
+            return result
+        }
+        tlsSetVerifyPeer(ctx, 1)
+        val conn = tlsConnect(ctx, host, port)
+        if (conn < 0) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", stringConcat("TLS connection failed to ", host))
+            return result
+        }
+        mapPut(session, "tlsCtx", ctx)
+        mapPut(session, "tlsConn", conn)
+    } else {
+        val fd = tcpConnect(host, port)
+        if (fd < 0) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", stringConcat("Connection failed to ", host))
+            return result
+        }
+        mapPut(session, "fd", fd)
+    }
+
+    mapPut(session, "host", host)
+    mapPut(session, "port", port)
+    mapPut(session, "scheme", scheme)
+    mapPut(session, "connected", true)
+    mapPut(result, "ok", true)
+    mapPut(result, "error", "")
+    return result
+}
+
+// Make an HTTP request using a session with connection reuse (keep-alive)
+// Reuses the TCP/TLS connection if the target host:port matches, otherwise reconnects
+fun httpSessionRequest(session: Map, method: String, url: String, body: String, contentType: String): Map {
+    val result = mapCreate()
+    val respHeaders = mapCreate()
+    mapPut(result, "headers", respHeaders)
+    mapPut(result, "method", method)
+
+    val scheme = urlExtractScheme(url)
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val path = httpExtractRequestTarget(url)
+
+    if (stringLength(host) == 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Invalid URL: no host")
+        return result
+    }
+
+    // Ensure connection is established to the right target
+    val connResult = httpSessionEnsureConnection(session, scheme, host, port)
+    val connOk = mapGet(connResult, "ok")
+    if (connOk != true) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", toString(mapGet(connResult, "error")))
+        return result
+    }
+
+    // Build request — use keep-alive instead of close
+    val hostHeader = httpBuildHostHeader(host, port, scheme)
+    var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", hostHeader), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("User-Agent: ", HTTP_USER_AGENT()), "\r\n"))
+
+    // Content-Type header
+    if (stringLength(contentType) > 0) {
+        req = stringConcat(req, stringConcat(stringConcat("Content-Type: ", contentType), "\r\n"))
+    }
+
+    // Content-Length for body (Gap 12: always send Content-Length: 0 for empty bodies on keep-alive)
+    if (stringLength(body) > 0) {
+        req = stringConcat(req, stringConcat(stringConcat("Content-Length: ", toString(stringLength(body))), "\r\n"))
+    } else {
+        req = stringConcat(req, "Content-Length: 0\r\n")
+    }
+
+    req = stringConcat(req, "Connection: keep-alive\r\n")
+    req = stringConcat(req, "\r\n")
+    req = stringConcat(req, body)
+
+    // Send
+    val sent = httpSessionSend(session, req)
+    if (sent < 0) {
+        httpSessionClose(session)
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Send failed")
+        return result
+    }
+
+    // Receive response
+    var response: String = ""
+    var recvDone: Bool = false
+    var iterations: Int = 0
+    while (recvDone == false) {
+        if (iterations > HTTP_MAX_RECV_ITERATIONS()) {
+            recvDone = true
+        } else {
+            if (stringLength(response) > HTTP_MAX_RESPONSE_SIZE()) {
+                recvDone = true
+            } else {
+                val chunk = httpSessionRecv(session, 8192)
+                if (stringLength(chunk) == 0) {
+                    recvDone = true
+                } else {
+                    response = stringConcat(response, chunk)
+                    // For keep-alive, check if we have a complete response
+                    if (httpIsResponseComplete(response)) {
+                        recvDone = true
+                    }
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+
+    // Parse response
+    httpParseResponse(response, result, respHeaders)
+
+    // Check if server wants to close the connection
+    val connHeader = httpHeader(result, "Connection")
+    if (urlToLower(connHeader) == "close") {
+        httpSessionClose(session)
+    }
+
+    return result
+}
+
+// Check if a response has been fully received (has headers + complete body)
+fun httpIsResponseComplete(response: String): Bool {
+    // Need at least the header/body separator
+    val headerEnd = stringIndexOf(response, "\r\n\r\n")
+    if (headerEnd < 0) {
+        return false
+    }
+
+    val bodyStart = headerEnd + 4
+    val respLen = stringLength(response)
+
+    // Parse headers to determine body length
+    val firstNewline = stringIndexOf(response, "\r\n")
+    if (firstNewline < 0) { return false }
+
+    val headerBlock = substring(response, firstNewline + 2, headerEnd)
+    val tmpHeaders = mapCreate()
+    httpParseHeaders(headerBlock, tmpHeaders)
+
+    // Check for chunked encoding
+    val teHeader = mapGet(tmpHeaders, "Transfer-Encoding")
+    if (teHeader != null) {
+        if (stringContains(urlToLower(toString(teHeader)), "chunked")) {
+            // == Gap 9: Check that response ends with terminal chunk pattern ==
+            // The response must end with \r\n\r\n after the 0-size chunk
+            // Check if the raw response ends with "\r\n\r\n"
+            if (respLen >= 5) {
+                val lastFour = substring(response, respLen - 4, respLen)
+                if (lastFour == "\r\n\r\n") {
+                    // Verify there's a "0\r\n" somewhere before the final \r\n
+                    val bodyPart = substring(response, bodyStart, respLen)
+                    return stringContains(bodyPart, "0\r\n")
+                }
+            }
+            return false
+        }
+    }
+
+    // Check Content-Length
+    val clHeader = mapGet(tmpHeaders, "Content-Length")
+    if (clHeader != null) {
+        val expectedLen = toInt(toString(clHeader))
+        val bodyLen = respLen - bodyStart
+        if (bodyLen >= expectedLen) {
+            return true
+        }
+        return false
+    }
+
+    // No Content-Length and no chunked — cannot determine completeness reliably
+    // Return true assuming the response is complete after we received something
+    return true
+}
+
+// == Redirect Handling (3xx) ==================================================
+
+// Check if a status code is a redirect that should be followed
+fun httpIsRedirect(statusCode: Int): Bool {
+    if (statusCode == 301) { return true }
+    if (statusCode == 302) { return true }
+    if (statusCode == 303) { return true }
+    if (statusCode == 307) { return true }
+    if (statusCode == 308) { return true }
+    return false
+}
+
+// Determine the method to use after a redirect (per RFC 9110 and browser conventions)
+// 303 always changes to GET; 301/302 with POST also change to GET
+// 307/308 preserve the original method
+fun httpRedirectMethod(statusCode: Int, originalMethod: String): String {
+    // 303 See Other: always change to GET
+    if (statusCode == 303) { return "GET" }
+
+    // 301 Moved Permanently / 302 Found: change POST to GET (browser convention)
+    if (statusCode == 301) {
+        if (originalMethod == "POST") { return "GET" }
+    }
+    if (statusCode == 302) {
+        if (originalMethod == "POST") { return "GET" }
+    }
+
+    // 307 Temporary Redirect / 308 Permanent Redirect: preserve method
+    return originalMethod
+}
+
+// Determine if the body should be preserved after a redirect
+// Body is dropped when method changes to GET
+fun httpRedirectPreservesBody(statusCode: Int, originalMethod: String): Bool {
+    val newMethod = httpRedirectMethod(statusCode, originalMethod)
+    if (newMethod != originalMethod) { return false }
+    if (newMethod == "GET") { return false }
+    if (newMethod == "HEAD") { return false }
+    return true
+}
+
+// Resolve a possibly-relative Location URL against the original request URL
+fun httpResolveRedirectUrl(originalUrl: String, location: String): String {
+    // If location starts with "http://" or "https://", it is absolute
+    if (stringLength(location) >= 7) {
+        val prefix7 = substring(location, 0, 7)
+        if (urlToLower(prefix7) == "http://") { return location }
+    }
+    if (stringLength(location) >= 8) {
+        val prefix8 = substring(location, 0, 8)
+        if (urlToLower(prefix8) == "https://") { return location }
+    }
+
+    // Relative URL — resolve against original
+    val scheme = urlExtractScheme(originalUrl)
+    val host = urlExtractHost(originalUrl)
+    val port = urlExtractPort(originalUrl)
+
+    var base: String = stringConcat(scheme, "://")
+    base = stringConcat(base, host)
+
+    // Include port only if non-default
+    var includePort: Bool = true
+    if (scheme == "http") {
+        if (port == 80) { includePort = false }
+    }
+    if (scheme == "https") {
+        if (port == 443) { includePort = false }
+    }
+    if (includePort) {
+        base = stringConcat(base, stringConcat(":", toString(port)))
+    }
+
+    // If location starts with "/", it is absolute path
+    if (stringLength(location) > 0) {
+        if (charCodeAt(location, 0) == 47) {
+            return stringConcat(base, location)
+        }
+    }
+
+    // Otherwise, resolve relative to the original path
+    val originalPath = urlExtractPath(originalUrl)
+    val lastSlash = httpLastIndexOfChar(originalPath, 47)
+    if (lastSlash >= 0) {
+        val parentPath = substring(originalPath, 0, lastSlash + 1)
+        return stringConcat(base, stringConcat(parentPath, location))
+    }
+
+    return stringConcat(base, stringConcat("/", location))
+}
+
+// Follow redirects for an HTTP request (RFC 9110 Section 15.4)
+// Makes the initial request and follows 3xx redirects up to maxRedirects times
+// Detects redirect loops by tracking visited URLs (Gap 13)
+fun httpFollowRedirects(method: String, url: String, body: String, contentType: String, maxRedirects: Int): Map {
+    var currentMethod: String = method
+    var currentUrl: String = url
+    var currentBody: String = body
+    var redirectCount: Int = 0
+
+    // == Gap 13: Track visited URLs for loop detection ==
+    val visitedUrls = listCreate()
+    listAppend(visitedUrls, currentUrl)
+
+    var headers: Map = mapCreate()
+    if (stringLength(contentType) > 0) {
+        mapPut(headers, "Content-Type", contentType)
+    }
+
+    var resp: Map = httpRequest(currentMethod, currentUrl, headers, currentBody)
+
+    var followDone: Bool = false
+    while (followDone == false) {
+        val status = httpStatus(resp)
+        if (httpIsRedirect(status) == false) {
+            followDone = true
+        } else {
+            if (redirectCount >= maxRedirects) {
+                mapPut(resp, "error", stringConcat("Too many redirects (max ", stringConcat(toString(maxRedirects), ")")))
+                followDone = true
+            } else {
+                val location = httpHeader(resp, "Location")
+                if (stringLength(location) == 0) {
+                    mapPut(resp, "error", "Redirect response missing Location header")
+                    followDone = true
+                } else {
+                    // Resolve the redirect URL
+                    currentUrl = httpResolveRedirectUrl(currentUrl, location)
+
+                    // == Gap 13: Check for redirect loop ==
+                    if (listContains(visitedUrls, currentUrl)) {
+                        mapPut(resp, "error", stringConcat("Redirect loop detected: ", currentUrl))
+                        followDone = true
+                    } else {
+                        listAppend(visitedUrls, currentUrl)
+
+                        // Determine new method and body
+                        val newMethod = httpRedirectMethod(status, currentMethod)
+                        if (httpRedirectPreservesBody(status, currentMethod)) {
+                            // Keep body and content type
+                        } else {
+                            currentBody = ""
+                            headers = mapCreate()
+                        }
+                        currentMethod = newMethod
+
+                        // Rebuild headers for new request
+                        if (stringLength(currentBody) > 0) {
+                            if (stringLength(contentType) > 0) {
+                                headers = mapCreate()
+                                mapPut(headers, "Content-Type", contentType)
+                            }
+                        }
+
+                        resp = httpRequest(currentMethod, currentUrl, headers, currentBody)
+                        redirectCount = redirectCount + 1
+                    }
+                }
+            }
+        }
+    }
+
+    // Store the final URL and redirect count in the response
+    mapPut(resp, "finalUrl", currentUrl)
+    mapPut(resp, "redirectCount", redirectCount)
+    return resp
+}
+
+// Convenience: follow redirects with default max (10)
+fun httpGetFollowRedirects(url: String): Map {
+    return httpFollowRedirects("GET", url, "", "", HTTP_MAX_REDIRECTS())
+}
+
+// Convenience: POST with redirect following
+fun httpPostFollowRedirects(url: String, body: String, contentType: String): Map {
+    return httpFollowRedirects("POST", url, body, contentType, HTTP_MAX_REDIRECTS())
+}
+
+// == Expect: 100-Continue (RFC 9110 Section 10.1.1) ===========================
+
+// Enable or disable Expect: 100-continue behavior
+fun httpSetExpectContinue(enable: Bool): Unit {
+    httpExpectContinueEnabled = enable
+}
+
+// Check if Expect: 100-continue is currently enabled
+fun httpGetExpectContinue(): Bool {
+    return httpExpectContinueEnabled
+}
+
+// Send an HTTP request with Expect: 100-continue support over raw TCP
+// If enabled and body is large, sends headers with Expect first, waits for 100, then sends body
+fun httpRequestRawWithExpect(method: String, url: String, headers: Map, body: String): Map {
+    val result = mapCreate()
+    val respHeaders = mapCreate()
+    mapPut(result, "headers", respHeaders)
+    mapPut(result, "method", method)
+
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val scheme = urlExtractScheme(url)
+    val path = httpExtractRequestTarget(url)
+
+    if (stringLength(host) == 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Invalid URL: no host")
+        return result
+    }
+
+    val fd = tcpConnect(host, port)
+    if (fd < 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", stringConcat("Connection failed to ", host))
+        return result
+    }
+
+    val useExpect = httpShouldUseExpect(body)
+
+    // Build request headers
+    val hostHeader = httpBuildHostHeader(host, port, scheme)
+    var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", hostHeader), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("User-Agent: ", HTTP_USER_AGENT()), "\r\n"))
+
+    // Add custom headers
+    val hdrKeys = mapKeys(headers)
+    var hi: Int = 0
+    while (hi < listSize(hdrKeys)) {
+        val k = toString(listGet(hdrKeys, hi))
+        val v = toString(mapGet(headers, k))
+        req = stringConcat(req, stringConcat(stringConcat(stringConcat(k, ": "), v), "\r\n"))
+        hi = hi + 1
+    }
+
+    // Content-Length for body
+    if (stringLength(body) > 0) {
+        req = stringConcat(req, stringConcat(stringConcat("Content-Length: ", toString(stringLength(body))), "\r\n"))
+    }
+
+    // Add Expect header if applicable
+    if (useExpect) {
+        req = stringConcat(req, "Expect: 100-continue\r\n")
+    }
+
+    req = stringConcat(req, "Connection: close\r\n")
+    req = stringConcat(req, "\r\n")
+
+    if (useExpect) {
+        // Send headers only first
+        val sent = tcpSend(fd, req)
+        if (sent < 0) {
+            tcpClose(fd)
+            mapPut(result, "status", 0)
+            mapPut(result, "body", "")
+            mapPut(result, "error", "Send failed")
+            return result
+        }
+
+        // Wait for 100 Continue response
+        val continueResp = tcpRecv(fd, 4096)
+        val continueOk = httpParseExpectResponse(continueResp)
+
+        if (continueOk) {
+            // Server sent 100 Continue — now send the body
+            val bodySent = tcpSend(fd, body)
+            if (bodySent < 0) {
+                tcpClose(fd)
+                mapPut(result, "status", 0)
+                mapPut(result, "body", "")
+                mapPut(result, "error", "Body send failed after 100-continue")
+                return result
+            }
+        } else {
+            // Server sent a final response instead of 100 — parse it
+            tcpClose(fd)
+            httpParseResponse(continueResp, result, respHeaders)
+            return result
+        }
+    } else {
+        // Send headers + body together
+        req = stringConcat(req, body)
+        val sent = tcpSend(fd, req)
+        if (sent < 0) {
+            tcpClose(fd)
+            mapPut(result, "status", 0)
+            mapPut(result, "body", "")
+            mapPut(result, "error", "Send failed")
+            return result
+        }
+    }
+
+    // Receive response
+    var response: String = ""
+    var recvDone: Bool = false
+    var iterations: Int = 0
+    while (recvDone == false) {
+        if (iterations > HTTP_MAX_RECV_ITERATIONS()) {
+            recvDone = true
+        } else {
+            if (stringLength(response) > HTTP_MAX_RESPONSE_SIZE()) {
+                recvDone = true
+            } else {
+                val chunk = tcpRecv(fd, 8192)
+                if (stringLength(chunk) == 0) {
+                    recvDone = true
+                } else {
+                    response = stringConcat(response, chunk)
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+    tcpClose(fd)
+
+    httpParseResponse(response, result, respHeaders)
+    return result
+}
+
+// Send an HTTPS request with Expect: 100-continue support
+fun httpRequestSecureWithExpect(method: String, url: String, headers: Map, body: String): Map {
+    val result = mapCreate()
+    val respHeaders = mapCreate()
+    mapPut(result, "headers", respHeaders)
+    mapPut(result, "method", method)
+
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val scheme = urlExtractScheme(url)
+    val path = httpExtractRequestTarget(url)
+
+    if (stringLength(host) == 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Invalid URL: no host")
+        return result
+    }
+
+    val ctx = tlsCreateContext()
+    if (ctx < 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", "Failed to create TLS context")
+        return result
+    }
+    tlsSetVerifyPeer(ctx, 1)
+
+    val conn = tlsConnect(ctx, host, port)
+    if (conn < 0) {
+        mapPut(result, "status", 0)
+        mapPut(result, "body", "")
+        mapPut(result, "error", stringConcat("TLS connection failed to ", host))
+        return result
+    }
+
+    val useExpect = httpShouldUseExpect(body)
+
+    // Build request headers
+    val hostHeader = httpBuildHostHeader(host, port, scheme)
+    var req: String = stringConcat(stringConcat(method, " "), stringConcat(path, " HTTP/1.1\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("Host: ", hostHeader), "\r\n"))
+    req = stringConcat(req, stringConcat(stringConcat("User-Agent: ", HTTP_USER_AGENT()), "\r\n"))
+
+    val hdrKeys = mapKeys(headers)
+    var hi: Int = 0
+    while (hi < listSize(hdrKeys)) {
+        val k = toString(listGet(hdrKeys, hi))
+        val v = toString(mapGet(headers, k))
+        req = stringConcat(req, stringConcat(stringConcat(stringConcat(k, ": "), v), "\r\n"))
+        hi = hi + 1
+    }
+
+    if (stringLength(body) > 0) {
+        req = stringConcat(req, stringConcat(stringConcat("Content-Length: ", toString(stringLength(body))), "\r\n"))
+    }
+
+    if (useExpect) {
+        req = stringConcat(req, "Expect: 100-continue\r\n")
+    }
+
+    req = stringConcat(req, "Connection: close\r\n")
+    req = stringConcat(req, "\r\n")
+
+    if (useExpect) {
+        val sent = tlsSend(conn, req)
+        if (sent < 0) {
+            tlsClose(conn)
+            mapPut(result, "status", 0)
+            mapPut(result, "body", "")
+            mapPut(result, "error", "TLS send failed")
+            return result
+        }
+
+        val continueResp = tlsRecv(conn, 4096)
+        val continueOk = httpParseExpectResponse(continueResp)
+
+        if (continueOk) {
+            val bodySent = tlsSend(conn, body)
+            if (bodySent < 0) {
+                tlsClose(conn)
+                mapPut(result, "status", 0)
+                mapPut(result, "body", "")
+                mapPut(result, "error", "TLS body send failed after 100-continue")
+                return result
+            }
+        } else {
+            tlsClose(conn)
+            httpParseResponse(continueResp, result, respHeaders)
+            return result
+        }
+    } else {
+        req = stringConcat(req, body)
+        val sent = tlsSend(conn, req)
+        if (sent < 0) {
+            tlsClose(conn)
+            mapPut(result, "status", 0)
+            mapPut(result, "body", "")
+            mapPut(result, "error", "TLS send failed")
+            return result
+        }
+    }
+
+    var response: String = ""
+    var recvDone: Bool = false
+    var iterations: Int = 0
+    while (recvDone == false) {
+        if (iterations > HTTP_MAX_RECV_ITERATIONS()) {
+            recvDone = true
+        } else {
+            if (stringLength(response) > HTTP_MAX_RESPONSE_SIZE()) {
+                recvDone = true
+            } else {
+                val chunk = tlsRecv(conn, 8192)
+                if (stringLength(chunk) == 0) {
+                    recvDone = true
+                } else {
+                    response = stringConcat(response, chunk)
+                }
+            }
+        }
+        iterations = iterations + 1
+    }
+    tlsClose(conn)
+
+    httpParseResponse(response, result, respHeaders)
+    return result
+}
+
+// Determine if Expect: 100-continue should be used for this request body
+fun httpShouldUseExpect(body: String): Bool {
+    if (httpExpectContinueEnabled == false) { return false }
+    if (stringLength(body) > HTTP_EXPECT_THRESHOLD()) { return true }
+    return false
+}
+
+// Parse the initial response to check for "100 Continue" status
+// Returns true if the response starts with "HTTP/1.1 100" or "HTTP/1.0 100"
+fun httpParseExpectResponse(response: String): Bool {
+    if (stringLength(response) < 12) { return false }
+    val statusLine = substring(response, 0, 12)
+    if (stringContains(statusLine, "100")) { return true }
+    return false
+}
+
+// Wrapper: send HTTP request with Expect: 100-continue support when enabled
+fun httpRequestWithExpect(method: String, url: String, headers: Map, body: String): Map {
+    if (httpExpectContinueEnabled) {
+        val scheme = urlExtractScheme(url)
+        if (scheme == "https") {
+            return httpRequestSecureWithExpect(method, url, headers, body)
+        }
+        return httpRequestRawWithExpect(method, url, headers, body)
+    }
+    return httpRequest(method, url, headers, body)
 }

@@ -1,0 +1,1222 @@
+// Tests for rockit.encoding.qpack
+import rockit.testing.probe
+import rockit.encoding.qpack
+import rockit.encoding.hpack
+
+// == Static Table (RFC 9204 Appendix A) =======================================
+
+@Test fun testQpackStaticSize() {
+    assertEquals(99, qpackStaticSize())
+}
+
+@Test fun testQpackStaticEntry0() {
+    assertEqualsStr(":authority", qpackStaticName(0))
+    assertEqualsStr("", qpackStaticValue(0))
+}
+
+@Test fun testQpackStaticEntry1() {
+    assertEqualsStr(":path", qpackStaticName(1))
+    assertEqualsStr("/", qpackStaticValue(1))
+}
+
+@Test fun testQpackStaticEntry15() {
+    assertEqualsStr(":method", qpackStaticName(15))
+    assertEqualsStr("CONNECT", qpackStaticValue(15))
+}
+
+@Test fun testQpackStaticEntry17() {
+    assertEqualsStr(":method", qpackStaticName(17))
+    assertEqualsStr("GET", qpackStaticValue(17))
+}
+
+@Test fun testQpackStaticEntry20() {
+    assertEqualsStr(":method", qpackStaticName(20))
+    assertEqualsStr("POST", qpackStaticValue(20))
+}
+
+@Test fun testQpackStaticEntry22() {
+    assertEqualsStr(":scheme", qpackStaticName(22))
+    assertEqualsStr("http", qpackStaticValue(22))
+}
+
+@Test fun testQpackStaticEntry23() {
+    assertEqualsStr(":scheme", qpackStaticName(23))
+    assertEqualsStr("https", qpackStaticValue(23))
+}
+
+@Test fun testQpackStaticEntry25() {
+    assertEqualsStr(":status", qpackStaticName(25))
+    assertEqualsStr("200", qpackStaticValue(25))
+}
+
+@Test fun testQpackStaticEntry46() {
+    assertEqualsStr("content-type", qpackStaticName(46))
+    assertEqualsStr("application/json", qpackStaticValue(46))
+}
+
+@Test fun testQpackStaticEntry61() {
+    assertEqualsStr("x-content-type-options", qpackStaticName(61))
+    assertEqualsStr("nosniff", qpackStaticValue(61))
+}
+
+@Test fun testQpackStaticEntry98() {
+    assertEqualsStr("x-frame-options", qpackStaticName(98))
+    assertEqualsStr("sameorigin", qpackStaticValue(98))
+}
+
+@Test fun testQpackStaticOutOfRange() {
+    assertEqualsStr("", qpackStaticName(99))
+    assertEqualsStr("", qpackStaticValue(99))
+}
+
+// == Static Table Lookup ======================================================
+
+@Test fun testQpackStaticLookupExact() {
+    assertEquals(17, qpackStaticLookup(":method", "GET"))
+    assertEquals(20, qpackStaticLookup(":method", "POST"))
+    assertEquals(1, qpackStaticLookup(":path", "/"))
+    assertEquals(25, qpackStaticLookup(":status", "200"))
+    assertEquals(23, qpackStaticLookup(":scheme", "https"))
+}
+
+@Test fun testQpackStaticLookupNoMatch() {
+    assertEquals(0 - 1, qpackStaticLookup("x-custom", "value"))
+}
+
+@Test fun testQpackStaticLookupNameOnly() {
+    assertEquals(0, qpackStaticLookupName(":authority"))
+    assertEquals(1, qpackStaticLookupName(":path"))
+    assertEquals(15, qpackStaticLookupName(":method"))
+    assertEquals(0 - 1, qpackStaticLookupName("x-custom"))
+}
+
+// == Dynamic Table ============================================================
+
+@Test fun testQpackCreateEncoder() {
+    val enc = qpackCreateEncoder(4096)
+    assertEquals(0, qpackDynamicTableLength(enc))
+    assertEquals(0, qpackDynamicTableSize(enc))
+}
+
+@Test fun testQpackCreateDecoder() {
+    val dec = qpackCreateDecoder(4096)
+    assertEquals(0, qpackDynamicTableLength(dec))
+    assertEquals(0, qpackDynamicTableSize(dec))
+}
+
+@Test fun testQpackDynamicAdd() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "custom-header", "custom-value")
+    assertEquals(1, qpackDynamicTableLength(enc))
+    // Size = 13 + 12 + 32 = 57
+    assertEquals(57, qpackDynamicTableSize(enc))
+}
+
+@Test fun testQpackDynamicMultipleEntries() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "name1", "val1")
+    qpackDynamicAdd(enc, "name2", "val2")
+    qpackDynamicAdd(enc, "name3", "val3")
+    assertEquals(3, qpackDynamicTableLength(enc))
+    // Each: 5 + 4 + 32 = 41, total = 123
+    assertEquals(123, qpackDynamicTableSize(enc))
+}
+
+@Test fun testQpackDynamicEviction() {
+    val enc = qpackCreateEncoder(100)
+    qpackDynamicAdd(enc, "name1", "val1")  // 41
+    qpackDynamicAdd(enc, "name2", "val2")  // 41, total=82
+    assertEquals(2, qpackDynamicTableLength(enc))
+    qpackDynamicAdd(enc, "name3", "val3")  // Would be 123, evicts oldest
+    assertEquals(2, qpackDynamicTableLength(enc))
+    assertEquals(82, qpackDynamicTableSize(enc))
+}
+
+@Test fun testQpackDynamicSetCapacity() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "name1", "val1")  // 41
+    qpackDynamicAdd(enc, "name2", "val2")  // 41
+    qpackDynamicAdd(enc, "name3", "val3")  // 41, total=123
+    assertEquals(3, qpackDynamicTableLength(enc))
+    qpackDynamicSetCapacity(enc, 50)
+    assertEquals(1, qpackDynamicTableLength(enc))
+    assertEquals(41, qpackDynamicTableSize(enc))
+}
+
+@Test fun testQpackDynamicSetCapacityToZero() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "name1", "val1")
+    qpackDynamicAdd(enc, "name2", "val2")
+    qpackDynamicSetCapacity(enc, 0)
+    assertEquals(0, qpackDynamicTableLength(enc))
+    assertEquals(0, qpackDynamicTableSize(enc))
+}
+
+// == Dynamic Table Absolute Indexing ==========================================
+
+@Test fun testQpackDynamicLookupAbsolute() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "first", "aaa")   // absIdx = 0
+    qpackDynamicAdd(enc, "second", "bbb")  // absIdx = 1
+    qpackDynamicAdd(enc, "third", "ccc")   // absIdx = 2
+    // Absolute index 0 = first inserted
+    val e0 = qpackDynamicLookup(enc, 0)
+    assertEqualsStr("first", toString(mapGet(e0, "name")))
+    assertEqualsStr("aaa", toString(mapGet(e0, "value")))
+    // Absolute index 2 = last inserted
+    val e2 = qpackDynamicLookup(enc, 2)
+    assertEqualsStr("third", toString(mapGet(e2, "name")))
+    assertEqualsStr("ccc", toString(mapGet(e2, "value")))
+}
+
+@Test fun testQpackDynamicLookupInvalid() {
+    val enc = qpackCreateEncoder(4096)
+    val entry = qpackDynamicLookup(enc, 0)
+    assertEqualsStr("", toString(mapGet(entry, "name")))
+}
+
+// == Encoder Stream Instructions ==============================================
+
+@Test fun testQpackSetDynamicTableCapacity() {
+    val enc = qpackCreateEncoder(4096)
+    val instruction = qpackSetDynamicTableCapacity(enc, 256)
+    // 001xxxxx prefix, 5-bit prefix
+    // 256 > 31 (max 5-bit), so multi-byte
+    val firstByte = charCodeAt(instruction, 0)
+    // High 3 bits should be 001 = 32
+    val prefix = firstByte / 32
+    assertEquals(1, prefix)
+}
+
+@Test fun testQpackInsertWithStaticNameRef() {
+    val enc = qpackCreateEncoder(4096)
+    // Insert :authority (static idx 0) with value "example.com"
+    val instruction = qpackInsertWithNameRef(enc, true, 0, "example.com")
+    // Should start with 11xxxxxx (192 prefix)
+    val firstByte = charCodeAt(instruction, 0)
+    val prefix = firstByte / 64
+    assertEquals(3, prefix)  // 11 = 3
+    // Entry should be in dynamic table
+    assertEquals(1, qpackDynamicTableLength(enc))
+    val entry = qpackDynamicLookup(enc, 0)
+    assertEqualsStr(":authority", toString(mapGet(entry, "name")))
+    assertEqualsStr("example.com", toString(mapGet(entry, "value")))
+}
+
+@Test fun testQpackInsertWithLiteralName() {
+    val enc = qpackCreateEncoder(4096)
+    val instruction = qpackInsertWithLiteral(enc, "x-custom", "test-val")
+    // Should start with 01xxxxxx (64 prefix region)
+    val firstByte = charCodeAt(instruction, 0)
+    val prefix = firstByte / 32
+    assertEquals(2, prefix)  // 010 = 2
+    assertEquals(1, qpackDynamicTableLength(enc))
+}
+
+@Test fun testQpackDuplicate() {
+    val enc = qpackCreateEncoder(4096)
+    qpackDynamicAdd(enc, "original", "value1")
+    // Duplicate absolute index 0
+    val instruction = qpackDuplicate(enc, 0)
+    assertEquals(2, qpackDynamicTableLength(enc))
+    // Newest entry should be the duplicate
+    val entry = qpackDynamicLookup(enc, 1)
+    assertEqualsStr("original", toString(mapGet(entry, "name")))
+    assertEqualsStr("value1", toString(mapGet(entry, "value")))
+}
+
+// == Decoder Stream Instructions ==============================================
+
+@Test fun testQpackSectionAck() {
+    // 1xxxxxxx format, 7-bit prefix
+    val ack = qpackSectionAck(4)
+    assertEquals(1, stringLength(ack))
+    assertEquals(132, charCodeAt(ack, 0))  // 128 + 4
+}
+
+@Test fun testQpackStreamCancel() {
+    // 01xxxxxx format, 6-bit prefix
+    val cancel = qpackStreamCancel(8)
+    assertEquals(1, stringLength(cancel))
+    assertEquals(72, charCodeAt(cancel, 0))  // 64 + 8
+}
+
+@Test fun testQpackInsertCountIncrement() {
+    // 00xxxxxx format, 6-bit prefix
+    val increment = qpackInsertCountIncrement(5)
+    assertEquals(1, stringLength(increment))
+    assertEquals(5, charCodeAt(increment, 0))
+}
+
+// == Field Section Prefix =====================================================
+
+@Test fun testQpackEncodePrefixNoInserts() {
+    // reqInsertCount=0, base=0 → encoded RIC=0, deltaBase=0, sign=0
+    val prefix = qpackEncodePrefix(0, 0, 4096)
+    assertEquals(2, stringLength(prefix))
+    assertEquals(0, charCodeAt(prefix, 0))  // Encoded RIC = 0
+    assertEquals(0, charCodeAt(prefix, 1))  // S=0, deltaBase=0
+}
+
+@Test fun testQpackDecodePrefixNoInserts() {
+    val prefix = qpackEncodePrefix(0, 0, 4096)
+    val result = qpackDecodePrefix(prefix, 0, 0, 4096)
+    assertEquals(0, toInt(mapGet(result, "reqInsertCount")))
+    assertEquals(0, toInt(mapGet(result, "base")))
+}
+
+@Test fun testQpackPrefixRoundtrip() {
+    val prefix = qpackEncodePrefix(3, 3, 4096)
+    val result = qpackDecodePrefix(prefix, 0, 3, 4096)
+    assertEquals(3, toInt(mapGet(result, "reqInsertCount")))
+    assertEquals(3, toInt(mapGet(result, "base")))
+}
+
+// == Field Section Encoding ===================================================
+
+@Test fun testQpackEncodeStaticIndexed() {
+    // Encode :method GET → should use static indexed (index 17)
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    // Prefix (2 bytes: RIC=0, deltaBase=0) + indexed field line
+    assertGreaterThan(stringLength(encoded), 2)
+    // Byte at offset 2 should be indexed static: 11xxxxxx
+    val fieldByte = charCodeAt(encoded, 2)
+    val prefix = fieldByte / 64
+    assertEquals(3, prefix)  // 11 = 3 (indexed static)
+}
+
+@Test fun testQpackEncodeStaticNameRef() {
+    // Encode :authority = example.com → static name ref (index 0)
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":authority")
+    mapPut(h, "value", "example.com")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    // Prefix (2 bytes) + literal with name ref
+    assertGreaterThan(stringLength(encoded), 2)
+    // Byte at offset 2 should be literal with static name ref: 0101xxxx
+    val fieldByte = charCodeAt(encoded, 2)
+    val prefix = fieldByte / 16
+    assertEquals(5, prefix)  // 0101 = 5
+}
+
+@Test fun testQpackEncodeLiteralName() {
+    // Encode x-custom = hello → literal with literal name
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "x-custom")
+    mapPut(h, "value", "hello")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    // Prefix (2 bytes) + literal with literal name
+    assertGreaterThan(stringLength(encoded), 2)
+    // Byte at offset 2 should be literal with literal name: 001xxxxx
+    val fieldByte = charCodeAt(encoded, 2)
+    val prefix = fieldByte / 32
+    assertEquals(1, prefix)  // 001 = 1
+}
+
+// == Field Section Roundtrip ==================================================
+
+@Test fun testQpackEncodeDecodeStaticIndexed() {
+    val enc = qpackCreateEncoder(4096)
+    val dec = qpackCreateDecoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    val decResult = qpackDecode(dec, encoded, "")
+    val decoded = mapGet(decResult, "headers")
+    assertEquals(1, listSize(decoded))
+    assertEqualsStr(":method", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(decoded, 0), "value")))
+}
+
+@Test fun testQpackEncodeDecodeMultipleHeaders() {
+    val enc = qpackCreateEncoder(4096)
+    val dec = qpackCreateDecoder(4096)
+    val headers = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":method")
+    mapPut(h1, "value", "GET")
+    listAppend(headers, h1)
+    val h2 = mapCreate()
+    mapPut(h2, "name", ":scheme")
+    mapPut(h2, "value", "https")
+    listAppend(headers, h2)
+    val h3 = mapCreate()
+    mapPut(h3, "name", ":path")
+    mapPut(h3, "value", "/")
+    listAppend(headers, h3)
+    val h4 = mapCreate()
+    mapPut(h4, "name", ":authority")
+    mapPut(h4, "value", "example.com")
+    listAppend(headers, h4)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    val decResult = qpackDecode(dec, encoded, "")
+    val decoded = mapGet(decResult, "headers")
+    assertEquals(4, listSize(decoded))
+    assertEqualsStr(":method", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(decoded, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(decoded, 1), "name")))
+    assertEqualsStr("https", toString(mapGet(listGet(decoded, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(decoded, 2), "name")))
+    assertEqualsStr("/", toString(mapGet(listGet(decoded, 2), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(decoded, 3), "name")))
+    assertEqualsStr("example.com", toString(mapGet(listGet(decoded, 3), "value")))
+}
+
+@Test fun testQpackEncodeDecodeLiteralName() {
+    val enc = qpackCreateEncoder(4096)
+    val dec = qpackCreateDecoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "x-custom-header")
+    mapPut(h, "value", "custom-value")
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    val decResult = qpackDecode(dec, encoded, "")
+    val decoded = mapGet(decResult, "headers")
+    assertEquals(1, listSize(decoded))
+    assertEqualsStr("x-custom-header", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("custom-value", toString(mapGet(listGet(decoded, 0), "value")))
+}
+
+@Test fun testQpackEncodeDecodeMixedHeaders() {
+    val enc = qpackCreateEncoder(4096)
+    val dec = qpackCreateDecoder(4096)
+    val headers = listCreate()
+    // Static exact match
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":status")
+    mapPut(h1, "value", "200")
+    listAppend(headers, h1)
+    // Static name ref
+    val h2 = mapCreate()
+    mapPut(h2, "name", "content-type")
+    mapPut(h2, "value", "text/html")
+    listAppend(headers, h2)
+    // Literal name
+    val h3 = mapCreate()
+    mapPut(h3, "name", "x-request-id")
+    mapPut(h3, "value", "abc123")
+    listAppend(headers, h3)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    val decResult = qpackDecode(dec, encoded, "")
+    val decoded = mapGet(decResult, "headers")
+    assertEquals(3, listSize(decoded))
+    assertEqualsStr(":status", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("200", toString(mapGet(listGet(decoded, 0), "value")))
+    assertEqualsStr("content-type", toString(mapGet(listGet(decoded, 1), "name")))
+    assertEqualsStr("text/html", toString(mapGet(listGet(decoded, 1), "value")))
+    assertEqualsStr("x-request-id", toString(mapGet(listGet(decoded, 2), "name")))
+    assertEqualsStr("abc123", toString(mapGet(listGet(decoded, 2), "value")))
+}
+
+// == Encoder Stream Processing ================================================
+
+@Test fun testQpackProcessEncoderStreamInsertStatic() {
+    // Build encoder stream instruction: insert with static name ref
+    val enc = qpackCreateEncoder(4096)
+    val instruction = qpackInsertWithNameRef(enc, true, 0, "test.com")
+    // Process on decoder side
+    val dec = qpackCreateDecoder(4096)
+    qpackProcessEncoderStream(dec, instruction)
+    assertEquals(1, qpackDynamicTableLength(dec))
+    val entry = qpackDynamicLookup(dec, 0)
+    assertEqualsStr(":authority", toString(mapGet(entry, "name")))
+    assertEqualsStr("test.com", toString(mapGet(entry, "value")))
+}
+
+@Test fun testQpackProcessEncoderStreamInsertLiteral() {
+    val enc = qpackCreateEncoder(4096)
+    val instruction = qpackInsertWithLiteral(enc, "x-test", "val1")
+    val dec = qpackCreateDecoder(4096)
+    qpackProcessEncoderStream(dec, instruction)
+    assertEquals(1, qpackDynamicTableLength(dec))
+    val entry = qpackDynamicLookup(dec, 0)
+    assertEqualsStr("x-test", toString(mapGet(entry, "name")))
+    assertEqualsStr("val1", toString(mapGet(entry, "value")))
+}
+
+@Test fun testQpackProcessEncoderStreamCapacity() {
+    val enc = qpackCreateEncoder(4096)
+    val instruction = qpackSetDynamicTableCapacity(enc, 128)
+    val dec = qpackCreateDecoder(4096)
+    qpackDynamicAdd(dec, "name1", "val1")  // 41
+    qpackDynamicAdd(dec, "name2", "val2")  // 41
+    qpackDynamicAdd(dec, "name3", "val3")  // 41, total=123
+    assertEquals(3, qpackDynamicTableLength(dec))
+    // Process capacity change to 128 — all 3 fit (123 < 128)
+    qpackProcessEncoderStream(dec, instruction)
+    assertEquals(3, qpackDynamicTableLength(dec))
+}
+
+// == Error Handling ===========================================================
+
+@Test fun testQpackError() {
+    val err = qpackError("test error")
+    assertTrue(qpackIsError(err))
+    assertEqualsStr("test error", toString(mapGet(err, "error")))
+}
+
+@Test fun testQpackNotError() {
+    val result = mapCreate()
+    mapPut(result, "type", "QPACK_OK")
+    assertFalse(qpackIsError(result))
+}
+
+// == RFC 9204 Appendix B Test Vectors =========================================
+
+@Test fun testQpackStaticTableEntryCount() {
+    // RFC 9204 Appendix A specifies exactly 99 entries (0-98)
+    assertEquals(99, qpackStaticSize())
+    // Entry 0 exists
+    assertStringNotEmpty(qpackStaticName(0))
+    // Entry 98 exists
+    assertStringNotEmpty(qpackStaticName(98))
+    // Entry 99 does not exist
+    assertStringEmpty(qpackStaticName(99))
+}
+
+@Test fun testQpackStaticTableMethodEntries() {
+    // RFC 9204 Appendix A: :method entries at indices 15-21
+    assertEqualsStr("CONNECT", qpackStaticValue(15))
+    assertEqualsStr("DELETE", qpackStaticValue(16))
+    assertEqualsStr("GET", qpackStaticValue(17))
+    assertEqualsStr("HEAD", qpackStaticValue(18))
+    assertEqualsStr("OPTIONS", qpackStaticValue(19))
+    assertEqualsStr("POST", qpackStaticValue(20))
+    assertEqualsStr("PUT", qpackStaticValue(21))
+}
+
+@Test fun testQpackStaticTableStatusEntries() {
+    // RFC 9204 Appendix A: :status entries
+    assertEqualsStr("103", qpackStaticValue(24))
+    assertEqualsStr("200", qpackStaticValue(25))
+    assertEqualsStr("304", qpackStaticValue(26))
+    assertEqualsStr("404", qpackStaticValue(27))
+    assertEqualsStr("503", qpackStaticValue(28))
+    // Additional status codes at indices 63-71
+    assertEqualsStr("100", qpackStaticValue(63))
+    assertEqualsStr("204", qpackStaticValue(64))
+    assertEqualsStr("206", qpackStaticValue(65))
+    assertEqualsStr("302", qpackStaticValue(66))
+    assertEqualsStr("400", qpackStaticValue(67))
+    assertEqualsStr("403", qpackStaticValue(68))
+    assertEqualsStr("421", qpackStaticValue(69))
+    assertEqualsStr("425", qpackStaticValue(70))
+    assertEqualsStr("500", qpackStaticValue(71))
+}
+
+@Test fun testQpackStaticTableContentTypeEntries() {
+    // RFC 9204 Appendix A: content-type entries at indices 44-54
+    assertEqualsStr("application/dns-message", qpackStaticValue(44))
+    assertEqualsStr("application/javascript", qpackStaticValue(45))
+    assertEqualsStr("application/json", qpackStaticValue(46))
+    assertEqualsStr("application/x-www-form-urlencoded", qpackStaticValue(47))
+    assertEqualsStr("image/gif", qpackStaticValue(48))
+    assertEqualsStr("image/jpeg", qpackStaticValue(49))
+    assertEqualsStr("image/png", qpackStaticValue(50))
+    assertEqualsStr("text/css", qpackStaticValue(51))
+    assertEqualsStr("text/html; charset=utf-8", qpackStaticValue(52))
+    assertEqualsStr("text/plain", qpackStaticValue(53))
+    assertEqualsStr("text/plain;charset=utf-8", qpackStaticValue(54))
+}
+
+@Test fun testQpackVectorStaticIndexedPath() {
+    // Encoding :path = / should produce static indexed reference to entry 1
+    // Indexed field line (static): 11 T=1 index
+    // Index 1 with 6-bit prefix, T=1: 0xc0 | 1 = 193
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":path")
+    mapPut(h, "value", "/")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    // After 2-byte prefix, the indexed ref byte should be 193
+    assertEquals(193, charCodeAt(encoded, 2))
+}
+
+@Test fun testQpackVectorStaticIndexedStatus200() {
+    // :status = 200 → static index 25
+    // 0xc0 | 25 = 217
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":status")
+    mapPut(h, "value", "200")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    assertEquals(217, charCodeAt(encoded, 2))
+}
+
+@Test fun testQpackVectorStaticNameRefPathIndexHtml() {
+    // :path = /index.html → static name ref to :path (index 1)
+    // No exact match (/ vs /index.html), so literal with static name ref
+    // 0101 NNNN, 4-bit prefix: 0x50 | 1 = 81
+    val enc = qpackCreateEncoder(4096)
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":path")
+    mapPut(h, "value", "/index.html")
+    listAppend(headers, h)
+    val result = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(result, "encoded"))
+    // After 2-byte prefix, name ref byte should be 81
+    assertEquals(81, charCodeAt(encoded, 2))
+    // Following bytes: string length (11) + "/index.html"
+    assertEquals(11, charCodeAt(encoded, 3))
+}
+
+@Test fun testQpackEmptyEncode() {
+    val enc = qpackCreateEncoder(4096)
+    val dec = qpackCreateDecoder(4096)
+    val headers = listCreate()
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    // Should just be the 2-byte prefix
+    assertEquals(2, stringLength(encoded))
+    val decResult = qpackDecode(dec, encoded, "")
+    val decoded = mapGet(decResult, "headers")
+    assertEquals(0, listSize(decoded))
+}
+
+// == RFC 9204 Appendix B — Byte-Exact Test Vectors ============================
+
+// -- B.1: Literal Field Line With Name Reference ------------------------------
+
+@Test fun testRfcB1_LiteralFieldLineWithNameRef() {
+    // Field section bytes: 00 00 51 0b 2f 69 6e 64 65 78 2e 68 74 6d 6c
+    // Prefix: 00 00 (RIC=0, Base=0)
+    // 51 = 0101 0001 → literal with static name ref, index 1 (:path)
+    // 0b = 11 → value length
+    // followed by "/index.html"
+    val dec = qpackCreateDecoder(4096)
+    var buf: String = hpackByteToChar(0)    // RIC = 0
+    buf = stringConcat(buf, hpackByteToChar(0))    // DeltaBase = 0
+    buf = stringConcat(buf, hpackByteToChar(81))   // 0x51 static name ref idx 1
+    buf = stringConcat(buf, hpackByteToChar(11))   // 0x0b value length
+    buf = stringConcat(buf, "/index.html")
+    val result = qpackDecode(dec, buf, "")
+    val headers = mapGet(result, "headers")
+    assertEquals(1, listSize(headers))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("/index.html", toString(mapGet(listGet(headers, 0), "value")))
+}
+
+// -- B.2: Dynamic Table Insert + Post-Base Reference --------------------------
+
+@Test fun testRfcB2_DynamicTableAndPostBase() {
+    // Step 1: Build encoder stream with capacity + 2 inserts
+    // Set capacity 220: 001xxxxx → 0x3f 0xbd 0x01 (32 + 31=63 prefix, then 220-31=189...)
+    // Actually: hpackEncodeInt(220, 5, 32)
+    // Insert :authority=www.example.com: 0xc0 | 0 = 192, value "www.example.com"
+    // Insert :path=/sample/path: 0xc0 | 1 = 193, value "/sample/path"
+    val dec = qpackCreateDecoder(4096)
+
+    // Build encoder stream bytes
+    var encStream: String = hpackEncodeInt(220, 5, 32)  // set capacity
+    // Insert with static name ref 0 (:authority), value "www.example.com"
+    encStream = stringConcat(encStream, hpackByteToChar(192))  // 0xc0 static ref idx 0
+    encStream = stringConcat(encStream, hpackByteToChar(15))   // value length 15
+    encStream = stringConcat(encStream, "www.example.com")
+    // Insert with static name ref 1 (:path), value "/sample/path"
+    encStream = stringConcat(encStream, hpackByteToChar(193))  // 0xc1 static ref idx 1
+    encStream = stringConcat(encStream, hpackByteToChar(12))   // value length 12
+    encStream = stringConcat(encStream, "/sample/path")
+
+    // Process encoder stream on decoder
+    qpackProcessEncoderStream(dec, encStream)
+    assertEquals(2, qpackDynamicTableLength(dec))
+
+    // Verify dynamic table entries
+    val e0 = qpackDynamicLookup(dec, 0)
+    assertEqualsStr(":authority", toString(mapGet(e0, "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(e0, "value")))
+    val e1 = qpackDynamicLookup(dec, 1)
+    assertEqualsStr(":path", toString(mapGet(e1, "name")))
+    assertEqualsStr("/sample/path", toString(mapGet(e1, "value")))
+}
+
+@Test fun testRfcB2_PostBaseFieldSection() {
+    // Build decoder with 2 dynamic entries, then decode post-base field section
+    val dec = qpackCreateDecoder(4096)
+    var encStream: String = hpackEncodeInt(220, 5, 32)
+    encStream = stringConcat(encStream, hpackByteToChar(192))
+    encStream = stringConcat(encStream, hpackByteToChar(15))
+    encStream = stringConcat(encStream, "www.example.com")
+    encStream = stringConcat(encStream, hpackByteToChar(193))
+    encStream = stringConcat(encStream, hpackByteToChar(12))
+    encStream = stringConcat(encStream, "/sample/path")
+    qpackProcessEncoderStream(dec, encStream)
+
+    // Field section prefix: RIC=2, DeltaBase encodes base < RIC
+    // For post-base refs to abs idx 0 and 1, we need base=0
+    // RIC=2, base=0 → S=1, deltaBase = RIC - base - 1 = 1
+    // Encoded RIC = (2 mod (2*128)) + 1 = 3 (RFC 9204 Section 4.5.1)
+    // S=1, deltaBase=1 (7-bit prefix with S bit): 128 + 1 = 129
+    var fieldBuf: String = hpackByteToChar(3)     // Encoded RIC = 3
+    fieldBuf = stringConcat(fieldBuf, hpackByteToChar(129))  // S=1, deltaBase=1
+    // Post-base indexed: 0001xxxx, 4-bit prefix
+    // abs idx = base + postBaseIdx = 0 + 0 = 0
+    fieldBuf = stringConcat(fieldBuf, hpackByteToChar(16))   // 0x10 post-base idx 0
+    // abs idx = base + postBaseIdx = 0 + 1 = 1
+    fieldBuf = stringConcat(fieldBuf, hpackByteToChar(17))   // 0x11 post-base idx 1
+    val result = qpackDecode(dec, fieldBuf, "")
+    val headers = mapGet(result, "headers")
+    assertEquals(2, listSize(headers))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("/sample/path", toString(mapGet(listGet(headers, 1), "value")))
+}
+
+@Test fun testRfcB2_SectionAckByte() {
+    // Section Ack for stream 4: 1xxxxxxx, 7-bit prefix
+    // 128 + 4 = 132 = 0x84
+    val ack = qpackSectionAck(4)
+    assertEquals(1, stringLength(ack))
+    assertEquals(132, charCodeAt(ack, 0))
+}
+
+// -- B.3: Insert with Literal Name --------------------------------------------
+
+@Test fun testRfcB3_InsertWithLiteralName() {
+    // Encoder stream: insert "custom-key" = "custom-value"
+    // 01 H=0 NNNNN → 0x4a (64 + 10) name len 10
+    // followed by "custom-key"
+    // then 0x0c (12) value length + "custom-value"
+    val dec = qpackCreateDecoder(4096)
+    var encStream: String = hpackByteToChar(74)   // 0x4a = 64 + 10 (name length)
+    encStream = stringConcat(encStream, "custom-key")
+    encStream = stringConcat(encStream, hpackByteToChar(12))  // value length 12
+    encStream = stringConcat(encStream, "custom-value")
+    qpackProcessEncoderStream(dec, encStream)
+    assertEquals(1, qpackDynamicTableLength(dec))
+    val entry = qpackDynamicLookup(dec, 0)
+    assertEqualsStr("custom-key", toString(mapGet(entry, "name")))
+    assertEqualsStr("custom-value", toString(mapGet(entry, "value")))
+}
+
+@Test fun testRfcB3_InsertCountIncrementByte() {
+    // Insert Count Increment of 1: 00xxxxxx, 6-bit prefix
+    // 0 + 1 = 0x01
+    val increment = qpackInsertCountIncrement(1)
+    assertEquals(1, stringLength(increment))
+    assertEquals(1, charCodeAt(increment, 0))
+}
+
+// -- B.4: Duplicate + Stream Cancellation -------------------------------------
+
+@Test fun testRfcB4_Duplicate() {
+    // First add an entry, then duplicate it via encoder stream byte 0x02
+    val dec = qpackCreateDecoder(4096)
+    // Seed an entry first
+    var encStream1: String = hpackByteToChar(74)  // insert literal name len 10
+    encStream1 = stringConcat(encStream1, "custom-key")
+    encStream1 = stringConcat(encStream1, hpackByteToChar(12))
+    encStream1 = stringConcat(encStream1, "custom-value")
+    qpackProcessEncoderStream(dec, encStream1)
+    assertEquals(1, qpackDynamicTableLength(dec))
+
+    // Duplicate: 000xxxxx → absolute index 0 → 0x00
+    var encStream2: String = hpackByteToChar(0)   // duplicate abs idx 0
+    qpackProcessEncoderStream(dec, encStream2)
+    assertEquals(2, qpackDynamicTableLength(dec))
+    // Newest entry (abs idx 1) should be the duplicate
+    val entry = qpackDynamicLookup(dec, 1)
+    assertEqualsStr("custom-key", toString(mapGet(entry, "name")))
+    assertEqualsStr("custom-value", toString(mapGet(entry, "value")))
+}
+
+@Test fun testRfcB4_StreamCancelByte() {
+    // Stream Cancellation for stream 8: 01xxxxxx, 6-bit prefix
+    // 64 + 8 = 72 = 0x48
+    val cancel = qpackStreamCancel(8)
+    assertEquals(1, stringLength(cancel))
+    assertEquals(72, charCodeAt(cancel, 0))
+}
+
+// == Blocked Streams (Phase 6) ================================================
+
+@Test fun testQpackIsBlockedWhenInsertCountTooLow() {
+    val dec = qpackCreateDecoder()
+    // reqInsertCount of 5 but no inserts have been acknowledged
+    val blocked = qpackIsBlocked(dec, 5)
+    assertTrue(blocked)
+}
+
+@Test fun testQpackIsNotBlockedWhenInsertCountMet() {
+    val dec = qpackCreateDecoder()
+    // reqInsertCount of 0 means no dynamic entries needed
+    val blocked = qpackIsBlocked(dec, 0)
+    assertTrue(blocked == false)
+}
+
+// == Decoder Stream Processing ================================================
+
+@Test fun testQpackProcessSectionAck() {
+    val enc = qpackCreateEncoder()
+    // Build a section ack instruction: 1xxxxxxx with 7-bit prefix
+    // Ack stream 0 = 0x80 (1 followed by 7 zeros)
+    val ackBuf = hpackByteToChar(128)
+    qpackProcessDecoderStream(enc, ackBuf)
+    // Should update encoder's known received state
+    val knownReceived = toInt(mapGet(enc, "knownReceived"))
+    assertTrue(knownReceived >= 0)
+}
+
+@Test fun testQpackProcessInsertCountIncrement() {
+    val enc = qpackCreateEncoder()
+    // Insert count increment: 00xxxxxx with 6-bit prefix
+    // Increment by 1 = 0x01
+    val incBuf = hpackByteToChar(1)
+    qpackProcessDecoderStream(enc, incBuf)
+    val knownReceived = toInt(mapGet(enc, "knownReceived"))
+    assertTrue(knownReceived >= 0)
+}
+
+// == Required Insert Count Encoding ===========================================
+
+@Test fun testRICEncodeZero() {
+    // RIC of 0 → encoded as 0
+    val encoded = qpackEncodeRequiredInsertCount(0, 4096)
+    assertEquals(0, encoded)
+}
+
+@Test fun testRICEncodeNonZero() {
+    // RIC of 1 with maxCapacity 4096 → should encode correctly
+    val encoded = qpackEncodeRequiredInsertCount(1, 4096)
+    assertTrue(encoded > 0)
+}
+
+@Test fun testRICDecodeZero() {
+    val decoded = qpackDecodeRequiredInsertCount(0, 0, 4096)
+    assertEquals(0, decoded)
+}
+
+// == QPACK Bomb Protection ====================================================
+
+@Test fun testQpackBombProtection() {
+    val dec = qpackCreateDecoder()
+    qpackSetMaxHeaderFieldSize(dec, 100)
+    // Create an encoder and encode a header with value > 100 bytes
+    val enc = qpackCreateEncoder()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "x-big")
+    var longVal: String = ""
+    var i: Int = 0
+    while (i < 120) {
+        longVal = stringConcat(longVal, "x")
+        i = i + 1
+    }
+    mapPut(h, "value", longVal)
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    val decResult = qpackDecode(dec, encoded, "")
+    // Should contain an error entry
+    val decoded = mapGet(decResult, "headers")
+    val first = listGet(decoded, 0)
+    assertEqualsStr("qpack-error", toString(mapGet(first, "name")))
+}
+
+@Test fun testQpackMaxTotalDecodedSize() {
+    val dec = qpackCreateDecoder()
+    // Default maxTotalDecodedSize is 65536 - just verify the field exists
+    val maxTotal = toInt(mapGet(dec, "maxTotalDecodedSize"))
+    assertEquals(65536, maxTotal)
+}
+
+// == Gap 4: Blocked Stream Retry ==============================================
+
+@Test fun testQpackBlockedStreamCount() {
+    val dec = qpackCreateDecoder()
+    assertEquals(0, qpackBlockedStreamCount(dec))
+}
+
+@Test fun testQpackBlockedStreamCountAfterBlock() {
+    val dec = qpackCreateDecoder()
+    // Manually add a blocked entry to simulate a blocked decode
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    val blockedEntry = mapCreate()
+    mapPut(blockedEntry, "reqInsertCount", 5)
+    mapPut(blockedEntry, "encoded", "")
+    listAppend(blockedStreams, blockedEntry)
+    assertEquals(1, qpackBlockedStreamCount(dec))
+}
+
+@Test fun testQpackRetryBlockedEmpty() {
+    val dec = qpackCreateDecoder()
+    val results = qpackRetryBlocked(dec)
+    assertEquals(0, listSize(results))
+}
+
+@Test fun testQpackRetryBlockedStillBlocked() {
+    val dec = qpackCreateDecoder()
+    // Add a blocked entry with reqInsertCount=5, but knownReceivedCount=0
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    val blockedEntry = mapCreate()
+    mapPut(blockedEntry, "reqInsertCount", 5)
+    mapPut(blockedEntry, "encoded", "")
+    listAppend(blockedStreams, blockedEntry)
+    // Retry without updating knownReceivedCount — should remain blocked
+    val results = qpackRetryBlocked(dec)
+    assertEquals(0, listSize(results))
+    assertEquals(1, qpackBlockedStreamCount(dec))
+}
+
+@Test fun testQpackRetryBlockedUnblocks() {
+    val dec = qpackCreateDecoder()
+    // Encode a simple static-only field section (reqInsertCount=0, base=0)
+    val enc = qpackCreateEncoder()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    // Manually put it in the blocked list with reqInsertCount=1
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    val blockedEntry = mapCreate()
+    mapPut(blockedEntry, "reqInsertCount", 1)
+    mapPut(blockedEntry, "encoded", encoded)
+    listAppend(blockedStreams, blockedEntry)
+    assertEquals(1, qpackBlockedStreamCount(dec))
+    // Update knownReceivedCount to satisfy the requirement
+    mapPut(dec, "knownReceivedCount", 1)
+    // Retry — should unblock and decode
+    val results = qpackRetryBlocked(dec)
+    assertEquals(1, listSize(results))
+    assertEquals(0, qpackBlockedStreamCount(dec))
+    // Check decoded headers
+    val decResult = listGet(results, 0)
+    val decodedHeaders = mapGet(decResult, "headers")
+    assertEquals(1, listSize(decodedHeaders))
+    assertEqualsStr(":method", toString(mapGet(listGet(decodedHeaders, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(decodedHeaders, 0), "value")))
+}
+
+@Test fun testQpackRetryBlockedPartialUnblock() {
+    val dec = qpackCreateDecoder()
+    // Encode a simple field section for unblocking
+    val enc = qpackCreateEncoder()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":status")
+    mapPut(h, "value", "200")
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val encoded = toString(mapGet(encResult, "encoded"))
+    // Add two blocked entries: one needing reqInsertCount=1, another needing 5
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    val entry1 = mapCreate()
+    mapPut(entry1, "reqInsertCount", 1)
+    mapPut(entry1, "encoded", encoded)
+    listAppend(blockedStreams, entry1)
+    val entry2 = mapCreate()
+    mapPut(entry2, "reqInsertCount", 5)
+    mapPut(entry2, "encoded", encoded)
+    listAppend(blockedStreams, entry2)
+    assertEquals(2, qpackBlockedStreamCount(dec))
+    // Update knownReceivedCount to 2 — only first should unblock
+    mapPut(dec, "knownReceivedCount", 2)
+    val results = qpackRetryBlocked(dec)
+    assertEquals(1, listSize(results))
+    assertEquals(1, qpackBlockedStreamCount(dec))
+}
+
+// == Gap 5: Decoder-to-Encoder Instruction Encoding ===========================
+
+@Test fun testQpackEncodeDecoderInstructionSectionAck() {
+    val result = qpackEncodeDecoderInstruction("section_ack", 4, 0)
+    assertEqualsStr("section_ack", toString(mapGet(result, "type")))
+    val wireBytes = toString(mapGet(result, "wireBytes"))
+    assertTrue(stringLength(wireBytes) > 0)
+    // Section Ack: 1xxxxxxx with 7-bit stream ID
+    // stream ID 4 → 128 + 4 = 132
+    assertEquals(132, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackEncodeDecoderInstructionStreamCancel() {
+    val result = qpackEncodeDecoderInstruction("stream_cancel", 8, 0)
+    assertEqualsStr("stream_cancel", toString(mapGet(result, "type")))
+    val wireBytes = toString(mapGet(result, "wireBytes"))
+    assertTrue(stringLength(wireBytes) > 0)
+    // Stream Cancel: 01xxxxxx with 6-bit stream ID
+    // stream ID 8 → 64 + 8 = 72
+    assertEquals(72, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackEncodeDecoderInstructionInsertCountIncrement() {
+    val result = qpackEncodeDecoderInstruction("insert_count_increment", 0, 3)
+    assertEqualsStr("insert_count_increment", toString(mapGet(result, "type")))
+    val wireBytes = toString(mapGet(result, "wireBytes"))
+    assertTrue(stringLength(wireBytes) > 0)
+    // Insert Count Increment: 00xxxxxx with 6-bit increment
+    // increment 3 → 0 + 3 = 3
+    assertEquals(3, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackEncodeDecoderInstructionUnknownType() {
+    val result = qpackEncodeDecoderInstruction("unknown", 0, 0)
+    assertTrue(qpackIsError(result))
+}
+
+@Test fun testQpackEncodeSectionAckConvenience() {
+    val wireBytes = qpackEncodeSectionAck(4)
+    assertEquals(1, stringLength(wireBytes))
+    assertEquals(132, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackEncodeStreamCancelConvenience() {
+    val wireBytes = qpackEncodeStreamCancel(8)
+    assertEquals(1, stringLength(wireBytes))
+    assertEquals(72, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackEncodeInsertCountIncrementConvenience() {
+    val wireBytes = qpackEncodeInsertCountIncrement(5)
+    assertEquals(1, stringLength(wireBytes))
+    assertEquals(5, charCodeAt(wireBytes, 0))
+}
+
+@Test fun testQpackDecoderInstructionRoundtripSectionAck() {
+    // Encode a section ack, then process it on the encoder side
+    val wireBytes = qpackEncodeSectionAck(0)
+    val enc = qpackCreateEncoder()
+    qpackDynamicAdd(enc, "test", "value")
+    qpackProcessDecoderStream(enc, wireBytes)
+    val knownReceived = toInt(mapGet(enc, "knownReceived"))
+    assertTrue(knownReceived >= 0)
+}
+
+@Test fun testQpackDecoderInstructionRoundtripInsertCountIncrement() {
+    // Encode an insert count increment, then process on encoder side
+    val wireBytes = qpackEncodeInsertCountIncrement(3)
+    val enc = qpackCreateEncoder()
+    qpackProcessDecoderStream(enc, wireBytes)
+    val knownReceived = toInt(mapGet(enc, "knownReceived"))
+    assertEquals(3, knownReceived)
+}
+
+@Test fun testQpackDecoderInstructionRoundtripStreamCancel() {
+    // Encode a stream cancel, then process on encoder side (no-op for basic impl)
+    val wireBytes = qpackEncodeStreamCancel(12)
+    val enc = qpackCreateEncoder()
+    qpackProcessDecoderStream(enc, wireBytes)
+    // Should not crash — cancellation is a no-op for basic impl
+    assertEquals(0, toInt(mapGet(enc, "knownReceived")))
+}
+
+@Test fun testQpackDecoderInstructionLargeStreamId() {
+    // Section Ack with stream ID > 127 requires multi-byte encoding
+    val wireBytes = qpackEncodeSectionAck(200)
+    assertTrue(stringLength(wireBytes) > 1)
+    // Process on encoder side
+    val enc = qpackCreateEncoder()
+    qpackDynamicAdd(enc, "key", "val")
+    qpackProcessDecoderStream(enc, wireBytes)
+    val knownReceived = toInt(mapGet(enc, "knownReceived"))
+    assertTrue(knownReceived >= 0)
+}
+
+// == Gap 6: Max Blocked Streams Enforcement ===================================
+
+@Test fun testQpackMaxBlockedStreamsDefault() {
+    val dec = qpackCreateDecoder()
+    assertEquals(100, toInt(mapGet(dec, "maxBlockedStreams")))
+}
+
+@Test fun testQpackSetMaxBlockedStreams() {
+    val dec = qpackCreateDecoder()
+    qpackSetMaxBlockedStreams(dec, 10)
+    assertEquals(10, toInt(mapGet(dec, "maxBlockedStreams")))
+}
+
+@Test fun testQpackMaxBlockedStreamsEnforcementRejectsExcess() {
+    val dec = qpackCreateDecoder()
+    qpackSetMaxBlockedStreams(dec, 2)
+    // Build a simple encoded field section with reqInsertCount > 0
+    // We need the prefix to encode a non-zero RIC to trigger blocking
+    val maxTableCapacity = toInt(mapGet(dec, "maxSize"))
+    // Create a field section prefix with reqInsertCount=5 (will be blocked)
+    val prefix = qpackEncodePrefix(5, 5, maxTableCapacity)
+    // Append a static indexed header so the encoded bytes are valid if decoded
+    var encoded: String = prefix
+    encoded = stringConcat(encoded, hpackEncodeInt(17, 6, 192))
+    // First decode — should block (reqInsertCount=5, knownReceivedCount=0)
+    val r1 = qpackDecode(dec, encoded, "")
+    assertEquals(1, toInt(mapGet(r1, "blocked")))
+    assertEquals(1, qpackBlockedStreamCount(dec))
+    // Second decode — should also block
+    val r2 = qpackDecode(dec, encoded, "")
+    assertEquals(1, toInt(mapGet(r2, "blocked")))
+    assertEquals(2, qpackBlockedStreamCount(dec))
+    // Third decode — should be REJECTED (max is 2)
+    val r3 = qpackDecode(dec, encoded, "")
+    assertTrue(qpackIsError(r3))
+    assertEqualsStr("Max blocked streams limit reached", toString(mapGet(r3, "error")))
+    // Blocked count should still be 2 (rejected entry not added)
+    assertEquals(2, qpackBlockedStreamCount(dec))
+}
+
+@Test fun testQpackMaxBlockedStreamsZeroRejectsImmediately() {
+    val dec = qpackCreateDecoder()
+    qpackSetMaxBlockedStreams(dec, 0)
+    val maxTableCapacity = toInt(mapGet(dec, "maxSize"))
+    val prefix = qpackEncodePrefix(3, 3, maxTableCapacity)
+    var encoded: String = prefix
+    encoded = stringConcat(encoded, hpackEncodeInt(25, 6, 192))
+    // Should be immediately rejected — max blocked is 0
+    val r = qpackDecode(dec, encoded, "")
+    assertTrue(qpackIsError(r))
+    assertEquals(0, qpackBlockedStreamCount(dec))
+}
+
+@Test fun testQpackMaxBlockedStreamsAllowsAfterRetry() {
+    val dec = qpackCreateDecoder()
+    qpackSetMaxBlockedStreams(dec, 1)
+    val maxTableCapacity = toInt(mapGet(dec, "maxSize"))
+    // Encode a simple static field section
+    val enc = qpackCreateEncoder()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val encResult = qpackEncode(enc, headers)
+    val goodEncoded = toString(mapGet(encResult, "encoded"))
+    // Create a blocked field section (reqInsertCount=2)
+    val prefix = qpackEncodePrefix(2, 2, maxTableCapacity)
+    var blockedEncoded: String = prefix
+    blockedEncoded = stringConcat(blockedEncoded, hpackEncodeInt(17, 6, 192))
+    // First blocked decode — allowed (count 0 < max 1)
+    val r1 = qpackDecode(dec, blockedEncoded, "")
+    assertEquals(1, toInt(mapGet(r1, "blocked")))
+    assertEquals(1, qpackBlockedStreamCount(dec))
+    // Second blocked decode — should be rejected
+    val r2 = qpackDecode(dec, blockedEncoded, "")
+    assertTrue(qpackIsError(r2))
+    // Unblock by updating knownReceivedCount
+    mapPut(dec, "knownReceivedCount", 2)
+    val unblocked = qpackRetryBlocked(dec)
+    assertEquals(1, listSize(unblocked))
+    assertEquals(0, qpackBlockedStreamCount(dec))
+    // Now a new blocked decode should be allowed again
+    val r3 = qpackDecode(dec, blockedEncoded, "")
+    assertEquals(1, toInt(mapGet(r3, "blocked")))
+    assertEquals(1, qpackBlockedStreamCount(dec))
+}
+
+// =============================================================================
+// == Gap Q1: Invalid Required Insert Count (RFC 9204 Section 4.5.1.1)
+// =============================================================================
+
+@Test fun testGapQ1_ValidRICZero() {
+    // Encoded RIC of 0 means no dynamic table references; returns 0
+    val ric = qpackDecodeRequiredInsertCount(0, 0, 4096)
+    assertEquals(0, ric)
+}
+
+@Test fun testGapQ1_InvalidRICWithZeroCapacity() {
+    // When maxTableCapacity is 0 (no dynamic table), encoded > 0 is invalid
+    val ric = qpackDecodeRequiredInsertCount(1, 0, 0)
+    assertEquals(-1, ric)
+}
+
+@Test fun testGapQ1_InvalidRICSignalsNegativeOne() {
+    // When encoded RIC is impossibly large relative to totalInsertCount,
+    // the decoded value should be -1 (error signal)
+    // maxEntries = 4096/32 = 128, fullRange = 256
+    // With totalInsertCount=0, maxValue=128, maxWrapped=0
+    // reqInsertCount = 0 + 200 - 1 = 199 > maxValue(128)
+    // reqInsertCount <= fullRange(256), so error
+    val ric = qpackDecodeRequiredInsertCount(200, 0, 4096)
+    assertEquals(-1, ric)
+}
+
+@Test fun testGapQ1_ValidRICNonZero() {
+    // Encoded RIC of 1 with totalInsertCount=1, maxTableCapacity=4096
+    // maxEntries=128, fullRange=256, maxValue=129, maxWrapped=0
+    // reqInsertCount = 0 + 1 - 1 = 0 < 1 -> returns -1
+    // Actually: encoded=1 > 0, reqInsertCount=0, < 1, so -1
+    // Let's use a valid scenario: totalInsertCount=1
+    // maxValue = 1 + 128 = 129, maxWrapped = 0
+    // reqInsertCount = 0 + 2 - 1 = 1, <= 129, valid
+    val ric = qpackDecodeRequiredInsertCount(2, 1, 4096)
+    assertEquals(1, ric)
+}
+
+@Test fun testGapQ1_InvalidRICInQpackDecode() {
+    // Build a field section with an impossibly large encoded RIC
+    // Prefix: encoded RIC (8-bit prefix) followed by delta base (7-bit prefix)
+    // We use maxTableCapacity=0, so any non-zero encoded RIC is invalid
+    val dec = qpackCreateDecoder(0)
+    // Prefix bytes: RIC=1 (invalid with capacity=0), sign=0, deltaBase=0
+    var encoded: String = hpackByteToChar(1)  // encodedRIC = 1
+    encoded = stringConcat(encoded, hpackByteToChar(0))  // S=0, deltaBase=0
+    val result = qpackDecode(dec, encoded, "")
+    assertTrue(qpackIsError(result))
+    assertEqualsStr("Invalid Required Insert Count", toString(mapGet(result, "error")))
+}
+
+// =============================================================================
+// == Gap Q2: Insert Count Increment of 0 (RFC 9204 Section 4.4.3)
+// =============================================================================
+
+@Test fun testGapQ2_IncrementZeroIsError() {
+    // Insert Count Increment of 0 MUST be treated as connection error
+    val enc = qpackCreateEncoder()
+    // Instruction byte: 00_000000 = 0x00 = Insert Count Increment with value 0
+    val streamBuf = hpackByteToChar(0)
+    qpackProcessDecoderStream(enc, streamBuf)
+    // Encoder should record the error
+    assertTrue(mapGet(enc, "decoderStreamError") == true)
+    assertEqualsStr("Insert Count Increment of 0 is invalid", toString(mapGet(enc, "decoderStreamErrorMsg")))
+}
+
+@Test fun testGapQ2_IncrementNonZeroIsValid() {
+    // Insert Count Increment of 1 is valid
+    val enc = qpackCreateEncoder()
+    // Instruction byte: 00_000001 = 0x01 = Insert Count Increment with value 1
+    val streamBuf = hpackByteToChar(1)
+    qpackProcessDecoderStream(enc, streamBuf)
+    // knownReceived should be incremented by 1
+    assertEquals(1, toInt(mapGet(enc, "knownReceived")))
+    // No error should be set
+    assertTrue(mapContains(enc, "decoderStreamError") == false)
+}
+
+@Test fun testGapQ2_IncrementMultiple() {
+    // Insert Count Increment of 5 should increase knownReceived by 5
+    val enc = qpackCreateEncoder()
+    // Instruction byte: 00_000101 = 0x05 = Insert Count Increment with value 5
+    val streamBuf = hpackByteToChar(5)
+    qpackProcessDecoderStream(enc, streamBuf)
+    assertEquals(5, toInt(mapGet(enc, "knownReceived")))
+}

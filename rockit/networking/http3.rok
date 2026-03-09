@@ -1,0 +1,1575 @@
+// rockit.networking.http3 — HTTP/3 client over QUIC
+//
+// Implements the HTTP/3 protocol over QUIC transport, using QPACK for header
+// compression. Provides frame encoding/decoding with varint-based framing,
+// connection management with control and QPACK streams, and a simple client
+// API matching the HTTP/2 module pattern.
+//
+// Standards: RFC 9114 — HTTP/3
+//
+// Usage:
+//   import rockit.networking.http3
+//   import rockit.networking.quic
+//   import rockit.encoding.qpack
+//   val resp = h3Get("https://example.com/api/data")
+//   println(h3Status(resp))
+//   println(h3Body(resp))
+
+// == Frame Type Constants (RFC 9114 Section 7.2) ==============================
+
+fun H3_DATA(): Int          { return 0 }
+fun H3_HEADERS(): Int       { return 1 }
+fun H3_CANCEL_PUSH(): Int   { return 3 }
+fun H3_SETTINGS(): Int      { return 4 }
+fun H3_PUSH_PROMISE(): Int  { return 5 }
+fun H3_GOAWAY(): Int        { return 7 }
+fun H3_MAX_PUSH_ID(): Int   { return 13 }
+
+// == HTTP/2-Only Frame Type Constants (RFC 9114 Section 7.2.8) ================
+// These frame types are defined in HTTP/2 but MUST NOT appear in HTTP/3.
+// Receipt of these on any stream is a connection error of type H3_FRAME_UNEXPECTED.
+
+fun H3_H2_PRIORITY(): Int       { return 2 }
+fun H3_H2_PING(): Int           { return 6 }
+fun H3_H2_WINDOW_UPDATE(): Int  { return 8 }
+fun H3_H2_CONTINUATION(): Int   { return 9 }
+
+// == Error Code Constants (RFC 9114 Section 8.1) ==============================
+
+fun H3_NO_ERROR(): Int                  { return 256 }
+fun H3_GENERAL_PROTOCOL_ERROR(): Int    { return 257 }
+fun H3_INTERNAL_ERROR(): Int            { return 258 }
+fun H3_STREAM_CREATION_ERROR(): Int     { return 259 }
+fun H3_CLOSED_CRITICAL_STREAM(): Int    { return 260 }
+fun H3_FRAME_UNEXPECTED(): Int          { return 261 }
+fun H3_FRAME_ERROR(): Int               { return 262 }
+fun H3_EXCESSIVE_LOAD(): Int            { return 263 }
+fun H3_ID_ERROR(): Int                  { return 264 }
+fun H3_SETTINGS_ERROR(): Int            { return 265 }
+fun H3_MISSING_SETTINGS(): Int          { return 266 }
+fun H3_REQUEST_REJECTED(): Int          { return 267 }
+fun H3_REQUEST_CANCELLED(): Int         { return 268 }
+fun H3_REQUEST_INCOMPLETE(): Int        { return 269 }
+fun H3_MESSAGE_ERROR(): Int             { return 270 }
+fun H3_CONNECT_ERROR(): Int             { return 271 }
+fun H3_VERSION_FALLBACK(): Int          { return 272 }
+
+// == Settings Constants (RFC 9114 Section 7.2.4.1) ============================
+
+fun H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY(): Int  { return 1 }
+fun H3_SETTINGS_MAX_FIELD_SECTION_SIZE(): Int     { return 6 }
+fun H3_SETTINGS_QPACK_BLOCKED_STREAMS(): Int      { return 7 }
+
+// == Unidirectional Stream Type Constants (RFC 9114 Section 6.2) ==============
+
+fun H3_STREAM_CONTROL(): Int         { return 0 }
+fun H3_STREAM_PUSH(): Int            { return 1 }
+fun H3_STREAM_QPACK_ENCODER(): Int   { return 2 }
+fun H3_STREAM_QPACK_DECODER(): Int   { return 3 }
+
+// == Error Handling ===========================================================
+
+fun H3_ERROR(): String { return "H3_ERROR" }
+
+fun h3Error(msg: String): Map {
+    val result = mapCreate()
+    mapPut(result, "type", H3_ERROR())
+    mapPut(result, "error", msg)
+    mapPut(result, "status", 0)
+    mapPut(result, "body", "")
+    mapPut(result, "headers", listCreate())
+    return result
+}
+
+// Create an error with an associated HTTP/3 error code (RFC 9114 Section 8.1)
+fun h3ErrorWithCode(msg: String, errorCode: Int): Map {
+    val result = h3Error(msg)
+    mapPut(result, "errorCode", errorCode)
+    return result
+}
+
+fun h3IsError(result: Map): Bool {
+    val t = mapGet(result, "type")
+    return t == H3_ERROR()
+}
+
+// == Frame Encoding/Decoding (RFC 9114 Section 7.1) ===========================
+// HTTP/3 frames use varint type + varint length + payload (unlike HTTP/2's fixed 9-byte header)
+
+// Encode an HTTP/3 frame: varint(type) + varint(length) + payload
+fun h3EncodeFrame(frameType: Int, payload: String): String {
+    val typeBytes = quicEncodeVarint(frameType)
+    val lengthBytes = quicEncodeVarint(stringLength(payload))
+    var result: String = typeBytes
+    result = stringConcat(result, lengthBytes)
+    result = stringConcat(result, payload)
+    return result
+}
+
+// Decode an HTTP/3 frame from data at offset
+// Returns map with "type", "length", "payload", "bytesRead"
+fun h3DecodeFrame(buf: String, offset: Int): Map {
+    val result = mapCreate()
+    val bufLen = stringLength(buf)
+    if (offset >= bufLen) {
+        mapPut(result, "type", 0 - 1)
+        mapPut(result, "length", 0)
+        mapPut(result, "payload", "")
+        mapPut(result, "bytesRead", 0)
+        return result
+    }
+    // Decode frame type
+    val typeResult = quicDecodeVarint(buf, offset)
+    val frameType = toInt(mapGet(typeResult, "value"))
+    val typeBytes = toInt(mapGet(typeResult, "bytesRead"))
+    // Decode payload length
+    val lenResult = quicDecodeVarint(buf, offset + typeBytes)
+    val payloadLen = toInt(mapGet(lenResult, "value"))
+    val lenBytes = toInt(mapGet(lenResult, "bytesRead"))
+    val headerSize = typeBytes + lenBytes
+    // Extract payload
+    var payload: String = ""
+    if (payloadLen > 0) {
+        val payloadStart = offset + headerSize
+        val payloadEnd = payloadStart + payloadLen
+        if (payloadEnd <= bufLen) {
+            payload = substring(buf, payloadStart, payloadEnd)
+        } else {
+            payload = substring(buf, payloadStart, bufLen)
+        }
+    }
+    mapPut(result, "type", frameType)
+    mapPut(result, "length", payloadLen)
+    mapPut(result, "payload", payload)
+    mapPut(result, "bytesRead", headerSize + payloadLen)
+    return result
+}
+
+// == Settings Frame Encoding/Decoding =========================================
+
+// Encode a SETTINGS frame payload from a list of {id, value} maps
+fun h3EncodeSettings(params: List): String {
+    var payload: String = ""
+    var i: Int = 0
+    while (i < listSize(params)) {
+        val param = listGet(params, i)
+        val id = toInt(mapGet(param, "id"))
+        val value = toInt(mapGet(param, "value"))
+        payload = stringConcat(payload, quicEncodeVarint(id))
+        payload = stringConcat(payload, quicEncodeVarint(value))
+        i = i + 1
+    }
+    return h3EncodeFrame(H3_SETTINGS(), payload)
+}
+
+// Decode a SETTINGS frame payload into a list of {id, value} maps
+// Returns error map with "type"=H3_ERROR() if duplicate settings ID found (Gap 7)
+// or if HTTP/2-only settings ID 0x02-0x05 is present (Gap 3).
+// On success, returns a map with "type"="H3_SETTINGS_LIST" and "params" (List).
+fun h3DecodeSettings(payload: String): Map {
+    val result = mapCreate()
+    val params = listCreate()
+    val seenIds = listCreate()
+    val payloadLen = stringLength(payload)
+    var pos: Int = 0
+    while (pos < payloadLen) {
+        val idResult = quicDecodeVarint(payload, pos)
+        val id = toInt(mapGet(idResult, "value"))
+        pos = pos + toInt(mapGet(idResult, "bytesRead"))
+        val valResult = quicDecodeVarint(payload, pos)
+        val value = toInt(mapGet(valResult, "value"))
+        pos = pos + toInt(mapGet(valResult, "bytesRead"))
+        // Gap 3: Reject HTTP/2-only settings IDs (RFC 9114 Section 7.2.4.1)
+        if (h3IsH2OnlySettingsId(id)) {
+            mapPut(result, "type", H3_ERROR())
+            mapPut(result, "error", "HTTP/2-only settings ID in HTTP/3 SETTINGS")
+            mapPut(result, "errorCode", H3_SETTINGS_ERROR())
+            return result
+        }
+        // Gap 7: Reject duplicate settings IDs (RFC 9114 Section 7.2.4)
+        if (listContains(seenIds, id)) {
+            mapPut(result, "type", H3_ERROR())
+            mapPut(result, "error", "Duplicate settings ID")
+            mapPut(result, "errorCode", H3_SETTINGS_ERROR())
+            return result
+        }
+        listAppend(seenIds, id)
+        val param = mapCreate()
+        mapPut(param, "id", id)
+        mapPut(param, "value", value)
+        listAppend(params, param)
+    }
+    mapPut(result, "type", "H3_SETTINGS_LIST")
+    mapPut(result, "params", params)
+    return result
+}
+
+// Legacy decode that returns just the list (for backward compat in tests)
+fun h3DecodeSettingsList(payload: String): List {
+    val result = h3DecodeSettings(payload)
+    val resultType = toString(mapGet(result, "type"))
+    if (resultType == H3_ERROR()) {
+        return listCreate()
+    }
+    return mapGet(result, "params")
+}
+
+// Build a default client SETTINGS frame
+fun h3BuildClientSettings(): String {
+    val params = listCreate()
+    val p1 = mapCreate()
+    mapPut(p1, "id", H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY())
+    mapPut(p1, "value", 4096)
+    listAppend(params, p1)
+    val p2 = mapCreate()
+    mapPut(p2, "id", H3_SETTINGS_QPACK_BLOCKED_STREAMS())
+    mapPut(p2, "value", 100)
+    listAppend(params, p2)
+    // Gap G: SETTINGS greasing (RFC 9114 Section 7.2.4.1)
+    // Include a greasing setting with ID of the form 0x1f * N + 0x21.
+    // Using N=0: 0x1f * 0 + 0x21 = 33 (0x21). Value is 0.
+    // Peers MUST ignore unknown settings identifiers.
+    val pGrease = mapCreate()
+    mapPut(pGrease, "id", 33)
+    mapPut(pGrease, "value", 0)
+    listAppend(params, pGrease)
+    return h3EncodeSettings(params)
+}
+
+// == HTTP/2-Only Settings ID Check (RFC 9114 Section 7.2.4.1, Gap 3) ==========
+
+// Settings IDs 0x02, 0x03, 0x04, 0x05 are defined in HTTP/2 and MUST NOT
+// appear in HTTP/3 SETTINGS frames. Their presence is H3_SETTINGS_ERROR.
+fun h3IsH2OnlySettingsId(id: Int): Bool {
+    if (id == 0) { return true }
+    if (id == 2) { return true }
+    if (id == 3) { return true }
+    if (id == 4) { return true }
+    if (id == 5) { return true }
+    return false
+}
+
+// == HTTP/2-Only Frame Type Check (RFC 9114 Section 7.2.8, Gap 2) =============
+
+// Frame types 0x02 (PRIORITY), 0x06 (PING), 0x09 (WINDOW_UPDATE) are HTTP/2-only.
+// Receipt on any HTTP/3 stream MUST be treated as H3_FRAME_UNEXPECTED.
+fun h3IsH2OnlyFrameType(frameType: Int): Bool {
+    if (frameType == H3_H2_PRIORITY()) { return true }
+    if (frameType == H3_H2_PING()) { return true }
+    if (frameType == H3_H2_WINDOW_UPDATE()) { return true }
+    if (frameType == H3_H2_CONTINUATION()) { return true }
+    return false
+}
+
+// == Control-Stream-Only Frame Type Check (RFC 9114 Section 7.2, Gap 11) ======
+
+// SETTINGS, GOAWAY, MAX_PUSH_ID, CANCEL_PUSH are control-stream-only frames.
+// Receipt on a request stream MUST be treated as H3_FRAME_UNEXPECTED.
+fun h3IsControlStreamOnlyFrame(frameType: Int): Bool {
+    if (frameType == H3_SETTINGS()) { return true }
+    if (frameType == H3_GOAWAY()) { return true }
+    if (frameType == H3_MAX_PUSH_ID()) { return true }
+    if (frameType == H3_CANCEL_PUSH()) { return true }
+    return false
+}
+
+// == Header Validation (RFC 9114 Section 4.2, 4.3.2) =========================
+
+// Gap 9: Validate header field name is lowercase (RFC 9114 Section 4.2)
+// HTTP/3 field names MUST be lowercase. Returns true if valid (all lowercase).
+fun h3ValidateHeaderName(name: String): Bool {
+    val nameLen = stringLength(name)
+    var i: Int = 0
+    while (i < nameLen) {
+        val code = charCodeAt(name, i)
+        // 65 = 'A', 90 = 'Z'
+        if (code >= 65) {
+            if (code <= 90) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Lowercase a header name for outbound use (auto-lowering, Gap 9)
+fun h3LowercaseHeaderName(name: String): String {
+    return urlToLower(name)
+}
+
+// Gap 10: Check if a header is a connection-specific header (RFC 9114 Section 4.2)
+// These headers are from HTTP/1.1 hop-by-hop and MUST NOT appear in HTTP/3.
+fun h3IsConnectionSpecificHeader(name: String): Bool {
+    val lower = urlToLower(name)
+    if (lower == "connection") { return true }
+    if (lower == "keep-alive") { return true }
+    if (lower == "proxy-connection") { return true }
+    if (lower == "transfer-encoding") { return true }
+    if (lower == "upgrade") { return true }
+    return false
+}
+
+// Gap 8: Validate response pseudo-headers (RFC 9114 Section 4.3.2)
+// Returns map with "valid" (Bool) and "error" (String)
+fun h3ValidateResponseHeaders(headers: List): Map {
+    val result = mapCreate()
+    mapPut(result, "valid", true)
+    mapPut(result, "error", "")
+    var hasStatus: Bool = false
+    var pseudosDone: Bool = false
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val hdr = listGet(headers, i)
+        val name = toString(mapGet(hdr, "name"))
+        val nameLen = stringLength(name)
+        if (nameLen > 0) {
+            val firstChar = charCodeAt(name, 0)
+            if (firstChar == 58) {
+                // Pseudo-header (starts with ':')
+                if (pseudosDone) {
+                    // Pseudo-headers after regular headers
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Pseudo-header after regular header")
+                    return result
+                }
+                if (name == ":status") {
+                    hasStatus = true
+                } else { if (name == ":method") {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Request pseudo-header :method in response")
+                    return result
+                } else { if (name == ":scheme") {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Request pseudo-header :scheme in response")
+                    return result
+                } else { if (name == ":path") {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Request pseudo-header :path in response")
+                    return result
+                } else { if (name == ":authority") {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Request pseudo-header :authority in response")
+                    return result
+                } } } } }
+            } else {
+                pseudosDone = true
+                // Gap 9: Validate inbound header name is lowercase
+                if (h3ValidateHeaderName(name) == false) {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Uppercase character in header field name")
+                    return result
+                }
+                // Gap 10: Reject connection-specific headers
+                if (h3IsConnectionSpecificHeader(name)) {
+                    mapPut(result, "valid", false)
+                    mapPut(result, "error", "Connection-specific header in HTTP/3")
+                    return result
+                }
+            }
+        }
+        i = i + 1
+    }
+    if (hasStatus == false) {
+        mapPut(result, "valid", false)
+        mapPut(result, "error", "Missing :status pseudo-header")
+        return result
+    }
+    return result
+}
+
+// Validate outbound request headers for connection-specific and case issues (Gap 9, 10)
+// Returns map with "valid" (Bool), "error" (String), "headers" (List, sanitized)
+fun h3ValidateRequestHeaders(headers: List): Map {
+    val result = mapCreate()
+    mapPut(result, "valid", true)
+    mapPut(result, "error", "")
+    val sanitized = listCreate()
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val hdr = listGet(headers, i)
+        val name = toString(mapGet(hdr, "name"))
+        val value = toString(mapGet(hdr, "value"))
+        // Gap 10: Reject connection-specific headers
+        if (h3IsConnectionSpecificHeader(name)) {
+            mapPut(result, "valid", false)
+            mapPut(result, "error", "Connection-specific header in HTTP/3 request")
+            return result
+        }
+        // Gap 9: Auto-lowercase outbound header names
+        val lowerName = h3LowercaseHeaderName(name)
+        val sanitizedHdr = mapCreate()
+        mapPut(sanitizedHdr, "name", lowerName)
+        mapPut(sanitizedHdr, "value", value)
+        listAppend(sanitized, sanitizedHdr)
+        i = i + 1
+    }
+    mapPut(result, "headers", sanitized)
+    return result
+}
+
+// == GOAWAY Frame =============================================================
+
+// Encode a GOAWAY frame with a stream ID
+fun h3EncodeGoaway(streamId: Int): String {
+    val payload = quicEncodeVarint(streamId)
+    return h3EncodeFrame(H3_GOAWAY(), payload)
+}
+
+// Decode a GOAWAY frame payload to get the stream ID
+fun h3DecodeGoaway(payload: String): Int {
+    val result = quicDecodeVarint(payload, 0)
+    return toInt(mapGet(result, "value"))
+}
+
+// == MAX_PUSH_ID Frame ========================================================
+
+fun h3EncodeMaxPushId(pushId: Int): String {
+    val payload = quicEncodeVarint(pushId)
+    return h3EncodeFrame(H3_MAX_PUSH_ID(), payload)
+}
+
+// == CANCEL_PUSH Frame ========================================================
+
+fun h3EncodeCancelPush(pushId: Int): String {
+    val payload = quicEncodeVarint(pushId)
+    return h3EncodeFrame(H3_CANCEL_PUSH(), payload)
+}
+
+// Decode a CANCEL_PUSH frame payload to get the push ID
+fun h3DecodeCancelPush(payload: String): Int {
+    val result = quicDecodeVarint(payload, 0)
+    return toInt(mapGet(result, "value"))
+}
+
+// == MAX_PUSH_ID Decode =======================================================
+
+// Decode a MAX_PUSH_ID frame payload to get the push ID
+fun h3DecodeMaxPushId(payload: String): Int {
+    val result = quicDecodeVarint(payload, 0)
+    return toInt(mapGet(result, "value"))
+}
+
+// == PUSH_PROMISE Frame =======================================================
+
+// Encode a PUSH_PROMISE frame: varint push ID + encoded headers, wrapped in frame
+fun h3EncodePushPromise(pushId: Int, encodedHeaders: String): String {
+    var payload: String = quicEncodeVarint(pushId)
+    payload = stringConcat(payload, encodedHeaders)
+    return h3EncodeFrame(H3_PUSH_PROMISE(), payload)
+}
+
+// Decode a PUSH_PROMISE frame payload into {pushId, headers}
+fun h3DecodePushPromise(payload: String): Map {
+    val result = mapCreate()
+    val varintResult = quicDecodeVarint(payload, 0)
+    val pushId = toInt(mapGet(varintResult, "value"))
+    val bytesRead = toInt(mapGet(varintResult, "bytesRead"))
+    val payloadLen = stringLength(payload)
+    var headers: String = ""
+    if (bytesRead < payloadLen) {
+        headers = substring(payload, bytesRead, payloadLen)
+    }
+    mapPut(result, "pushId", pushId)
+    mapPut(result, "headers", headers)
+    return result
+}
+
+// == Stream Type Validation ===================================================
+
+// Validate whether a stream type is a known HTTP/3 unidirectional stream type
+fun h3ValidateStreamType(streamType: Int): Bool {
+    if (streamType == H3_STREAM_CONTROL()) { return true }
+    if (streamType == H3_STREAM_PUSH()) { return true }
+    if (streamType == H3_STREAM_QPACK_ENCODER()) { return true }
+    if (streamType == H3_STREAM_QPACK_DECODER()) { return true }
+    return false
+}
+
+// == Settings Application =====================================================
+
+// Apply peer settings from a decoded settings list onto the connection
+// Gap 3: Rejects HTTP/2-only settings IDs (0x02-0x05) with H3_SETTINGS_ERROR.
+// Returns map with "ok" (Bool) and "error" (String) and "errorCode" (Int).
+fun h3ApplyPeerSettings(conn: Map, settingsList: List): Map {
+    val result = mapCreate()
+    mapPut(result, "ok", true)
+    mapPut(result, "error", "")
+    mapPut(result, "errorCode", 0)
+    val peerSettings = mapGet(conn, "peerSettings")
+    var i: Int = 0
+    while (i < listSize(settingsList)) {
+        val setting = listGet(settingsList, i)
+        val id = toInt(mapGet(setting, "id"))
+        val value = toInt(mapGet(setting, "value"))
+        // Gap 3: Reject HTTP/2-only settings IDs
+        if (h3IsH2OnlySettingsId(id)) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "HTTP/2-only settings ID in HTTP/3")
+            mapPut(result, "errorCode", H3_SETTINGS_ERROR())
+            return result
+        }
+        if (id == H3_SETTINGS_MAX_FIELD_SECTION_SIZE()) {
+            mapPut(peerSettings, "maxFieldSectionSize", value)
+        } else { if (id == H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY()) {
+            mapPut(peerSettings, "qpackMaxTableCapacity", value)
+        } else { if (id == H3_SETTINGS_QPACK_BLOCKED_STREAMS()) {
+            mapPut(peerSettings, "qpackBlockedStreams", value)
+        } } }
+        i = i + 1
+    }
+    return result
+}
+
+// == Push Stream Validation (RFC 9114 Section 4.6, Gap 15) ====================
+
+// Validate a push promise: client must have sent MAX_PUSH_ID, push ID must be
+// within allowed range, and push ID must not already be used.
+// Returns map with "valid" (Bool) and "error" (String).
+fun h3ValidatePushPromise(conn: Map, pushId: Int): Map {
+    val result = mapCreate()
+    mapPut(result, "valid", true)
+    mapPut(result, "error", "")
+    // Check if MAX_PUSH_ID has been sent
+    if (mapContains(conn, "maxPushIdSent") == false) {
+        mapPut(result, "valid", false)
+        mapPut(result, "error", "PUSH_PROMISE received before MAX_PUSH_ID sent")
+        return result
+    }
+    val maxPushIdSent = h3ToBool(mapGet(conn, "maxPushIdSent"))
+    if (maxPushIdSent == false) {
+        mapPut(result, "valid", false)
+        mapPut(result, "error", "PUSH_PROMISE received before MAX_PUSH_ID sent")
+        return result
+    }
+    // Check push ID is within allowed range
+    val maxPushIdValue = toInt(mapGet(conn, "maxPushIdValue"))
+    if (pushId > maxPushIdValue) {
+        mapPut(result, "valid", false)
+        mapPut(result, "error", "Push ID exceeds MAX_PUSH_ID")
+        return result
+    }
+    // Check push ID is not already used
+    if (mapContains(conn, "usedPushIds")) {
+        val usedPushIds = mapGet(conn, "usedPushIds")
+        if (listContains(usedPushIds, pushId)) {
+            mapPut(result, "valid", false)
+            mapPut(result, "error", "Duplicate push ID")
+            return result
+        }
+    }
+    return result
+}
+
+// Record a used push ID
+fun h3RecordPushId(conn: Map, pushId: Int): Unit {
+    if (mapContains(conn, "usedPushIds") == false) {
+        mapPut(conn, "usedPushIds", listCreate())
+    }
+    val usedPushIds = mapGet(conn, "usedPushIds")
+    listAppend(usedPushIds, pushId)
+}
+
+// == Connection Management ====================================================
+
+// Connect to an HTTP/3 server
+// Sets up QUIC connection with ALPN "h3", then opens control and QPACK streams
+fun h3Connect(url: String): Map {
+    val conn = mapCreate()
+    val host = urlExtractHost(url)
+    val port = urlExtractPort(url)
+    val scheme = urlExtractScheme(url)
+    if (stringLength(host) == 0) {
+        mapPut(conn, "type", H3_ERROR())
+        mapPut(conn, "error", "Invalid URL: no host")
+        return conn
+    }
+    // Default port for HTTPS is 443
+    var connectPort: Int = port
+    if (connectPort == 0) {
+        if (scheme == "https") {
+            connectPort = 443
+        } else {
+            connectPort = 443
+        }
+    }
+    // Establish QUIC connection with ALPN "h3"
+    val quicResult = quicConnect(host, connectPort, "h3")
+    if (quicIsError(quicResult)) {
+        mapPut(conn, "type", H3_ERROR())
+        mapPut(conn, "error", "QUIC connection failed")
+        return conn
+    }
+    mapPut(conn, "type", "H3_CONN")
+    mapPut(conn, "error", "")
+    mapPut(conn, "quic", quicResult)
+    mapPut(conn, "host", host)
+    mapPut(conn, "port", connectPort)
+    mapPut(conn, "qpackEncoder", qpackCreateEncoder(4096))
+    mapPut(conn, "qpackDecoder", qpackCreateDecoder(4096))
+    mapPut(conn, "nextRequestStreamId", 0)
+    // Peer settings (defaults until SETTINGS received)
+    val peerSettings = mapCreate()
+    mapPut(peerSettings, "maxFieldSectionSize", 0)
+    mapPut(peerSettings, "qpackMaxTableCapacity", 0)
+    mapPut(peerSettings, "qpackBlockedStreams", 0)
+    mapPut(conn, "peerSettings", peerSettings)
+    mapPut(conn, "shuttingDown", false)
+    mapPut(conn, "peerGoawayStreamId", 0 - 1)
+    // Push tracking (Gap 15)
+    mapPut(conn, "maxPushIdSent", false)
+    mapPut(conn, "maxPushIdValue", 0)
+    mapPut(conn, "usedPushIds", listCreate())
+    // Peer control stream initial SETTINGS received flag (Gap 4)
+    mapPut(conn, "peerSettingsReceived", false)
+    // Open control stream (unidirectional, type 0x00)
+    val controlStreamId = quicOpenUniStream(quicResult)
+    mapPut(conn, "controlStreamId", controlStreamId)
+    // Send stream type identifier + SETTINGS
+    val streamTypeBytes = quicEncodeVarint(H3_STREAM_CONTROL())
+    val settingsFrame = h3BuildClientSettings()
+    var controlInit: String = streamTypeBytes
+    controlInit = stringConcat(controlInit, settingsFrame)
+    quicSendStream(quicResult, controlStreamId, controlInit, false)
+    // Open QPACK encoder stream (unidirectional, type 0x02)
+    val encoderStreamId = quicOpenUniStream(quicResult)
+    mapPut(conn, "qpackEncoderStreamId", encoderStreamId)
+    val encStreamType = quicEncodeVarint(H3_STREAM_QPACK_ENCODER())
+    quicSendStream(quicResult, encoderStreamId, encStreamType, false)
+    // Open QPACK decoder stream (unidirectional, type 0x03)
+    val decoderStreamId = quicOpenUniStream(quicResult)
+    mapPut(conn, "qpackDecoderStreamId", decoderStreamId)
+    val decStreamType = quicEncodeVarint(H3_STREAM_QPACK_DECODER())
+    quicSendStream(quicResult, decoderStreamId, decStreamType, false)
+    // Store peer-side critical stream IDs for monitoring
+    // These track the remote peer's control, encoder, and decoder streams.
+    // Initialized to -1 (unknown); set when the peer opens them.
+    mapPut(conn, "peerControlStreamId", 0 - 1)
+    mapPut(conn, "peerEncoderStreamId", 0 - 1)
+    mapPut(conn, "peerDecoderStreamId", 0 - 1)
+    return conn
+}
+
+// == Critical Stream Monitoring (RFC 9114 Section 6.2.1) ======================
+
+// Set the peer's control stream ID (called when peer's control stream is discovered)
+fun h3SetPeerControlStream(conn: Map, streamId: Int): Unit {
+    mapPut(conn, "peerControlStreamId", streamId)
+}
+
+// Set the peer's encoder stream ID (called when peer's encoder stream is discovered)
+fun h3SetPeerEncoderStream(conn: Map, streamId: Int): Unit {
+    mapPut(conn, "peerEncoderStreamId", streamId)
+}
+
+// Set the peer's decoder stream ID (called when peer's decoder stream is discovered)
+fun h3SetPeerDecoderStream(conn: Map, streamId: Int): Unit {
+    mapPut(conn, "peerDecoderStreamId", streamId)
+}
+
+// Monitor critical control streams for closure (RFC 9114 Section 6.2.1)
+// Checks that the local and peer control, encoder, and decoder streams are still
+// alive. If any required unidirectional stream is closed by the peer, this is a
+// connection error of type H3_CLOSED_CRITICAL_STREAM.
+// Returns a map with "ok" (Bool) and "error" (String) and "errorCode" (Int)
+fun h3MonitorControlStreams(conn: Map): Map {
+    val result = mapCreate()
+    mapPut(result, "ok", true)
+    mapPut(result, "error", "")
+    mapPut(result, "errorCode", 0)
+    val quicConn = mapGet(conn, "quic")
+    if (quicConn == null) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "No QUIC connection")
+        mapPut(result, "errorCode", H3_INTERNAL_ERROR())
+        return result
+    }
+    // Check local control stream
+    val controlStreamId = toInt(mapGet(conn, "controlStreamId"))
+    val controlCheck = h3CheckStreamAlive(quicConn, controlStreamId)
+    if (controlCheck == false) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "Local control stream closed")
+        mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+        return result
+    }
+    // Check local QPACK encoder stream
+    val encoderStreamId = toInt(mapGet(conn, "qpackEncoderStreamId"))
+    val encoderCheck = h3CheckStreamAlive(quicConn, encoderStreamId)
+    if (encoderCheck == false) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "Local QPACK encoder stream closed")
+        mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+        return result
+    }
+    // Check local QPACK decoder stream
+    val decoderStreamId = toInt(mapGet(conn, "qpackDecoderStreamId"))
+    val decoderCheck = h3CheckStreamAlive(quicConn, decoderStreamId)
+    if (decoderCheck == false) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "Local QPACK decoder stream closed")
+        mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+        return result
+    }
+    // Check peer control stream (if known)
+    val peerControlStreamId = toInt(mapGet(conn, "peerControlStreamId"))
+    if (peerControlStreamId >= 0) {
+        val peerControlCheck = h3CheckStreamAlive(quicConn, peerControlStreamId)
+        if (peerControlCheck == false) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "Peer control stream closed")
+            mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+            return result
+        }
+    }
+    // Check peer encoder stream (if known)
+    val peerEncoderStreamId = toInt(mapGet(conn, "peerEncoderStreamId"))
+    if (peerEncoderStreamId >= 0) {
+        val peerEncoderCheck = h3CheckStreamAlive(quicConn, peerEncoderStreamId)
+        if (peerEncoderCheck == false) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "Peer QPACK encoder stream closed")
+            mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+            return result
+        }
+    }
+    // Check peer decoder stream (if known)
+    val peerDecoderStreamId = toInt(mapGet(conn, "peerDecoderStreamId"))
+    if (peerDecoderStreamId >= 0) {
+        val peerDecoderCheck = h3CheckStreamAlive(quicConn, peerDecoderStreamId)
+        if (peerDecoderCheck == false) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "Peer QPACK decoder stream closed")
+            mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+            return result
+        }
+    }
+    return result
+}
+
+// Check if a QUIC stream is still alive by attempting a zero-byte recv
+// Returns true if the stream has not been closed (no FIN received)
+fun h3CheckStreamAlive(quicConn: Map, streamId: Int): Bool {
+    val recvResult = quicRecvStream(quicConn, streamId, 0)
+    val fin = h3ToBool(mapGet(recvResult, "fin"))
+    if (fin) { return false }
+    return true
+}
+
+// Close an HTTP/3 connection
+fun h3Close(conn: Map): Unit {
+    val quicConn = mapGet(conn, "quic")
+    if (quicConn != null) {
+        // Send GOAWAY on control stream
+        val controlStreamId = toInt(mapGet(conn, "controlStreamId"))
+        val goaway = h3EncodeGoaway(0)
+        quicSendStream(quicConn, controlStreamId, goaway, false)
+        quicClose(quicConn)
+    }
+}
+
+// == Connection Close with Error Code (RFC 9114 Section 8.1, Gap 17) ==========
+
+// Close the connection with an HTTP/3 error code.
+// Sends GOAWAY on the control stream, then closes the QUIC connection with
+// the given application-level error code.
+fun h3CloseWithError(conn: Map, errorCode: Int, reason: String): Unit {
+    val quicConn = mapGet(conn, "quic")
+    if (quicConn != null) {
+        // Send GOAWAY with next request stream ID
+        val controlStreamId = toInt(mapGet(conn, "controlStreamId"))
+        val nextStreamId = toInt(mapGet(conn, "nextRequestStreamId"))
+        val goaway = h3EncodeGoaway(nextStreamId)
+        quicSendStream(quicConn, controlStreamId, goaway, false)
+        // Close QUIC connection with the HTTP/3 error code
+        quicCloseWithError(quicConn, errorCode, reason)
+    }
+}
+
+// == Graceful Shutdown (RFC 9114 Section 5.2) ==================================
+
+// Gracefully close an HTTP/3 connection with two-phase GOAWAY draining.
+// Phase 1: Send initial GOAWAY with MAX_STREAM_ID to announce shutdown intent.
+// Phase 2: Wait for in-flight requests to complete (up to maxDrainIterations).
+// Phase 3: Send final GOAWAY with actual last processed stream ID.
+// Phase 4: Close the QUIC connection.
+// Returns a map with "initialGoaway", "finalGoaway", and "drainedIterations"
+// for observability.
+fun h3GracefulClose(conn: Map, maxDrainIterations: Int): Map {
+    val result = mapCreate()
+    val quicConn = mapGet(conn, "quic")
+    if (quicConn == null) {
+        mapPut(result, "initialGoaway", 0)
+        mapPut(result, "finalGoaway", 0)
+        mapPut(result, "drainedIterations", 0)
+        return result
+    }
+    val controlStreamId = toInt(mapGet(conn, "controlStreamId"))
+    // Phase 1: Send initial GOAWAY with maximum stream ID (RFC 9114 Section 5.2)
+    // This tells the peer "I am shutting down, but I have not decided the last
+    // stream I will accept yet"
+    val maxStreamId = 1073741823
+    val initialGoaway = h3EncodeGoaway(maxStreamId)
+    quicSendStream(quicConn, controlStreamId, initialGoaway, false)
+    mapPut(conn, "shuttingDown", true)
+    mapPut(result, "initialGoaway", maxStreamId)
+    // Phase 2: Drain — read in-flight responses for up to maxDrainIterations
+    // This allows requests already sent by the peer before receiving our GOAWAY
+    // to finish being processed.
+    var drainCount: Int = 0
+    var lastProcessedStreamId: Int = toInt(mapGet(conn, "nextRequestStreamId"))
+    while (drainCount < maxDrainIterations) {
+        val recvResult = quicRecvStream(quicConn, controlStreamId, 65536)
+        val chunk = toString(mapGet(recvResult, "data"))
+        val fin = h3ToBool(mapGet(recvResult, "fin"))
+        if (stringLength(chunk) == 0) {
+            if (fin == false) {
+                drainCount = maxDrainIterations
+            }
+        }
+        // Process any frames in the chunk (e.g., peer GOAWAY)
+        if (stringLength(chunk) > 0) {
+            var chunkPos: Int = 0
+            val chunkLen = stringLength(chunk)
+            while (chunkPos < chunkLen) {
+                val frame = h3DecodeFrame(chunk, chunkPos)
+                val bytesRead = toInt(mapGet(frame, "bytesRead"))
+                if (bytesRead == 0) {
+                    chunkPos = chunkLen
+                } else {
+                    val frameType = toInt(mapGet(frame, "type"))
+                    if (frameType == H3_GOAWAY()) {
+                        val peerGoawayId = h3DecodeGoaway(toString(mapGet(frame, "payload")))
+                        mapPut(conn, "peerGoawayStreamId", peerGoawayId)
+                    }
+                    chunkPos = chunkPos + bytesRead
+                }
+            }
+        }
+        if (fin) {
+            drainCount = maxDrainIterations
+        }
+        drainCount = drainCount + 1
+    }
+    mapPut(result, "drainedIterations", drainCount)
+    // Phase 3: Send final GOAWAY with actual last processed stream ID
+    // After draining, we now know the last stream we will process.
+    val finalStreamId = toInt(mapGet(conn, "nextRequestStreamId"))
+    val finalGoaway = h3EncodeGoaway(finalStreamId)
+    quicSendStream(quicConn, controlStreamId, finalGoaway, false)
+    mapPut(result, "finalGoaway", finalStreamId)
+    // Phase 4: Close the QUIC connection
+    quicClose(quicConn)
+    return result
+}
+
+// == GOAWAY Monotonic Decrease Validation (RFC 9114 Section 5.2, Gap 13) ======
+
+// Validate that a received GOAWAY ID is monotonically decreasing.
+// Each GOAWAY received must have an ID <= the previously received GOAWAY ID.
+// Returns map with "valid" (Bool) and "error" (String).
+fun h3ValidateGoawayId(conn: Map, newGoawayId: Int): Map {
+    val result = mapCreate()
+    mapPut(result, "valid", true)
+    mapPut(result, "error", "")
+    val prevGoawayId = toInt(mapGet(conn, "peerGoawayStreamId"))
+    // If no previous GOAWAY received (peerGoawayStreamId == -1), any value is fine
+    if (prevGoawayId >= 0) {
+        if (newGoawayId > prevGoawayId) {
+            mapPut(result, "valid", false)
+            mapPut(result, "error", "GOAWAY ID increased (must be monotonically decreasing)")
+            return result
+        }
+    }
+    return result
+}
+
+// == Peer Stream Ingestion (RFC 9114 Section 6.2, Gap 5) ======================
+
+// Process new peer-initiated unidirectional streams.
+// Accepts streams, reads type byte, and routes to control/encoder/decoder.
+// Gap 12: Detects duplicate critical streams (H3_STREAM_CREATION_ERROR).
+// Gap 18: Detects control stream closure (H3_CLOSED_CRITICAL_STREAM).
+// Returns map with "ok" (Bool), "error" (String), "errorCode" (Int).
+fun h3ProcessPeerStreams(conn: Map, quicConn: Map): Map {
+    val result = mapCreate()
+    mapPut(result, "ok", true)
+    mapPut(result, "error", "")
+    mapPut(result, "errorCode", 0)
+    // Try to accept new unidirectional streams from the peer
+    var keepAccepting: Bool = true
+    while (keepAccepting) {
+        val acceptResult = quicAcceptUniStream(quicConn)
+        val available = h3ToBool(mapGet(acceptResult, "available"))
+        if (available == false) {
+            keepAccepting = false
+        } else {
+            val newStreamId = toInt(mapGet(acceptResult, "streamId"))
+            // Read the stream type byte
+            val recvResult = quicRecvStream(quicConn, newStreamId, 1)
+            val typeBuf = toString(mapGet(recvResult, "data"))
+            if (stringLength(typeBuf) == 0) {
+                // No type byte available yet, skip
+                keepAccepting = false
+            } else {
+                val typeVarint = quicDecodeVarint(typeBuf, 0)
+                val streamType = toInt(mapGet(typeVarint, "value"))
+                if (streamType == H3_STREAM_CONTROL()) {
+                    // Gap 12: Check for duplicate control stream
+                    val existingId = toInt(mapGet(conn, "peerControlStreamId"))
+                    if (existingId >= 0) {
+                        mapPut(result, "ok", false)
+                        mapPut(result, "error", "Duplicate peer control stream")
+                        mapPut(result, "errorCode", H3_STREAM_CREATION_ERROR())
+                        return result
+                    }
+                    h3SetPeerControlStream(conn, newStreamId)
+                    // Gap 4: Read and validate initial SETTINGS from control stream
+                    val ctrlResult = h3ReadControlStreamFrame(conn, quicConn)
+                    val ctrlOk = h3ToBool(mapGet(ctrlResult, "ok"))
+                    if (ctrlOk == false) {
+                        mapPut(result, "ok", false)
+                        mapPut(result, "error", toString(mapGet(ctrlResult, "error")))
+                        mapPut(result, "errorCode", toInt(mapGet(ctrlResult, "errorCode")))
+                        return result
+                    }
+                } else { if (streamType == H3_STREAM_QPACK_ENCODER()) {
+                    // Gap 12: Check for duplicate encoder stream
+                    val existingEncId = toInt(mapGet(conn, "peerEncoderStreamId"))
+                    if (existingEncId >= 0) {
+                        mapPut(result, "ok", false)
+                        mapPut(result, "error", "Duplicate peer encoder stream")
+                        mapPut(result, "errorCode", H3_STREAM_CREATION_ERROR())
+                        return result
+                    }
+                    h3SetPeerEncoderStream(conn, newStreamId)
+                } else { if (streamType == H3_STREAM_QPACK_DECODER()) {
+                    // Gap 12: Check for duplicate decoder stream
+                    val existingDecId = toInt(mapGet(conn, "peerDecoderStreamId"))
+                    if (existingDecId >= 0) {
+                        mapPut(result, "ok", false)
+                        mapPut(result, "error", "Duplicate peer decoder stream")
+                        mapPut(result, "errorCode", H3_STREAM_CREATION_ERROR())
+                        return result
+                    }
+                    h3SetPeerDecoderStream(conn, newStreamId)
+                } else { if (streamType == H3_STREAM_PUSH()) {
+                    // Push streams — store but do not process here
+                    if (mapContains(conn, "pushStreams") == false) {
+                        mapPut(conn, "pushStreams", listCreate())
+                    }
+                    val pushStreams = mapGet(conn, "pushStreams")
+                    listAppend(pushStreams, newStreamId)
+                } } } }
+                // Unknown stream types are silently ignored per RFC 9114 Section 6.2
+            }
+        }
+    }
+    // Gap 18: Check if peer control stream is closed
+    val peerCtrlId = toInt(mapGet(conn, "peerControlStreamId"))
+    if (peerCtrlId >= 0) {
+        val ctrlRecv = quicRecvStream(quicConn, peerCtrlId, 0)
+        val ctrlFin = h3ToBool(mapGet(ctrlRecv, "fin"))
+        if (ctrlFin) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "Peer control stream closed")
+            mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+            return result
+        }
+    }
+    return result
+}
+
+// == Control Stream Frame Processing (RFC 9114 Section 6.2.1, Gap 4) ==========
+
+// Read and validate a frame from the peer's control stream.
+// On first call, the first frame MUST be SETTINGS (RFC 9114 Section 6.2.1).
+// Subsequent frames: GOAWAY, MAX_PUSH_ID, CANCEL_PUSH are processed.
+// Returns map with "ok" (Bool), "error" (String), "errorCode" (Int),
+// and "frameType" (Int, the type of frame read).
+fun h3ReadControlStreamFrame(conn: Map, quicConn: Map): Map {
+    val result = mapCreate()
+    mapPut(result, "ok", true)
+    mapPut(result, "error", "")
+    mapPut(result, "errorCode", 0)
+    mapPut(result, "frameType", 0 - 1)
+    val peerCtrlStreamId = toInt(mapGet(conn, "peerControlStreamId"))
+    if (peerCtrlStreamId < 0) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "No peer control stream")
+        mapPut(result, "errorCode", H3_INTERNAL_ERROR())
+        return result
+    }
+    // Read from the peer control stream
+    val recvResult = quicRecvStream(quicConn, peerCtrlStreamId, 65536)
+    val chunk = toString(mapGet(recvResult, "data"))
+    val fin = h3ToBool(mapGet(recvResult, "fin"))
+    // Gap 18: Control stream closure detection
+    if (fin) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "Peer control stream closed")
+        mapPut(result, "errorCode", H3_CLOSED_CRITICAL_STREAM())
+        return result
+    }
+    if (stringLength(chunk) == 0) {
+        // No data available yet
+        return result
+    }
+    // Decode frame
+    val frame = h3DecodeFrame(chunk, 0)
+    val frameType = toInt(mapGet(frame, "type"))
+    val payload = toString(mapGet(frame, "payload"))
+    mapPut(result, "frameType", frameType)
+    // Gap 2: Check for HTTP/2-only frame types
+    if (h3IsH2OnlyFrameType(frameType)) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "HTTP/2-only frame type on control stream")
+        mapPut(result, "errorCode", H3_FRAME_UNEXPECTED())
+        return result
+    }
+    // Gap 4: First frame on control stream MUST be SETTINGS
+    val settingsReceived = h3ToBool(mapGet(conn, "peerSettingsReceived"))
+    if (settingsReceived == false) {
+        if (frameType != H3_SETTINGS()) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", "First control stream frame is not SETTINGS")
+            mapPut(result, "errorCode", H3_MISSING_SETTINGS())
+            return result
+        }
+        // Decode and apply settings
+        val settingsResult = h3DecodeSettings(payload)
+        val settingsType = toString(mapGet(settingsResult, "type"))
+        if (settingsType == H3_ERROR()) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", toString(mapGet(settingsResult, "error")))
+            mapPut(result, "errorCode", toInt(mapGet(settingsResult, "errorCode")))
+            return result
+        }
+        val settingsList = mapGet(settingsResult, "params")
+        val applyResult = h3ApplyPeerSettings(conn, settingsList)
+        val applyOk = h3ToBool(mapGet(applyResult, "ok"))
+        if (applyOk == false) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", toString(mapGet(applyResult, "error")))
+            mapPut(result, "errorCode", toInt(mapGet(applyResult, "errorCode")))
+            return result
+        }
+        mapPut(conn, "peerSettingsReceived", true)
+        return result
+    }
+    // Subsequent frames on control stream
+    if (frameType == H3_SETTINGS()) {
+        // Second SETTINGS on control stream is an error
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "Duplicate SETTINGS frame on control stream")
+        mapPut(result, "errorCode", H3_FRAME_UNEXPECTED())
+        return result
+    }
+    if (frameType == H3_GOAWAY()) {
+        val newGoawayId = h3DecodeGoaway(payload)
+        // Gap 13: Validate monotonic decrease
+        val goawayCheck = h3ValidateGoawayId(conn, newGoawayId)
+        val goawayValid = h3ToBool(mapGet(goawayCheck, "valid"))
+        if (goawayValid == false) {
+            mapPut(result, "ok", false)
+            mapPut(result, "error", toString(mapGet(goawayCheck, "error")))
+            mapPut(result, "errorCode", H3_ID_ERROR())
+            return result
+        }
+        mapPut(conn, "peerGoawayStreamId", newGoawayId)
+        mapPut(conn, "shuttingDown", true)
+        return result
+    }
+    if (frameType == H3_MAX_PUSH_ID()) {
+        val maxPushId = h3DecodeMaxPushId(payload)
+        mapPut(conn, "maxPushId", maxPushId)
+        return result
+    }
+    if (frameType == H3_CANCEL_PUSH()) {
+        val cancelledPushId = h3DecodeCancelPush(payload)
+        mapPut(conn, "cancelledPushId", cancelledPushId)
+        return result
+    }
+    // DATA and HEADERS are not allowed on control stream (Gap 11)
+    if (frameType == H3_DATA()) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "DATA frame on control stream")
+        mapPut(result, "errorCode", H3_FRAME_UNEXPECTED())
+        return result
+    }
+    if (frameType == H3_HEADERS()) {
+        mapPut(result, "ok", false)
+        mapPut(result, "error", "HEADERS frame on control stream")
+        mapPut(result, "errorCode", H3_FRAME_UNEXPECTED())
+        return result
+    }
+    // Unknown frame types on control stream are ignored per RFC 9114
+    return result
+}
+
+// == Request/Response =========================================================
+
+// Send an HTTP/3 request and receive the response
+// method: "GET", "POST", etc.
+// path: request path (e.g., "/api/data")
+// headers: additional headers as list of {name, value} maps
+// body: request body (empty string for no body)
+fun h3Request(conn: Map, method: String, path: String, headers: List, body: String): Map {
+    // Check if connection is shutting down
+    if (h3ToBool(mapGet(conn, "shuttingDown"))) {
+        return h3Error("Connection is shutting down (GOAWAY received)")
+    }
+    val quicConn = mapGet(conn, "quic")
+    val host = toString(mapGet(conn, "host"))
+    val enc = mapGet(conn, "qpackEncoder")
+    // Gap 5: Process peer streams before sending
+    val peerResult = h3ProcessPeerStreams(conn, quicConn)
+    val peerOk = h3ToBool(mapGet(peerResult, "ok"))
+    if (peerOk == false) {
+        return h3ErrorWithCode(toString(mapGet(peerResult, "error")), toInt(mapGet(peerResult, "errorCode")))
+    }
+    // Gap 9, 10: Validate and sanitize outbound user headers
+    val headerCheck = h3ValidateRequestHeaders(headers)
+    val headerCheckValid = h3ToBool(mapGet(headerCheck, "valid"))
+    if (headerCheckValid == false) {
+        return h3ErrorWithCode(toString(mapGet(headerCheck, "error")), H3_MESSAGE_ERROR())
+    }
+    val sanitizedHeaders = mapGet(headerCheck, "headers")
+    // Build pseudo-headers + regular headers
+    val allHeaders = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":method")
+    mapPut(h1, "value", method)
+    listAppend(allHeaders, h1)
+    // Gap E: CONNECT omits :scheme and :path pseudo-headers (RFC 9114 Section 4.4)
+    if (method == "CONNECT") {
+        val hAuth = mapCreate()
+        mapPut(hAuth, "name", ":authority")
+        mapPut(hAuth, "value", host)
+        listAppend(allHeaders, hAuth)
+    } else {
+        val h2 = mapCreate()
+        mapPut(h2, "name", ":scheme")
+        mapPut(h2, "value", "https")
+        listAppend(allHeaders, h2)
+        val hAuth = mapCreate()
+        mapPut(hAuth, "name", ":authority")
+        mapPut(hAuth, "value", host)
+        listAppend(allHeaders, hAuth)
+        val h4 = mapCreate()
+        mapPut(h4, "name", ":path")
+        mapPut(h4, "value", path)
+        listAppend(allHeaders, h4)
+    }
+    // Append sanitized user headers
+    var i: Int = 0
+    while (i < listSize(sanitizedHeaders)) {
+        listAppend(allHeaders, listGet(sanitizedHeaders, i))
+        i = i + 1
+    }
+    // Check header list size against peer maxFieldSectionSize
+    val peerSettings = mapGet(conn, "peerSettings")
+    val maxFieldSectionSize = toInt(mapGet(peerSettings, "maxFieldSectionSize"))
+    if (maxFieldSectionSize > 0) {
+        var headerListSize: Int = 0
+        var hi: Int = 0
+        while (hi < listSize(allHeaders)) {
+            val hdr = listGet(allHeaders, hi)
+            val hName = toString(mapGet(hdr, "name"))
+            val hValue = toString(mapGet(hdr, "value"))
+            headerListSize = headerListSize + stringLength(hName) + stringLength(hValue) + 32
+            hi = hi + 1
+        }
+        if (headerListSize > maxFieldSectionSize) {
+            return h3Error("Header list size exceeds peer MAX_FIELD_SECTION_SIZE")
+        }
+    }
+    // Encode headers using QPACK
+    val encResult = qpackEncode(enc, allHeaders)
+    val encodedHeaders = toString(mapGet(encResult, "encoded"))
+    // Send any encoder stream instructions
+    val encoderStreamData = toString(mapGet(encResult, "encoderStream"))
+    if (stringLength(encoderStreamData) > 0) {
+        val encoderStreamId = toInt(mapGet(conn, "qpackEncoderStreamId"))
+        quicSendStream(quicConn, encoderStreamId, encoderStreamData, false)
+    }
+    // Open a request stream (bidirectional)
+    val streamId = quicOpenBidiStream(quicConn)
+    // Gap 16: Track request stream ID for GOAWAY
+    mapPut(conn, "nextRequestStreamId", streamId + 4)
+    // Build HEADERS frame
+    val headersFrame = h3EncodeFrame(H3_HEADERS(), encodedHeaders)
+    if (stringLength(body) > 0) {
+        // Send HEADERS (not fin) + DATA (fin)
+        quicSendStream(quicConn, streamId, headersFrame, false)
+        val dataFrame = h3EncodeFrame(H3_DATA(), body)
+        quicSendStream(quicConn, streamId, dataFrame, true)
+    } else {
+        // Send HEADERS with fin
+        quicSendStream(quicConn, streamId, headersFrame, true)
+    }
+    // Read response
+    return h3ReadResponse(conn, streamId)
+}
+
+// == Frame Sequence State Constants (RFC 9114 Section 4.1, Gap 1) =============
+// State 0: Awaiting initial HEADERS
+// State 1: HEADERS received, expecting DATA or trailing HEADERS
+// State 2: Trailing HEADERS received, no more frames allowed
+
+// Read an HTTP/3 response from a request stream
+// Handles split-frame boundaries: if a frame header or payload is split across
+// multiple recv() calls, buffers and continues receiving until complete.
+// Validates frame sequence (Gap 1), rejects H2-only frames (Gap 2),
+// rejects control-stream-only frames (Gap 11), validates headers (Gap 8, 9, 10),
+// decodes trailers (Gap 6), and validates Content-Length (Gap 14).
+fun h3ReadResponse(conn: Map, streamId: Int): Map {
+    val quicConn = mapGet(conn, "quic")
+    val dec = mapGet(conn, "qpackDecoder")
+    val resp = mapCreate()
+    mapPut(resp, "type", "H3_RESPONSE")
+    mapPut(resp, "status", 0)
+    mapPut(resp, "body", "")
+    mapPut(resp, "headers", listCreate())
+    mapPut(resp, "trailers", listCreate())
+    var headersDecoded: Bool = false
+    var bodyData: String = ""
+    var respBuf: String = ""
+    var streamFinished: Bool = false
+    // Gap 1: Frame sequence state tracking
+    // State 0 = awaiting initial HEADERS
+    // State 1 = HEADERS received, expecting DATA or trailing HEADERS
+    // State 2 = trailing HEADERS received, no more frames allowed
+    var frameSeqState: Int = 0
+    var bodyLength: Int = 0
+    // Outer loop: keep receiving until stream is finished
+    while (streamFinished == false) {
+        val recvResult = quicRecvStream(quicConn, streamId, 65536)
+        val chunk = toString(mapGet(recvResult, "data"))
+        val fin = h3ToBool(mapGet(recvResult, "fin"))
+        respBuf = stringConcat(respBuf, chunk)
+        if (fin) { streamFinished = true }
+        if (stringLength(chunk) == 0) {
+            if (fin == false) {
+                streamFinished = true
+            }
+        }
+        // Inner loop: parse as many complete frames as possible from buffer
+        var parseMore: Bool = true
+        while (parseMore) {
+            val bufLen = stringLength(respBuf)
+            if (bufLen == 0) {
+                parseMore = false
+            } else {
+                // Try to decode a frame from the current buffer
+                val frameCheck = h3DecodeFrameCheck(respBuf, 0)
+                val frameComplete = h3ToBool(mapGet(frameCheck, "complete"))
+                if (frameComplete == false) {
+                    // Incomplete frame header or payload — need more data
+                    parseMore = false
+                } else {
+                    val frame = h3DecodeFrame(respBuf, 0)
+                    val frameType = toInt(mapGet(frame, "type"))
+                    val payload = toString(mapGet(frame, "payload"))
+                    val bytesRead = toInt(mapGet(frame, "bytesRead"))
+                    if (bytesRead == 0) {
+                        parseMore = false
+                    } else {
+                        // Consume the frame from the buffer
+                        if (bytesRead >= bufLen) {
+                            respBuf = ""
+                        } else {
+                            respBuf = substring(respBuf, bytesRead, bufLen)
+                        }
+                        // Gap 2: Reject HTTP/2-only frame types
+                        if (h3IsH2OnlyFrameType(frameType)) {
+                            return h3ErrorWithCode("HTTP/2-only frame type received", H3_FRAME_UNEXPECTED())
+                        }
+                        // Gap 11: Reject control-stream-only frames on request stream
+                        if (h3IsControlStreamOnlyFrame(frameType)) {
+                            return h3ErrorWithCode("Control-stream-only frame on request stream", H3_FRAME_UNEXPECTED())
+                        }
+                        // Process the frame
+                        if (frameType == H3_HEADERS()) {
+                            if (frameSeqState == 0) {
+                                // Initial HEADERS
+                                val decResult = qpackDecode(dec, payload, "")
+                                val headers = mapGet(decResult, "headers")
+                                // Gap 8: Validate response pseudo-headers
+                                val headerValidation = h3ValidateResponseHeaders(headers)
+                                val headerValid = h3ToBool(mapGet(headerValidation, "valid"))
+                                if (headerValid == false) {
+                                    return h3ErrorWithCode(toString(mapGet(headerValidation, "error")), H3_MESSAGE_ERROR())
+                                }
+                                // Extract :status
+                                var decodedStatus: Int = 0
+                                var hi: Int = 0
+                                while (hi < listSize(headers)) {
+                                    val hdr = listGet(headers, hi)
+                                    val hdrName = toString(mapGet(hdr, "name"))
+                                    if (hdrName == ":status") {
+                                        val statusStr = toString(mapGet(hdr, "value"))
+                                        decodedStatus = toInt(statusStr)
+                                    }
+                                    hi = hi + 1
+                                }
+                                // Gap D: 1xx interim response handling (RFC 9114 Section 4.1)
+                                // If status is 100-199, store as interim, reset state, continue
+                                if (decodedStatus >= 100) {
+                                    if (decodedStatus <= 199) {
+                                        mapPut(resp, "interimStatus", decodedStatus)
+                                        mapPut(resp, "interimHeaders", headers)
+                                        // Reset frame sequence state to await final HEADERS
+                                        frameSeqState = 0
+                                    } else {
+                                        mapPut(resp, "headers", headers)
+                                        mapPut(resp, "status", decodedStatus)
+                                        headersDecoded = true
+                                        frameSeqState = 1
+                                    }
+                                } else {
+                                    mapPut(resp, "headers", headers)
+                                    mapPut(resp, "status", decodedStatus)
+                                    headersDecoded = true
+                                    frameSeqState = 1
+                                }
+                            } else { if (frameSeqState == 1) {
+                                // Gap 6: Trailing HEADERS
+                                val trailerResult = qpackDecode(dec, payload, "")
+                                val trailers = mapGet(trailerResult, "headers")
+                                // Gap F: Validate trailers contain no pseudo-headers (RFC 9114 Section 4.3)
+                                var ti: Int = 0
+                                while (ti < listSize(trailers)) {
+                                    val tHdr = listGet(trailers, ti)
+                                    val tName = toString(mapGet(tHdr, "name"))
+                                    if (stringLength(tName) > 0) {
+                                        val tFirstChar = charCodeAt(tName, 0)
+                                        if (tFirstChar == 58) {
+                                            return h3ErrorWithCode("Pseudo-header in trailers", H3_MESSAGE_ERROR())
+                                        }
+                                    }
+                                    ti = ti + 1
+                                }
+                                mapPut(resp, "trailers", trailers)
+                                frameSeqState = 2
+                            } else {
+                                // Gap 1: HEADERS after trailers
+                                return h3ErrorWithCode("HEADERS frame after trailers", H3_FRAME_UNEXPECTED())
+                            } }
+                        } else { if (frameType == H3_DATA()) {
+                            // Gap 1: DATA before initial HEADERS
+                            if (frameSeqState == 0) {
+                                return h3ErrorWithCode("DATA frame before HEADERS", H3_FRAME_UNEXPECTED())
+                            }
+                            // Gap 1: DATA after trailing HEADERS
+                            if (frameSeqState == 2) {
+                                return h3ErrorWithCode("DATA frame after trailers", H3_FRAME_UNEXPECTED())
+                            }
+                            bodyData = stringConcat(bodyData, payload)
+                            bodyLength = bodyLength + stringLength(payload)
+                        } else { if (frameType == H3_PUSH_PROMISE()) {
+                            val pushPromise = h3DecodePushPromise(payload)
+                            if (mapContains(resp, "pushPromises") == false) {
+                                mapPut(resp, "pushPromises", listCreate())
+                            }
+                            val pushPromises = mapGet(resp, "pushPromises")
+                            listAppend(pushPromises, pushPromise)
+                        } } }
+                        // Note: GOAWAY, SETTINGS, MAX_PUSH_ID, CANCEL_PUSH are caught
+                        // by h3IsControlStreamOnlyFrame above and rejected.
+                    }
+                }
+            }
+        }
+    }
+    mapPut(resp, "body", bodyData)
+    // Gap 14: Content-Length vs body length validation
+    if (headersDecoded) {
+        val contentLengthStr = h3Header(resp, "content-length")
+        if (stringLength(contentLengthStr) > 0) {
+            val expectedLen = toInt(contentLengthStr)
+            if (expectedLen != bodyLength) {
+                return h3ErrorWithCode("Content-Length mismatch with actual body length", H3_MESSAGE_ERROR())
+            }
+        }
+    }
+    return resp
+}
+
+// Check if a complete frame is available starting at the given offset in buf.
+// Returns a map with "complete" (Bool) indicating whether the frame header
+// (type varint + length varint) and full payload are present in buf.
+fun h3DecodeFrameCheck(buf: String, offset: Int): Map {
+    val result = mapCreate()
+    val bufLen = stringLength(buf)
+    if (offset >= bufLen) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    // Check if we have enough bytes for the type varint
+    val typeVarintLen = h3VarintBytesNeeded(buf, offset)
+    if (typeVarintLen == 0) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    if (offset + typeVarintLen > bufLen) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    // Check if we have enough bytes for the length varint
+    val lenOffset = offset + typeVarintLen
+    if (lenOffset >= bufLen) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    val lenVarintLen = h3VarintBytesNeeded(buf, lenOffset)
+    if (lenVarintLen == 0) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    if (lenOffset + lenVarintLen > bufLen) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    // Decode the length varint to get payload size
+    val lenResult = quicDecodeVarint(buf, lenOffset)
+    val payloadLen = toInt(mapGet(lenResult, "value"))
+    val headerSize = typeVarintLen + lenVarintLen
+    // Check if the full payload is present
+    if (offset + headerSize + payloadLen > bufLen) {
+        mapPut(result, "complete", false)
+        return result
+    }
+    mapPut(result, "complete", true)
+    return result
+}
+
+// Determine how many bytes a QUIC varint occupies from the first byte.
+// Returns the number of bytes needed (1, 2, 4, or 8), or 0 if not enough data.
+fun h3VarintBytesNeeded(buf: String, offset: Int): Int {
+    val bufLen = stringLength(buf)
+    if (offset >= bufLen) { return 0 }
+    val firstByte = charCodeAt(buf, offset)
+    val prefix = firstByte / 64  // Top 2 bits
+    if (prefix == 0) { return 1 }
+    if (prefix == 1) { return 2 }
+    if (prefix == 2) { return 4 }
+    return 8
+}
+
+// == Response Accessors =======================================================
+
+// Get the HTTP status code from a response
+fun h3Status(resp: Map): Int {
+    return toInt(mapGet(resp, "status"))
+}
+
+// Get the response body as a string
+fun h3Body(resp: Map): String {
+    return toString(mapGet(resp, "body"))
+}
+
+// Get a specific header value from a response (case-insensitive name match)
+fun h3Header(resp: Map, name: String): String {
+    val headers = mapGet(resp, "headers")
+    if (headers == null) { return "" }
+    val lowerName = urlToLower(name)
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val hdr = listGet(headers, i)
+        val hdrName = toString(mapGet(hdr, "name"))
+        if (urlToLower(hdrName) == lowerName) {
+            return toString(mapGet(hdr, "value"))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Get all headers from a response as a list of {name, value} maps
+fun h3Headers(resp: Map): List {
+    val v = mapGet(resp, "headers")
+    if (v == null) { return listCreate() }
+    return v
+}
+
+// Get trailers from a response as a list of {name, value} maps (Gap 6)
+fun h3Trailers(resp: Map): List {
+    val v = mapGet(resp, "trailers")
+    if (v == null) { return listCreate() }
+    return v
+}
+
+// == Simple Client API ========================================================
+
+// Perform an HTTP/3 GET request
+fun h3Get(url: String): Map {
+    val path = urlExtractPath(url)
+    val requestPath = h3NormalizePath(path)
+    val conn = h3Connect(url)
+    if (h3IsError(conn)) { return conn }
+    val resp = h3Request(conn, "GET", requestPath, listCreate(), "")
+    h3Close(conn)
+    return resp
+}
+
+// Perform an HTTP/3 POST request
+fun h3Post(url: String, body: String, contentType: String): Map {
+    val path = urlExtractPath(url)
+    val requestPath = h3NormalizePath(path)
+    val conn = h3Connect(url)
+    if (h3IsError(conn)) { return conn }
+    val headers = listCreate()
+    val ctHeader = mapCreate()
+    mapPut(ctHeader, "name", "content-type")
+    mapPut(ctHeader, "value", contentType)
+    listAppend(headers, ctHeader)
+    val resp = h3Request(conn, "POST", requestPath, headers, body)
+    h3Close(conn)
+    return resp
+}
+
+// Perform an HTTP/3 PUT request
+fun h3Put(url: String, body: String, contentType: String): Map {
+    val path = urlExtractPath(url)
+    val requestPath = h3NormalizePath(path)
+    val conn = h3Connect(url)
+    if (h3IsError(conn)) { return conn }
+    val headers = listCreate()
+    val ctHeader = mapCreate()
+    mapPut(ctHeader, "name", "content-type")
+    mapPut(ctHeader, "value", contentType)
+    listAppend(headers, ctHeader)
+    val resp = h3Request(conn, "PUT", requestPath, headers, body)
+    h3Close(conn)
+    return resp
+}
+
+// Perform an HTTP/3 DELETE request
+fun h3Delete(url: String): Map {
+    val path = urlExtractPath(url)
+    val requestPath = h3NormalizePath(path)
+    val conn = h3Connect(url)
+    if (h3IsError(conn)) { return conn }
+    val resp = h3Request(conn, "DELETE", requestPath, listCreate(), "")
+    h3Close(conn)
+    return resp
+}
+
+// == Helpers ==================================================================
+
+// Convert a value to Bool (no toBool builtin available)
+fun h3ToBool(v: Any): Bool {
+    return v == true
+}
+
+// Normalize a path: ensure it starts with "/" and is not empty
+fun h3NormalizePath(path: String): String {
+    if (stringLength(path) == 0) { return "/" }
+    val firstChar = charCodeAt(path, 0)
+    if (firstChar == 47) { return path }  // 47 = '/'
+    return stringConcat("/", path)
+}
+
+// Case-insensitive comparison helper using urlToLower from url.rok
+// (url.rok is imported transitively through the networking domain)

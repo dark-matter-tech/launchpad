@@ -36,9 +36,9 @@ All imports use the pattern `rockit.<domain>.<module>`:
 | Domain | Modules |
 |--------|---------|
 | `core` | collections, math, strings, result, uuid |
-| `encoding` | base64, hpack, json, xml |
+| `encoding` | base64, hpack, json, qpack, xml |
 | `filesystem` | file, path |
-| `networking` | http, http2, url, websocket |
+| `networking` | http, http2, http3, quic, url, websocket |
 | `security` | tls, crypto, x509, pem |
 | `testing` | probe |
 | `time` | datetime |
@@ -70,8 +70,11 @@ Every module has a corresponding test file in `tests/<domain>/test_<module>.rok`
 | encoding/xml | W3C XML 1.0 Fifth Edition |
 | encoding/base64 | RFC 4648 |
 | encoding/hpack | RFC 7541 |
+| encoding/qpack | RFC 9204 |
 | networking/http | RFC 9110, RFC 9112 |
 | networking/http2 | RFC 9113 |
+| networking/http3 | RFC 9114 |
+| networking/quic | RFC 9000 |
 | networking/url | RFC 3986 |
 | networking/websocket | RFC 6455 |
 | core/uuid | RFC 9562 |

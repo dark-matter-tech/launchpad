@@ -1,0 +1,312 @@
+// Tests for rockit.networking.quic
+import rockit.testing.probe
+import rockit.networking.quic
+
+// == Stream Type Constants ====================================================
+
+@Test fun testQuicStreamTypeConstants() {
+    assertEquals(0, QUIC_STREAM_BIDI_CLIENT())
+    assertEquals(1, QUIC_STREAM_BIDI_SERVER())
+    assertEquals(2, QUIC_STREAM_UNI_CLIENT())
+    assertEquals(3, QUIC_STREAM_UNI_SERVER())
+}
+
+// == Variable-Length Integer Encoding (RFC 9000 Section 16) ====================
+
+// -- 1-byte encoding (values 0-63, prefix 00) --
+
+@Test fun testQuicVarintEncode0() {
+    val encoded = quicEncodeVarint(0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(0, charCodeAt(encoded, 0))
+}
+
+@Test fun testQuicVarintEncode1() {
+    val encoded = quicEncodeVarint(1)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(1, charCodeAt(encoded, 0))
+}
+
+@Test fun testRfc9000_S16_Encode37() {
+    // RFC 9000 Section 16 example: value 37 → 0x25
+    val encoded = quicEncodeVarint(37)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(37, charCodeAt(encoded, 0))
+}
+
+@Test fun testQuicVarintEncode63() {
+    val encoded = quicEncodeVarint(63)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(63, charCodeAt(encoded, 0))
+}
+
+// -- 2-byte encoding (values 64-16383, prefix 01) --
+
+@Test fun testQuicVarintEncode64() {
+    val encoded = quicEncodeVarint(64)
+    assertEquals(2, stringLength(encoded))
+    // 0x4000 + 64 = 0x4040 → bytes: 0x40, 0x40
+    assertEquals(64, charCodeAt(encoded, 0))
+    assertEquals(64, charCodeAt(encoded, 1))
+}
+
+@Test fun testRfc9000_S16_Encode15293() {
+    // RFC 9000 Section 16 example: value 15293 → 0x7bbd
+    val encoded = quicEncodeVarint(15293)
+    assertEquals(2, stringLength(encoded))
+    // 15293 = 59*256 + 189, but with prefix: 64 + 59 = 123, 189
+    assertEquals(123, charCodeAt(encoded, 0))   // 0x7b
+    assertEquals(189, charCodeAt(encoded, 1))   // 0xbd
+}
+
+@Test fun testQuicVarintEncode16383() {
+    val encoded = quicEncodeVarint(16383)
+    assertEquals(2, stringLength(encoded))
+    // 16383 = 0x3FFF, with prefix 01: 0x7FFF → 127, 255
+    assertEquals(127, charCodeAt(encoded, 0))
+    assertEquals(255, charCodeAt(encoded, 1))
+}
+
+// -- 4-byte encoding (values 16384-1073741823, prefix 10) --
+
+@Test fun testQuicVarintEncode16384() {
+    val encoded = quicEncodeVarint(16384)
+    assertEquals(4, stringLength(encoded))
+    // 16384 = 0x00004000, with prefix 10: 0x80004000
+    assertEquals(128, charCodeAt(encoded, 0))  // 0x80
+    assertEquals(0, charCodeAt(encoded, 1))
+    assertEquals(64, charCodeAt(encoded, 2))   // 0x40
+    assertEquals(0, charCodeAt(encoded, 3))
+}
+
+@Test fun testRfc9000_S16_Encode494878333() {
+    // RFC 9000 Section 16 example: value 494878333 → 0x9d7f3e7d
+    val encoded = quicEncodeVarint(494878333)
+    assertEquals(4, stringLength(encoded))
+    assertEquals(157, charCodeAt(encoded, 0))  // 0x9d
+    assertEquals(127, charCodeAt(encoded, 1))  // 0x7f
+    assertEquals(62, charCodeAt(encoded, 2))   // 0x3e
+    assertEquals(125, charCodeAt(encoded, 3))  // 0x7d
+}
+
+// -- Decoding tests --
+
+@Test fun testQuicVarintDecode1Byte() {
+    val encoded = quicEncodeVarint(37)
+    val result = quicDecodeVarint(encoded, 0)
+    assertEquals(37, toInt(mapGet(result, "value")))
+    assertEquals(1, toInt(mapGet(result, "bytesRead")))
+}
+
+@Test fun testQuicVarintDecode2Byte() {
+    val encoded = quicEncodeVarint(15293)
+    val result = quicDecodeVarint(encoded, 0)
+    assertEquals(15293, toInt(mapGet(result, "value")))
+    assertEquals(2, toInt(mapGet(result, "bytesRead")))
+}
+
+@Test fun testQuicVarintDecode4Byte() {
+    val encoded = quicEncodeVarint(494878333)
+    val result = quicDecodeVarint(encoded, 0)
+    assertEquals(494878333, toInt(mapGet(result, "value")))
+    assertEquals(4, toInt(mapGet(result, "bytesRead")))
+}
+
+@Test fun testQuicVarintDecodeAtOffset() {
+    // Put varint at offset 3 in a buffer
+    var buf: String = intToChar(0)
+    buf = stringConcat(buf, intToChar(0))
+    buf = stringConcat(buf, intToChar(0))
+    buf = stringConcat(buf, quicEncodeVarint(42))
+    val result = quicDecodeVarint(buf, 3)
+    assertEquals(42, toInt(mapGet(result, "value")))
+    assertEquals(1, toInt(mapGet(result, "bytesRead")))
+}
+
+@Test fun testQuicVarintDecodeEmpty() {
+    val result = quicDecodeVarint("", 0)
+    assertEquals(0, toInt(mapGet(result, "value")))
+    assertEquals(0, toInt(mapGet(result, "bytesRead")))
+}
+
+// -- Roundtrip tests --
+
+@Test fun testQuicVarintRoundtrip1Byte() {
+    var v: Int = 0
+    while (v <= 63) {
+        val encoded = quicEncodeVarint(v)
+        assertEquals(1, stringLength(encoded))
+        val result = quicDecodeVarint(encoded, 0)
+        assertEquals(v, toInt(mapGet(result, "value")))
+        v = v + 1
+    }
+}
+
+@Test fun testQuicVarintRoundtrip2Byte() {
+    // Test boundary values and a few samples
+    val values = listCreate()
+    listAppend(values, 64)
+    listAppend(values, 100)
+    listAppend(values, 256)
+    listAppend(values, 1000)
+    listAppend(values, 8192)
+    listAppend(values, 15293)
+    listAppend(values, 16383)
+    var i: Int = 0
+    while (i < listSize(values)) {
+        val v = toInt(listGet(values, i))
+        val encoded = quicEncodeVarint(v)
+        assertEquals(2, stringLength(encoded))
+        val result = quicDecodeVarint(encoded, 0)
+        assertEquals(v, toInt(mapGet(result, "value")))
+        i = i + 1
+    }
+}
+
+@Test fun testQuicVarintRoundtrip4Byte() {
+    val values = listCreate()
+    listAppend(values, 16384)
+    listAppend(values, 65536)
+    listAppend(values, 1000000)
+    listAppend(values, 494878333)
+    listAppend(values, 1073741823)
+    var i: Int = 0
+    while (i < listSize(values)) {
+        val v = toInt(listGet(values, i))
+        val encoded = quicEncodeVarint(v)
+        assertEquals(4, stringLength(encoded))
+        val result = quicDecodeVarint(encoded, 0)
+        assertEquals(v, toInt(mapGet(result, "value")))
+        i = i + 1
+    }
+}
+
+@Test fun testQuicVarintRoundtripBoundaries() {
+    // Test the exact boundary values between encoding sizes
+    val e63 = quicEncodeVarint(63)
+    assertEquals(1, stringLength(e63))
+    val e64 = quicEncodeVarint(64)
+    assertEquals(2, stringLength(e64))
+    val e16383 = quicEncodeVarint(16383)
+    assertEquals(2, stringLength(e16383))
+    val e16384 = quicEncodeVarint(16384)
+    assertEquals(4, stringLength(e16384))
+    val e1073741823 = quicEncodeVarint(1073741823)
+    assertEquals(4, stringLength(e1073741823))
+}
+
+// -- Varint Size function --
+
+@Test fun testQuicVarintSize() {
+    assertEquals(1, quicVarintSize(0))
+    assertEquals(1, quicVarintSize(63))
+    assertEquals(2, quicVarintSize(64))
+    assertEquals(2, quicVarintSize(16383))
+    assertEquals(4, quicVarintSize(16384))
+    assertEquals(4, quicVarintSize(1073741823))
+}
+
+// -- Multiple varints in sequence --
+
+@Test fun testQuicVarintSequence() {
+    // Encode multiple varints sequentially
+    var buf: String = quicEncodeVarint(5)      // 1 byte
+    buf = stringConcat(buf, quicEncodeVarint(500))    // 2 bytes
+    buf = stringConcat(buf, quicEncodeVarint(50000))  // 4 bytes
+    // Decode in sequence
+    val r1 = quicDecodeVarint(buf, 0)
+    assertEquals(5, toInt(mapGet(r1, "value")))
+    assertEquals(1, toInt(mapGet(r1, "bytesRead")))
+    val r2 = quicDecodeVarint(buf, 1)
+    assertEquals(500, toInt(mapGet(r2, "value")))
+    assertEquals(2, toInt(mapGet(r2, "bytesRead")))
+    val r3 = quicDecodeVarint(buf, 3)
+    assertEquals(50000, toInt(mapGet(r3, "value")))
+    assertEquals(4, toInt(mapGet(r3, "bytesRead")))
+}
+
+// == Error Handling ===========================================================
+
+@Test fun testQuicError() {
+    val err = quicError("connection failed")
+    assertTrue(quicIsError(err))
+    assertEqualsStr("connection failed", toString(mapGet(err, "error")))
+}
+
+@Test fun testQuicNotError() {
+    val result = mapCreate()
+    mapPut(result, "type", "QUIC_CONN")
+    assertFalse(quicIsError(result))
+}
+
+// == Error Constant ===========================================================
+
+@Test fun testQuicErrorConstant() {
+    assertEqualsStr("QUIC_ERROR", QUIC_ERROR())
+}
+
+// == RFC 9000 Appendix A.1 — Non-Minimal Encoding ============================
+
+@Test fun testRfcA1_NonMinimalDecode37() {
+    // RFC 9000 notes that value 37 can also be decoded from the 2-byte
+    // encoding 0x4025 (prefix 01, value 37). This is non-minimal but valid.
+    var buf: String = quicByteToChar(64)    // 0x40
+    buf = stringConcat(buf, quicByteToChar(37))    // 0x25
+    val result = quicDecodeVarint(buf, 0)
+    assertEquals(37, toInt(mapGet(result, "value")))
+    assertEquals(2, toInt(mapGet(result, "bytesRead")))
+}
+
+// == RFC 9000 Section 16 — 8-Byte Varint ======================================
+
+@Test fun testRfc9000_S16_Encode151288809941952652() {
+    // RFC 9000 Section 16 example: value 151288809941952652 → 0xc2197c5eff14e88c
+    val encoded = quicEncodeVarint(151288809941952652)
+    assertEquals(8, stringLength(encoded))
+    assertEquals(194, charCodeAt(encoded, 0))  // 0xc2
+    assertEquals(25, charCodeAt(encoded, 1))   // 0x19
+    assertEquals(124, charCodeAt(encoded, 2))  // 0x7c
+    assertEquals(94, charCodeAt(encoded, 3))   // 0x5e
+    assertEquals(255, charCodeAt(encoded, 4))  // 0xff
+    assertEquals(20, charCodeAt(encoded, 5))   // 0x14
+    assertEquals(232, charCodeAt(encoded, 6))  // 0xe8
+    assertEquals(140, charCodeAt(encoded, 7))  // 0x8c
+}
+
+@Test fun testRfc9000_S16_Decode8Byte() {
+    // Construct the 8-byte sequence from RFC 9000 Section 16 and decode
+    var buf: String = quicByteToChar(194)   // 0xc2
+    buf = stringConcat(buf, quicByteToChar(25))    // 0x19
+    buf = stringConcat(buf, quicByteToChar(124))   // 0x7c
+    buf = stringConcat(buf, quicByteToChar(94))    // 0x5e
+    buf = stringConcat(buf, quicByteToChar(255))   // 0xff
+    buf = stringConcat(buf, quicByteToChar(20))    // 0x14
+    buf = stringConcat(buf, quicByteToChar(232))   // 0xe8
+    buf = stringConcat(buf, quicByteToChar(140))   // 0x8c
+    val result = quicDecodeVarint(buf, 0)
+    assertEquals(151288809941952652, toInt(mapGet(result, "value")))
+    assertEquals(8, toInt(mapGet(result, "bytesRead")))
+}
+
+// == High-Byte Roundtrip ======================================================
+
+@Test fun testRfc9000_VarintHighBytes() {
+    // Prove bytes >= 128 survive roundtrip (validates quicByteToChar fix)
+    // 2-byte: value 16383 → 0x7FFF → bytes 127 and 255
+    val e2 = quicEncodeVarint(16383)
+    assertEquals(2, stringLength(e2))
+    assertEquals(127, charCodeAt(e2, 0))   // 0x7F
+    assertEquals(255, charCodeAt(e2, 1))   // 0xFF — byte >= 128
+    val d2 = quicDecodeVarint(e2, 0)
+    assertEquals(16383, toInt(mapGet(d2, "value")))
+
+    // 4-byte: value 1073741823 → 0xBFFFFFFF → bytes 191, 255, 255, 255
+    val e4 = quicEncodeVarint(1073741823)
+    assertEquals(4, stringLength(e4))
+    assertEquals(191, charCodeAt(e4, 0))   // 0xBF — byte >= 128
+    assertEquals(255, charCodeAt(e4, 1))   // 0xFF
+    assertEquals(255, charCodeAt(e4, 2))   // 0xFF
+    assertEquals(255, charCodeAt(e4, 3))   // 0xFF
+    val d4 = quicDecodeVarint(e4, 0)
+    assertEquals(1073741823, toInt(mapGet(d4, "value")))
+}

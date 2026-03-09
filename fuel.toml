@@ -33,6 +33,14 @@ exclude = []
 include = ["security"]
 exclude = []
 
+[test.scheme.http3]
+include = ["encoding", "networking"]
+exclude = []
+
+[test.scheme.interop]
+include = ["networking"]
+exclude = []
+
 [test.scheme.all]
 include = ["*"]
 exclude = []

@@ -1,0 +1,1210 @@
+// rockit.encoding.qpack — QPACK header compression for HTTP/3
+//
+// Implements QPACK header compression as defined in RFC 9204. QPACK adapts
+// HPACK for out-of-order delivery over QUIC, using a 99-entry static table,
+// absolute indexing for the dynamic table, and separate encoder/decoder
+// streams. Reuses HPACK integer encoding primitives.
+//
+// Standards: RFC 9204 — QPACK: Field Compression for HTTP/3
+//
+// Usage:
+//   import rockit.encoding.qpack
+//   import rockit.encoding.hpack
+//   val enc = qpackCreateEncoder(4096)
+//   val result = qpackEncode(enc, headers)
+
+// == Error Constants ==========================================================
+
+fun QPACK_ERROR(): String { return "QPACK_ERROR" }
+
+// == Static Table (RFC 9204 Appendix A) =======================================
+// 99 entries indexed 0-98 (unlike HPACK's 1-61)
+
+fun qpackStaticSize(): Int { return 99 }
+
+// Return the header name for a static table index (0-98)
+fun qpackStaticName(index: Int): String {
+    if (index == 0) { return ":authority" }
+    if (index == 1) { return ":path" }
+    if (index == 2) { return "age" }
+    if (index == 3) { return "content-disposition" }
+    if (index == 4) { return "content-length" }
+    if (index == 5) { return "cookie" }
+    if (index == 6) { return "date" }
+    if (index == 7) { return "etag" }
+    if (index == 8) { return "if-modified-since" }
+    if (index == 9) { return "if-none-match" }
+    if (index == 10) { return "last-modified" }
+    if (index == 11) { return "link" }
+    if (index == 12) { return "location" }
+    if (index == 13) { return "referer" }
+    if (index == 14) { return "set-cookie" }
+    if (index == 15) { return ":method" }
+    if (index == 16) { return ":method" }
+    if (index == 17) { return ":method" }
+    if (index == 18) { return ":method" }
+    if (index == 19) { return ":method" }
+    if (index == 20) { return ":method" }
+    if (index == 21) { return ":method" }
+    if (index == 22) { return ":scheme" }
+    if (index == 23) { return ":scheme" }
+    if (index == 24) { return ":status" }
+    if (index == 25) { return ":status" }
+    if (index == 26) { return ":status" }
+    if (index == 27) { return ":status" }
+    if (index == 28) { return ":status" }
+    if (index == 29) { return "accept" }
+    if (index == 30) { return "accept" }
+    if (index == 31) { return "accept-encoding" }
+    if (index == 32) { return "accept-ranges" }
+    if (index == 33) { return "access-control-allow-headers" }
+    if (index == 34) { return "access-control-allow-headers" }
+    if (index == 35) { return "access-control-allow-origin" }
+    if (index == 36) { return "cache-control" }
+    if (index == 37) { return "cache-control" }
+    if (index == 38) { return "cache-control" }
+    if (index == 39) { return "cache-control" }
+    if (index == 40) { return "cache-control" }
+    if (index == 41) { return "cache-control" }
+    if (index == 42) { return "content-encoding" }
+    if (index == 43) { return "content-encoding" }
+    if (index == 44) { return "content-type" }
+    if (index == 45) { return "content-type" }
+    if (index == 46) { return "content-type" }
+    if (index == 47) { return "content-type" }
+    if (index == 48) { return "content-type" }
+    if (index == 49) { return "content-type" }
+    if (index == 50) { return "content-type" }
+    if (index == 51) { return "content-type" }
+    if (index == 52) { return "content-type" }
+    if (index == 53) { return "content-type" }
+    if (index == 54) { return "content-type" }
+    if (index == 55) { return "range" }
+    if (index == 56) { return "strict-transport-security" }
+    if (index == 57) { return "strict-transport-security" }
+    if (index == 58) { return "strict-transport-security" }
+    if (index == 59) { return "vary" }
+    if (index == 60) { return "vary" }
+    if (index == 61) { return "x-content-type-options" }
+    if (index == 62) { return "x-xss-protection" }
+    if (index == 63) { return ":status" }
+    if (index == 64) { return ":status" }
+    if (index == 65) { return ":status" }
+    if (index == 66) { return ":status" }
+    if (index == 67) { return ":status" }
+    if (index == 68) { return ":status" }
+    if (index == 69) { return ":status" }
+    if (index == 70) { return ":status" }
+    if (index == 71) { return ":status" }
+    if (index == 72) { return "accept-language" }
+    if (index == 73) { return "access-control-allow-credentials" }
+    if (index == 74) { return "access-control-allow-credentials" }
+    if (index == 75) { return "access-control-allow-headers" }
+    if (index == 76) { return "access-control-allow-methods" }
+    if (index == 77) { return "access-control-allow-methods" }
+    if (index == 78) { return "access-control-allow-methods" }
+    if (index == 79) { return "access-control-expose-headers" }
+    if (index == 80) { return "access-control-request-headers" }
+    if (index == 81) { return "access-control-request-method" }
+    if (index == 82) { return "access-control-request-method" }
+    if (index == 83) { return "alt-svc" }
+    if (index == 84) { return "authorization" }
+    if (index == 85) { return "content-security-policy" }
+    if (index == 86) { return "early-data" }
+    if (index == 87) { return "expect-ct" }
+    if (index == 88) { return "forwarded" }
+    if (index == 89) { return "if-range" }
+    if (index == 90) { return "origin" }
+    if (index == 91) { return "purpose" }
+    if (index == 92) { return "server" }
+    if (index == 93) { return "timing-allow-origin" }
+    if (index == 94) { return "upgrade-insecure-requests" }
+    if (index == 95) { return "user-agent" }
+    if (index == 96) { return "x-forwarded-for" }
+    if (index == 97) { return "x-frame-options" }
+    if (index == 98) { return "x-frame-options" }
+    return ""
+}
+
+// Return the header value for a static table index (0-98)
+fun qpackStaticValue(index: Int): String {
+    if (index == 1) { return "/" }
+    if (index == 2) { return "0" }
+    if (index == 4) { return "0" }
+    if (index == 15) { return "CONNECT" }
+    if (index == 16) { return "DELETE" }
+    if (index == 17) { return "GET" }
+    if (index == 18) { return "HEAD" }
+    if (index == 19) { return "OPTIONS" }
+    if (index == 20) { return "POST" }
+    if (index == 21) { return "PUT" }
+    if (index == 22) { return "http" }
+    if (index == 23) { return "https" }
+    if (index == 24) { return "103" }
+    if (index == 25) { return "200" }
+    if (index == 26) { return "304" }
+    if (index == 27) { return "404" }
+    if (index == 28) { return "503" }
+    if (index == 29) { return "*/*" }
+    if (index == 30) { return "application/dns-message" }
+    if (index == 31) { return "gzip, deflate, br" }
+    if (index == 32) { return "bytes" }
+    if (index == 33) { return "cache-control" }
+    if (index == 34) { return "content-type" }
+    if (index == 35) { return "*" }
+    if (index == 36) { return "max-age=0" }
+    if (index == 37) { return "max-age=2592000" }
+    if (index == 38) { return "max-age=604800" }
+    if (index == 39) { return "no-cache" }
+    if (index == 40) { return "no-store" }
+    if (index == 41) { return "public, max-age=31536000" }
+    if (index == 42) { return "br" }
+    if (index == 43) { return "gzip" }
+    if (index == 44) { return "application/dns-message" }
+    if (index == 45) { return "application/javascript" }
+    if (index == 46) { return "application/json" }
+    if (index == 47) { return "application/x-www-form-urlencoded" }
+    if (index == 48) { return "image/gif" }
+    if (index == 49) { return "image/jpeg" }
+    if (index == 50) { return "image/png" }
+    if (index == 51) { return "text/css" }
+    if (index == 52) { return "text/html; charset=utf-8" }
+    if (index == 53) { return "text/plain" }
+    if (index == 54) { return "text/plain;charset=utf-8" }
+    if (index == 55) { return "bytes=0-" }
+    if (index == 56) { return "max-age=31536000" }
+    if (index == 57) { return "max-age=31536000; includesubdomains" }
+    if (index == 58) { return "max-age=31536000; includesubdomains; preload" }
+    if (index == 59) { return "accept-encoding" }
+    if (index == 60) { return "origin" }
+    if (index == 61) { return "nosniff" }
+    if (index == 62) { return "1; mode=block" }
+    if (index == 63) { return "100" }
+    if (index == 64) { return "204" }
+    if (index == 65) { return "206" }
+    if (index == 66) { return "302" }
+    if (index == 67) { return "400" }
+    if (index == 68) { return "403" }
+    if (index == 69) { return "421" }
+    if (index == 70) { return "425" }
+    if (index == 71) { return "500" }
+    if (index == 73) { return "FALSE" }
+    if (index == 74) { return "TRUE" }
+    if (index == 75) { return "*" }
+    if (index == 76) { return "get" }
+    if (index == 77) { return "options" }
+    if (index == 78) { return "post" }
+    if (index == 79) { return "content-length" }
+    if (index == 81) { return "get" }
+    if (index == 82) { return "post" }
+    if (index == 86) { return "1" }
+    if (index == 91) { return "prefetch" }
+    if (index == 94) { return "1" }
+    if (index == 97) { return "deny" }
+    if (index == 98) { return "sameorigin" }
+    return ""
+}
+
+// Return a map with "name" and "value" for a static table index
+fun qpackStaticEntry(index: Int): Map {
+    val entry = mapCreate()
+    mapPut(entry, "name", qpackStaticName(index))
+    mapPut(entry, "value", qpackStaticValue(index))
+    return entry
+}
+
+// Look up exact match (name+value) in static table, return index or -1
+fun qpackStaticLookup(name: String, value: String): Int {
+    var i: Int = 0
+    while (i < 99) {
+        if (qpackStaticName(i) == name) {
+            if (qpackStaticValue(i) == value) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Look up name-only match in static table, return first index or -1
+fun qpackStaticLookupName(name: String): Int {
+    var i: Int = 0
+    while (i < 99) {
+        if (qpackStaticName(i) == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// == Bitwise Helpers ==========================================================
+
+fun qpackPow2(n: Int): Int {
+    var result: Int = 1
+    var i: Int = 0
+    while (i < n) {
+        result = result * 2
+        i = i + 1
+    }
+    return result
+}
+
+fun qpackAnd(a: Int, mask: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vm: Int = mask
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val mBit = vm - (vm / 2) * 2
+        if (aBit == 1) {
+            if (mBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vm = vm / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}
+
+fun qpackOr(a: Int, b: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vb: Int = b
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val bBit = vb - (vb / 2) * 2
+        if (aBit == 1) {
+            result = result + bit
+        } else {
+            if (bBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vb = vb / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}
+
+// == Dynamic Table (RFC 9204 Section 3.2) =====================================
+// QPACK uses absolute indexing. The insertCount tracks total insertions.
+// Dynamic entries are stored newest-first, with absolute index = insertCount - 1 - listIdx.
+
+// Create a QPACK encoder context
+fun qpackCreateEncoder(maxTableSize: Int): Map {
+    val enc = mapCreate()
+    mapPut(enc, "dynamicEntries", listCreate())
+    mapPut(enc, "dynamicSize", 0)
+    mapPut(enc, "maxSize", maxTableSize)
+    mapPut(enc, "insertCount", 0)
+    mapPut(enc, "knownReceived", 0)
+    return enc
+}
+
+// Create a QPACK encoder context with default capacity (4096)
+fun qpackCreateEncoder(): Map {
+    return qpackCreateEncoder(4096)
+}
+
+// Create a QPACK decoder context
+fun qpackCreateDecoder(maxTableSize: Int): Map {
+    val dec = mapCreate()
+    mapPut(dec, "dynamicEntries", listCreate())
+    mapPut(dec, "dynamicSize", 0)
+    mapPut(dec, "maxSize", maxTableSize)
+    mapPut(dec, "insertCount", 0)
+    mapPut(dec, "knownReceivedCount", 0)
+    mapPut(dec, "blockedStreams", listCreate())
+    mapPut(dec, "maxBlockedStreams", 100)
+    mapPut(dec, "maxHeaderFieldSize", 8192)
+    mapPut(dec, "maxTotalDecodedSize", 65536)
+    return dec
+}
+
+// Create a QPACK decoder context with default capacity (4096)
+fun qpackCreateDecoder(): Map {
+    return qpackCreateDecoder(4096)
+}
+
+// Add an entry to the dynamic table (newest at index 0 in the list)
+// Entry size = len(name) + len(value) + 32 per RFC 9204 Section 3.2.1
+fun qpackDynamicAdd(ctx: Map, name: String, value: String): Unit {
+    val entrySize = stringLength(name) + stringLength(value) + 32
+    val maxSize = toInt(mapGet(ctx, "maxSize"))
+    if (entrySize > maxSize) {
+        val entries = mapGet(ctx, "dynamicEntries")
+        while (listSize(entries) > 0) {
+            listRemoveAt(entries, listSize(entries) - 1)
+        }
+        mapPut(ctx, "dynamicSize", 0)
+        return
+    }
+    qpackDynamicEvict(ctx, maxSize - entrySize)
+    val entry = mapCreate()
+    mapPut(entry, "name", name)
+    mapPut(entry, "value", value)
+    // Prepend entry to front of list (no listInsert builtin)
+    val oldEntries = mapGet(ctx, "dynamicEntries")
+    val newEntries = listCreate()
+    listAppend(newEntries, entry)
+    var idx: Int = 0
+    while (idx < listSize(oldEntries)) {
+        listAppend(newEntries, listGet(oldEntries, idx))
+        idx = idx + 1
+    }
+    mapPut(ctx, "dynamicEntries", newEntries)
+    val currentSize = toInt(mapGet(ctx, "dynamicSize"))
+    mapPut(ctx, "dynamicSize", currentSize + entrySize)
+    val insertCount = toInt(mapGet(ctx, "insertCount"))
+    mapPut(ctx, "insertCount", insertCount + 1)
+}
+
+// Evict entries from the end until dynamicSize <= targetSize
+fun qpackDynamicEvict(ctx: Map, targetSize: Int): Unit {
+    val entries = mapGet(ctx, "dynamicEntries")
+    var currentSize: Int = toInt(mapGet(ctx, "dynamicSize"))
+    while (currentSize > targetSize) {
+        if (listSize(entries) == 0) {
+            currentSize = 0
+        } else {
+            val lastIdx = listSize(entries) - 1
+            val last = listGet(entries, lastIdx)
+            val name = toString(mapGet(last, "name"))
+            val value = toString(mapGet(last, "value"))
+            val entrySize = stringLength(name) + stringLength(value) + 32
+            currentSize = currentSize - entrySize
+            listRemoveAt(entries, lastIdx)
+        }
+    }
+    if (currentSize < 0) { currentSize = 0 }
+    mapPut(ctx, "dynamicSize", currentSize)
+}
+
+// Set dynamic table capacity, evicting as needed
+fun qpackDynamicSetCapacity(ctx: Map, newMaxSize: Int): Unit {
+    mapPut(ctx, "maxSize", newMaxSize)
+    qpackDynamicEvict(ctx, newMaxSize)
+}
+
+// Get the number of entries in the dynamic table
+fun qpackDynamicTableLength(ctx: Map): Int {
+    val entries = mapGet(ctx, "dynamicEntries")
+    return listSize(entries)
+}
+
+// Get the current byte size of the dynamic table
+fun qpackDynamicTableSize(ctx: Map): Int {
+    return toInt(mapGet(ctx, "dynamicSize"))
+}
+
+// Lookup a dynamic table entry by absolute index
+// Absolute index = insertCount - 1 for newest, counting down
+fun qpackDynamicLookup(ctx: Map, absIndex: Int): Map {
+    val insertCount = toInt(mapGet(ctx, "insertCount"))
+    val entries = mapGet(ctx, "dynamicEntries")
+    // List index 0 = newest = absolute index (insertCount - 1)
+    // List index n = absolute index (insertCount - 1 - n)
+    val listIdx = (insertCount - 1) - absIndex
+    val result = mapCreate()
+    if (listIdx >= 0) {
+        if (listIdx < listSize(entries)) {
+            val entry = listGet(entries, listIdx)
+            mapPut(result, "name", toString(mapGet(entry, "name")))
+            mapPut(result, "value", toString(mapGet(entry, "value")))
+            return result
+        }
+    }
+    mapPut(result, "name", "")
+    mapPut(result, "value", "")
+    return result
+}
+
+// Lookup a dynamic entry name by absolute index
+fun qpackDynamicLookupName(ctx: Map, absIndex: Int): String {
+    val entry = qpackDynamicLookup(ctx, absIndex)
+    return toString(mapGet(entry, "name"))
+}
+
+// == Required Insert Count (RFC 9204 Section 4.5.1) ===========================
+
+// Encode Required Insert Count for a field section prefix (RFC 9204 Section 4.5.1)
+// reqInsertCount: the minimum insertCount the decoder needs
+// maxTableCapacity: the maximum dynamic table capacity
+// Returns: encoded RIC value using modular arithmetic
+fun qpackEncodeRequiredInsertCount(reqInsertCount: Int, maxTableCapacity: Int): Int {
+    if (reqInsertCount == 0) { return 0 }
+    val maxEntries = maxTableCapacity / 32
+    if (maxEntries == 0) {
+        // Fallback: identity encoding when table capacity is too small
+        return reqInsertCount
+    }
+    val fullRange = 2 * maxEntries
+    return (reqInsertCount - ((reqInsertCount / fullRange) * fullRange)) + 1
+}
+
+// Decode Required Insert Count from the encoded value (RFC 9204 Section 4.5.1)
+// encoded: the encoded RIC from the wire
+// totalInsertCount: the total number of inserts processed so far
+// maxTableCapacity: the maximum dynamic table capacity
+// Returns: the decoded Required Insert Count
+fun qpackDecodeRequiredInsertCount(encoded: Int, totalInsertCount: Int, maxTableCapacity: Int): Int {
+    if (encoded == 0) { return 0 }
+    val maxEntries = maxTableCapacity / 32
+    if (maxEntries == 0) {
+        // Gap Q1: When maxTableCapacity is 0 (no dynamic table), encoded > 0 is invalid
+        // because no dynamic references should be possible.
+        return -1
+    }
+    val fullRange = 2 * maxEntries
+    val maxValue = totalInsertCount + maxEntries
+    // MaxWrapped = floor(maxValue / fullRange) * fullRange
+    val maxWrapped = (maxValue / fullRange) * fullRange
+    var reqInsertCount: Int = maxWrapped + encoded - 1
+    // If reqInsertCount > maxValue, subtract fullRange
+    if (reqInsertCount > maxValue) {
+        if (reqInsertCount <= fullRange) {
+            // Gap Q1: Encoded value is invalid — signal connection error
+            return -1
+        }
+        reqInsertCount = reqInsertCount - fullRange
+    }
+    // reqInsertCount must be > 0 (since encoded > 0)
+    if (reqInsertCount < 1) { return -1 }
+    return reqInsertCount
+}
+
+// == Encoder Stream Instructions (RFC 9204 Section 4.3) =======================
+
+// Set Dynamic Table Capacity (Section 4.3.1)
+// Instruction format: 001xxxxx, 5-bit prefix integer
+fun qpackSetDynamicTableCapacity(enc: Map, capacity: Int): String {
+    qpackDynamicSetCapacity(enc, capacity)
+    return hpackEncodeInt(capacity, 5, 32)
+}
+
+// Insert With Name Reference (Section 4.3.2)
+// Instruction format for static ref:  11xxxxxx, 6-bit prefix integer
+// Instruction format for dynamic ref: 10xxxxxx, 6-bit prefix integer
+// Followed by value string
+fun qpackInsertWithNameRef(enc: Map, isStatic: Bool, nameIdx: Int, value: String): String {
+    var result: String = ""
+    if (isStatic) {
+        // 1 1 N N N N N N — static, 6-bit prefix, high bits = 0xc0 = 192
+        result = hpackEncodeInt(nameIdx, 6, 192)
+    } else {
+        // 1 0 N N N N N N — dynamic, 6-bit prefix, high bits = 0x80 = 128
+        result = hpackEncodeInt(nameIdx, 6, 128)
+    }
+    result = stringConcat(result, hpackEncodeString(value))
+    // Add to encoder's dynamic table
+    var name: String = ""
+    if (isStatic) {
+        name = qpackStaticName(nameIdx)
+    } else {
+        name = qpackDynamicLookupName(enc, nameIdx)
+    }
+    qpackDynamicAdd(enc, name, value)
+    return result
+}
+
+// Insert With Literal Name (Section 4.3.3)
+// Instruction format: 01xxxxxx, name string, value string
+fun qpackInsertWithLiteral(enc: Map, name: String, value: String): String {
+    // 0 1 H N N N N N — 5-bit name length prefix, high bits = 0x40 = 64
+    // H=0 (not Huffman), then raw name bytes
+    var result: String = hpackEncodeInt(stringLength(name), 5, 64)
+    result = stringConcat(result, name)
+    result = stringConcat(result, hpackEncodeString(value))
+    qpackDynamicAdd(enc, name, value)
+    return result
+}
+
+// Duplicate (Section 4.3.4)
+// Instruction format: 000xxxxx, 5-bit prefix integer (absolute index)
+fun qpackDuplicate(enc: Map, index: Int): String {
+    val entry = qpackDynamicLookup(enc, index)
+    val name = toString(mapGet(entry, "name"))
+    val value = toString(mapGet(entry, "value"))
+    qpackDynamicAdd(enc, name, value)
+    return hpackEncodeInt(index, 5, 0)
+}
+
+// == Decoder Stream Instructions (RFC 9204 Section 4.4) =======================
+
+// Section Acknowledgment (Section 4.4.1)
+// Instruction format: 1xxxxxxx, 7-bit prefix integer
+fun qpackSectionAck(streamId: Int): String {
+    return hpackEncodeInt(streamId, 7, 128)
+}
+
+// Stream Cancellation (Section 4.4.2)
+// Instruction format: 01xxxxxx, 6-bit prefix integer
+fun qpackStreamCancel(streamId: Int): String {
+    return hpackEncodeInt(streamId, 6, 64)
+}
+
+// Insert Count Increment (Section 4.4.3)
+// Instruction format: 00xxxxxx, 6-bit prefix integer
+fun qpackInsertCountIncrement(increment: Int): String {
+    return hpackEncodeInt(increment, 6, 0)
+}
+
+// == Field Section Prefix (RFC 9204 Section 4.5) ==============================
+
+// Encode the field section prefix (Required Insert Count + Sign/DeltaBase)
+// For simplicity, we use base = reqInsertCount (deltaBase = 0, sign = 0)
+fun qpackEncodePrefix(reqInsertCount: Int, base: Int, maxTableCapacity: Int): String {
+    val encodedRIC = qpackEncodeRequiredInsertCount(reqInsertCount, maxTableCapacity)
+    var result: String = hpackEncodeInt(encodedRIC, 8, 0)
+    // Delta Base: sign bit (S) + 7-bit prefix integer
+    // If base >= reqInsertCount: S=0, deltaBase = base - reqInsertCount
+    // If base < reqInsertCount: S=1, deltaBase = reqInsertCount - base - 1
+    if (base >= reqInsertCount) {
+        val delta = base - reqInsertCount
+        result = stringConcat(result, hpackEncodeInt(delta, 7, 0))
+    } else {
+        val delta = reqInsertCount - base - 1
+        result = stringConcat(result, hpackEncodeInt(delta, 7, 128))
+    }
+    return result
+}
+
+// Decode the field section prefix
+// Returns map with "reqInsertCount" and "base"
+fun qpackDecodePrefix(buf: String, pos: Int, totalInsertCount: Int, maxTableCapacity: Int): Map {
+    val result = mapCreate()
+    // Decode Required Insert Count (8-bit prefix)
+    val ricResult = hpackDecodeInt(buf, pos, 8)
+    val encodedRIC = toInt(mapGet(ricResult, "value"))
+    var newPos: Int = toInt(mapGet(ricResult, "pos"))
+    val reqInsertCount = qpackDecodeRequiredInsertCount(encodedRIC, totalInsertCount, maxTableCapacity)
+    // Decode Sign + DeltaBase (7-bit prefix)
+    val dbByte = charCodeAt(buf, newPos)
+    val sign = dbByte / 128  // S bit
+    val dbResult = hpackDecodeInt(buf, newPos, 7)
+    val deltaBase = toInt(mapGet(dbResult, "value"))
+    newPos = toInt(mapGet(dbResult, "pos"))
+    var base: Int = 0
+    if (sign == 0) {
+        base = reqInsertCount + deltaBase
+    } else {
+        base = reqInsertCount - deltaBase - 1
+    }
+    mapPut(result, "reqInsertCount", reqInsertCount)
+    mapPut(result, "base", base)
+    mapPut(result, "pos", newPos)
+    return result
+}
+
+// == Field Line Representations (RFC 9204 Section 4.5) ========================
+
+// Encode a field section from a list of header maps
+// Returns map with "encoded" (field section bytes) and "encoderStream" (instructions)
+fun qpackEncode(enc: Map, headers: List): Map {
+    val result = mapCreate()
+    var encoderStream: String = ""
+    var fieldSection: String = ""
+    // We use a simple strategy: static table references only (no dynamic table for encoding)
+    // This means reqInsertCount = 0, base = 0
+    val maxTableCapacity = toInt(mapGet(enc, "maxSize"))
+    val prefix = qpackEncodePrefix(0, 0, maxTableCapacity)
+    fieldSection = prefix
+    var i: Int = 0
+    while (i < listSize(headers)) {
+        val header = listGet(headers, i)
+        val name = toString(mapGet(header, "name"))
+        val value = toString(mapGet(header, "value"))
+        // Try static table exact match
+        val exactIdx = qpackStaticLookup(name, value)
+        if (exactIdx >= 0) {
+            // Indexed Field Line — static (Section 4.5.2)
+            // 1 1 I I I I I I — 6-bit prefix, high bits = 0xc0 = 192
+            fieldSection = stringConcat(fieldSection, hpackEncodeInt(exactIdx, 6, 192))
+        } else {
+            // Try static name-only match
+            val nameIdx = qpackStaticLookupName(name)
+            if (nameIdx >= 0) {
+                // Literal Field Line With Name Reference — static (Section 4.5.4)
+                // 0 1 0 1 N N N N — 4-bit prefix, high bits = 0x50 = 80
+                // N=0 (not never-indexed)
+                fieldSection = stringConcat(fieldSection, hpackEncodeInt(nameIdx, 4, 80))
+                fieldSection = stringConcat(fieldSection, hpackEncodeString(value))
+            } else {
+                // Literal Field Line With Literal Name (Section 4.5.6)
+                // 0 0 1 0 H N N N — 3-bit name length prefix, high bits = 0x20 = 32
+                // H=0 (no Huffman)
+                fieldSection = stringConcat(fieldSection, hpackEncodeInt(stringLength(name), 3, 32))
+                fieldSection = stringConcat(fieldSection, name)
+                fieldSection = stringConcat(fieldSection, hpackEncodeString(value))
+            }
+        }
+        i = i + 1
+    }
+    mapPut(result, "encoded", fieldSection)
+    mapPut(result, "encoderStream", encoderStream)
+    return result
+}
+
+// Decode a field section
+// Returns map with "headers" (list of {name, value} maps) and "decoderStream" (instructions)
+fun qpackDecode(dec: Map, encoded: String, encoderData: String): Map {
+    val result = mapCreate()
+    val headers = listCreate()
+    var decoderStream: String = ""
+    val bufLen = stringLength(encoded)
+    if (bufLen == 0) {
+        mapPut(result, "headers", headers)
+        mapPut(result, "decoderStream", decoderStream)
+        return result
+    }
+    // Process any encoder stream data first
+    if (stringLength(encoderData) > 0) {
+        qpackProcessEncoderStream(dec, encoderData)
+    }
+    // Decode prefix
+    val totalInsertCount = toInt(mapGet(dec, "insertCount"))
+    val maxTableCapacity = toInt(mapGet(dec, "maxSize"))
+    val prefixResult = qpackDecodePrefix(encoded, 0, totalInsertCount, maxTableCapacity)
+    val reqInsertCount = toInt(mapGet(prefixResult, "reqInsertCount"))
+    val base = toInt(mapGet(prefixResult, "base"))
+    var pos: Int = toInt(mapGet(prefixResult, "pos"))
+    // Gap Q1: Invalid Required Insert Count signals a connection error (RFC 9204 Section 4.5.1.1)
+    if (reqInsertCount < 0) {
+        mapPut(result, "type", QPACK_ERROR())
+        mapPut(result, "error", "Invalid Required Insert Count")
+        mapPut(result, "headers", headers)
+        mapPut(result, "decoderStream", decoderStream)
+        return result
+    }
+    // Check if this stream is blocked (needs dynamic entries not yet received)
+    if (qpackIsBlocked(dec, reqInsertCount)) {
+        val blockedStreams = mapGet(dec, "blockedStreams")
+        // Gap 6: Enforce maxBlockedStreams limit (RFC 9204 Section 2.1.2)
+        val maxBlocked = toInt(mapGet(dec, "maxBlockedStreams"))
+        val currentBlocked = listSize(blockedStreams)
+        if (currentBlocked >= maxBlocked) {
+            // Max blocked streams reached — reject with error
+            mapPut(result, "type", QPACK_ERROR())
+            mapPut(result, "error", "Max blocked streams limit reached")
+            mapPut(result, "headers", headers)
+            mapPut(result, "decoderStream", decoderStream)
+            return result
+        }
+        val blockedEntry = mapCreate()
+        mapPut(blockedEntry, "reqInsertCount", reqInsertCount)
+        mapPut(blockedEntry, "encoded", encoded)
+        listAppend(blockedStreams, blockedEntry)
+        mapPut(result, "headers", headers)
+        mapPut(result, "decoderStream", decoderStream)
+        mapPut(result, "blocked", 1)
+        return result
+    }
+    // Bomb protection limits
+    val maxFieldSize = toInt(mapGet(dec, "maxHeaderFieldSize"))
+    val maxTotalSize = toInt(mapGet(dec, "maxTotalDecodedSize"))
+    var totalDecodedSize: Int = 0
+    // Decode field lines
+    while (pos < bufLen) {
+        var hdrName: String = ""
+        var hdrValue: String = ""
+        val b = charCodeAt(encoded, pos)
+        if (b / 128 == 1) {
+            // Top bit set: Indexed Field Line (Section 4.5.2)
+            val staticBit = qpackAnd(b, 64) / 64  // bit 6 = T (static)
+            if (staticBit == 1) {
+                // Static indexed: 11xxxxxx, 6-bit prefix
+                val idxResult = hpackDecodeInt(encoded, pos, 6)
+                val idx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                hdrName = qpackStaticName(idx)
+                hdrValue = qpackStaticValue(idx)
+            } else {
+                // Dynamic indexed: 10xxxxxx, 6-bit prefix
+                val idxResult = hpackDecodeInt(encoded, pos, 6)
+                val relIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val absIdx = base - relIdx - 1
+                val dynEntry = qpackDynamicLookup(dec, absIdx)
+                hdrName = toString(mapGet(dynEntry, "name"))
+                hdrValue = toString(mapGet(dynEntry, "value"))
+            }
+        } else { if (b / 64 == 1) {
+            // 01xxxxxx: Literal with name reference (Section 4.5.4)
+            val staticBit = qpackAnd(b, 16) / 16  // bit 4 = N (static/dynamic)
+            if (staticBit == 1) {
+                // Static name ref: 0101xxxx, 4-bit prefix
+                val idxResult = hpackDecodeInt(encoded, pos, 4)
+                val nameIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                hdrName = qpackStaticName(nameIdx)
+                val valResult = hpackDecodeString(encoded, pos)
+                hdrValue = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+            } else {
+                // Dynamic name ref: 0100xxxx, 4-bit prefix
+                val idxResult = hpackDecodeInt(encoded, pos, 4)
+                val relIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val absIdx = base - relIdx - 1
+                hdrName = qpackDynamicLookupName(dec, absIdx)
+                val valResult = hpackDecodeString(encoded, pos)
+                hdrValue = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+            }
+        } else { if (b / 32 == 1) {
+            // 001xxxxx: Literal with literal name (Section 4.5.6)
+            val nameResult = hpackDecodeInt(encoded, pos, 3)
+            val nameLen = toInt(mapGet(nameResult, "value"))
+            pos = toInt(mapGet(nameResult, "pos"))
+            var nameChars: String = ""
+            var j: Int = 0
+            while (j < nameLen) {
+                if (pos + j < bufLen) {
+                    nameChars = stringConcat(nameChars, hpackByteToChar(charCodeAt(encoded, pos + j)))
+                }
+                j = j + 1
+            }
+            pos = pos + nameLen
+            hdrName = nameChars
+            val valResult = hpackDecodeString(encoded, pos)
+            hdrValue = toString(mapGet(valResult, "value"))
+            pos = toInt(mapGet(valResult, "pos"))
+        } else { if (b / 16 == 1) {
+            // 0001xxxx: Indexed Field Line — Post-Base (Section 4.5.3)
+            val idxResult = hpackDecodeInt(encoded, pos, 4)
+            val postBaseIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            val absIdx = base + postBaseIdx
+            val dynEntry = qpackDynamicLookup(dec, absIdx)
+            hdrName = toString(mapGet(dynEntry, "name"))
+            hdrValue = toString(mapGet(dynEntry, "value"))
+        } else {
+            // 0000xxxx: Literal with Post-Base Name Reference (Section 4.5.5)
+            val idxResult = hpackDecodeInt(encoded, pos, 3)
+            val postBaseIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            val absIdx = base + postBaseIdx
+            hdrName = qpackDynamicLookupName(dec, absIdx)
+            val valResult = hpackDecodeString(encoded, pos)
+            hdrValue = toString(mapGet(valResult, "value"))
+            pos = toInt(mapGet(valResult, "pos"))
+        } } } }
+        // Bomb protection: check per-field size limit
+        val fieldSize = stringLength(hdrName) + stringLength(hdrValue)
+        if (fieldSize > maxFieldSize) {
+            val errEntry = mapCreate()
+            mapPut(errEntry, "name", "qpack-error")
+            mapPut(errEntry, "value", "header field exceeds max size")
+            listAppend(headers, errEntry)
+            mapPut(result, "headers", headers)
+            mapPut(result, "decoderStream", decoderStream)
+            return result
+        }
+        totalDecodedSize = totalDecodedSize + fieldSize
+        if (totalDecodedSize > maxTotalSize) {
+            val errEntry = mapCreate()
+            mapPut(errEntry, "name", "qpack-error")
+            mapPut(errEntry, "value", "total decoded size exceeds limit")
+            listAppend(headers, errEntry)
+            mapPut(result, "headers", headers)
+            mapPut(result, "decoderStream", decoderStream)
+            return result
+        }
+        val entry = mapCreate()
+        mapPut(entry, "name", hdrName)
+        mapPut(entry, "value", hdrValue)
+        listAppend(headers, entry)
+    }
+    mapPut(result, "headers", headers)
+    mapPut(result, "decoderStream", decoderStream)
+    return result
+}
+
+// == Encoder Stream Processing ================================================
+
+// Process encoder stream instructions (called by decoder)
+fun qpackProcessEncoderStream(dec: Map, streamBuf: String): Unit {
+    val bufLen = stringLength(streamBuf)
+    var pos: Int = 0
+    while (pos < bufLen) {
+        val b = charCodeAt(streamBuf, pos)
+        if (b / 128 == 1) {
+            // 1xxxxxxx: Insert With Name Reference
+            val staticBit = qpackAnd(b, 64) / 64  // bit 6 = S (static)
+            if (staticBit == 1) {
+                // Static: 11xxxxxx, 6-bit prefix
+                val idxResult = hpackDecodeInt(streamBuf, pos, 6)
+                val nameIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val name = qpackStaticName(nameIdx)
+                val valResult = hpackDecodeString(streamBuf, pos)
+                val value = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+                qpackDynamicAdd(dec, name, value)
+            } else {
+                // Dynamic: 10xxxxxx, 6-bit prefix
+                val idxResult = hpackDecodeInt(streamBuf, pos, 6)
+                val absIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val name = qpackDynamicLookupName(dec, absIdx)
+                val valResult = hpackDecodeString(streamBuf, pos)
+                val value = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+                qpackDynamicAdd(dec, name, value)
+            }
+        } else { if (b / 64 == 1) {
+            // 01xxxxxx: Insert With Literal Name
+            val nameResult = hpackDecodeInt(streamBuf, pos, 5)
+            val nameLen = toInt(mapGet(nameResult, "value"))
+            pos = toInt(mapGet(nameResult, "pos"))
+            var name: String = ""
+            var j: Int = 0
+            while (j < nameLen) {
+                if (pos + j < bufLen) {
+                    name = stringConcat(name, hpackByteToChar(charCodeAt(streamBuf, pos + j)))
+                }
+                j = j + 1
+            }
+            pos = pos + nameLen
+            val valResult = hpackDecodeString(streamBuf, pos)
+            val value = toString(mapGet(valResult, "value"))
+            pos = toInt(mapGet(valResult, "pos"))
+            qpackDynamicAdd(dec, name, value)
+        } else { if (b / 32 == 1) {
+            // 001xxxxx: Set Dynamic Table Capacity
+            val capResult = hpackDecodeInt(streamBuf, pos, 5)
+            val capacity = toInt(mapGet(capResult, "value"))
+            pos = toInt(mapGet(capResult, "pos"))
+            qpackDynamicSetCapacity(dec, capacity)
+        } else {
+            // 000xxxxx: Duplicate
+            val idxResult = hpackDecodeInt(streamBuf, pos, 5)
+            val absIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            val entry = qpackDynamicLookup(dec, absIdx)
+            val name = toString(mapGet(entry, "name"))
+            val value = toString(mapGet(entry, "value"))
+            qpackDynamicAdd(dec, name, value)
+        } } }
+    }
+}
+
+// == Blocked Streams (RFC 9204 Section 2.1.2) =================================
+
+// Check if a stream is blocked — returns true if the decoder has not received
+// enough dynamic table inserts to satisfy the Required Insert Count
+fun qpackIsBlocked(dec: Map, reqInsertCount: Int): Bool {
+    if (reqInsertCount == 0) { return false }
+    val knownReceivedCount = toInt(mapGet(dec, "knownReceivedCount"))
+    return reqInsertCount > knownReceivedCount
+}
+
+// Count the number of currently blocked streams
+fun qpackBlockedStreamCount(dec: Map): Int {
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    return listSize(blockedStreams)
+}
+
+// Retry all blocked decode requests whose Required Insert Count is now satisfied.
+// Called after the decoder's knownReceivedCount has been updated (e.g., after
+// processing encoder stream instructions via qpackProcessEncoderStream).
+// Returns a list of decoded results (each a map with "headers", "decoderStream").
+// Successfully unblocked entries are removed from the blocked list.
+fun qpackRetryBlocked(dec: Map): List {
+    val results = listCreate()
+    val blockedStreams = mapGet(dec, "blockedStreams")
+    val knownReceivedCount = toInt(mapGet(dec, "knownReceivedCount"))
+    // Build a new blocked list containing only still-blocked entries
+    val stillBlocked = listCreate()
+    var i: Int = 0
+    while (i < listSize(blockedStreams)) {
+        val entry = listGet(blockedStreams, i)
+        val reqInsertCount = toInt(mapGet(entry, "reqInsertCount"))
+        if (reqInsertCount <= knownReceivedCount) {
+            // This entry can now be decoded — re-decode with current state
+            val encoded = toString(mapGet(entry, "encoded"))
+            val decResult = qpackDecodeUnblocked(dec, encoded)
+            listAppend(results, decResult)
+        } else {
+            // Still blocked — keep in the list
+            listAppend(stillBlocked, entry)
+        }
+        i = i + 1
+    }
+    // Replace blocked list with only the still-blocked entries
+    mapPut(dec, "blockedStreams", stillBlocked)
+    return results
+}
+
+// Internal decode function for previously blocked streams that are now unblocked.
+// Does not re-check blocking status since we already confirmed it is satisfied.
+fun qpackDecodeUnblocked(dec: Map, encoded: String): Map {
+    val result = mapCreate()
+    val headers = listCreate()
+    var decoderStream: String = ""
+    val bufLen = stringLength(encoded)
+    if (bufLen == 0) {
+        mapPut(result, "headers", headers)
+        mapPut(result, "decoderStream", decoderStream)
+        return result
+    }
+    // Decode prefix
+    val totalInsertCount = toInt(mapGet(dec, "insertCount"))
+    val maxTableCapacity = toInt(mapGet(dec, "maxSize"))
+    val prefixResult = qpackDecodePrefix(encoded, 0, totalInsertCount, maxTableCapacity)
+    val reqInsertCount = toInt(mapGet(prefixResult, "reqInsertCount"))
+    val base = toInt(mapGet(prefixResult, "base"))
+    var pos: Int = toInt(mapGet(prefixResult, "pos"))
+    val maxFieldSize = toInt(mapGet(dec, "maxHeaderFieldSize"))
+    val maxTotalSize = toInt(mapGet(dec, "maxTotalDecodedSize"))
+    var totalDecodedSize: Int = 0
+    while (pos < bufLen) {
+        var hdrName: String = ""
+        var hdrValue: String = ""
+        val b = charCodeAt(encoded, pos)
+        if (b / 128 == 1) {
+            val staticBit = qpackAnd(b, 64) / 64
+            if (staticBit == 1) {
+                val idxResult = hpackDecodeInt(encoded, pos, 6)
+                val idx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                hdrName = qpackStaticName(idx)
+                hdrValue = qpackStaticValue(idx)
+            } else {
+                val idxResult = hpackDecodeInt(encoded, pos, 6)
+                val relIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val absIdx = base - relIdx - 1
+                val dynEntry = qpackDynamicLookup(dec, absIdx)
+                hdrName = toString(mapGet(dynEntry, "name"))
+                hdrValue = toString(mapGet(dynEntry, "value"))
+            }
+        } else { if (b / 64 == 1) {
+            val staticBit = qpackAnd(b, 16) / 16
+            if (staticBit == 1) {
+                val idxResult = hpackDecodeInt(encoded, pos, 4)
+                val nameIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                hdrName = qpackStaticName(nameIdx)
+                val valResult = hpackDecodeString(encoded, pos)
+                hdrValue = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+            } else {
+                val idxResult = hpackDecodeInt(encoded, pos, 4)
+                val relIdx = toInt(mapGet(idxResult, "value"))
+                pos = toInt(mapGet(idxResult, "pos"))
+                val absIdx = base - relIdx - 1
+                hdrName = qpackDynamicLookupName(dec, absIdx)
+                val valResult = hpackDecodeString(encoded, pos)
+                hdrValue = toString(mapGet(valResult, "value"))
+                pos = toInt(mapGet(valResult, "pos"))
+            }
+        } else { if (b / 32 == 1) {
+            val nameResult = hpackDecodeInt(encoded, pos, 3)
+            val nameLen = toInt(mapGet(nameResult, "value"))
+            pos = toInt(mapGet(nameResult, "pos"))
+            var nameChars: String = ""
+            var j: Int = 0
+            while (j < nameLen) {
+                if (pos + j < bufLen) {
+                    nameChars = stringConcat(nameChars, hpackByteToChar(charCodeAt(encoded, pos + j)))
+                }
+                j = j + 1
+            }
+            pos = pos + nameLen
+            hdrName = nameChars
+            val valResult = hpackDecodeString(encoded, pos)
+            hdrValue = toString(mapGet(valResult, "value"))
+            pos = toInt(mapGet(valResult, "pos"))
+        } else { if (b / 16 == 1) {
+            val idxResult = hpackDecodeInt(encoded, pos, 4)
+            val postBaseIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            val absIdx = base + postBaseIdx
+            val dynEntry = qpackDynamicLookup(dec, absIdx)
+            hdrName = toString(mapGet(dynEntry, "name"))
+            hdrValue = toString(mapGet(dynEntry, "value"))
+        } else {
+            val idxResult = hpackDecodeInt(encoded, pos, 3)
+            val postBaseIdx = toInt(mapGet(idxResult, "value"))
+            pos = toInt(mapGet(idxResult, "pos"))
+            val absIdx = base + postBaseIdx
+            hdrName = qpackDynamicLookupName(dec, absIdx)
+            val valResult = hpackDecodeString(encoded, pos)
+            hdrValue = toString(mapGet(valResult, "value"))
+            pos = toInt(mapGet(valResult, "pos"))
+        } } } }
+        val fieldSize = stringLength(hdrName) + stringLength(hdrValue)
+        if (fieldSize > maxFieldSize) {
+            val errEntry = mapCreate()
+            mapPut(errEntry, "name", "qpack-error")
+            mapPut(errEntry, "value", "header field exceeds max size")
+            listAppend(headers, errEntry)
+            mapPut(result, "headers", headers)
+            mapPut(result, "decoderStream", decoderStream)
+            return result
+        }
+        totalDecodedSize = totalDecodedSize + fieldSize
+        if (totalDecodedSize > maxTotalSize) {
+            val errEntry = mapCreate()
+            mapPut(errEntry, "name", "qpack-error")
+            mapPut(errEntry, "value", "total decoded size exceeds limit")
+            listAppend(headers, errEntry)
+            mapPut(result, "headers", headers)
+            mapPut(result, "decoderStream", decoderStream)
+            return result
+        }
+        val hdrEntry = mapCreate()
+        mapPut(hdrEntry, "name", hdrName)
+        mapPut(hdrEntry, "value", hdrValue)
+        listAppend(headers, hdrEntry)
+    }
+    mapPut(result, "headers", headers)
+    mapPut(result, "decoderStream", decoderStream)
+    return result
+}
+
+// == Bomb Protection (RFC 9204 Section 3.2.1) =================================
+
+// Set the maximum allowed size of a single header field (name + value)
+fun qpackSetMaxHeaderFieldSize(dec: Map, maxSize: Int): Unit {
+    mapPut(dec, "maxHeaderFieldSize", maxSize)
+}
+
+// == Decoder Stream Processing (RFC 9204 Section 4.4) =========================
+
+// Process decoder stream instructions sent from decoder to encoder
+// Instruction types:
+//   Section Acknowledgment: 1xxxxxxx, 7-bit prefix integer
+//   Stream Cancellation: 01xxxxxx, 6-bit prefix integer
+//   Insert Count Increment: 00xxxxxx, 6-bit prefix integer
+fun qpackProcessDecoderStream(enc: Map, streamBuf: String): Unit {
+    val bufLen = stringLength(streamBuf)
+    var pos: Int = 0
+    while (pos < bufLen) {
+        val b = charCodeAt(streamBuf, pos)
+        if (b / 128 == 1) {
+            // 1xxxxxxx: Section Acknowledgment (Section 4.4.1)
+            val idResult = hpackDecodeInt(streamBuf, pos, 7)
+            pos = toInt(mapGet(idResult, "pos"))
+            // Section ack updates knownReceived — the encoder now knows the
+            // decoder has processed all entries referenced by this stream
+            val currentKnown = toInt(mapGet(enc, "knownReceived"))
+            val insertCount = toInt(mapGet(enc, "insertCount"))
+            if (insertCount > currentKnown) {
+                mapPut(enc, "knownReceived", insertCount)
+            }
+        } else { if (b / 64 == 1) {
+            // 01xxxxxx: Stream Cancellation (Section 4.4.2)
+            val idResult = hpackDecodeInt(streamBuf, pos, 6)
+            pos = toInt(mapGet(idResult, "pos"))
+            // Stream cancellation — encoder notes stream is cancelled
+            // No further action needed for basic implementation
+        } else {
+            // 00xxxxxx: Insert Count Increment (Section 4.4.3)
+            val incResult = hpackDecodeInt(streamBuf, pos, 6)
+            val increment = toInt(mapGet(incResult, "value"))
+            pos = toInt(mapGet(incResult, "pos"))
+            // Gap Q2: Increment of 0 MUST be treated as connection error
+            // of type QPACK_DECODER_STREAM_ERROR (RFC 9204 Section 4.4.3)
+            if (increment == 0) {
+                mapPut(enc, "decoderStreamError", true)
+                mapPut(enc, "decoderStreamErrorMsg", "Insert Count Increment of 0 is invalid")
+            } else {
+                val currentKnown = toInt(mapGet(enc, "knownReceived"))
+                mapPut(enc, "knownReceived", currentKnown + increment)
+            }
+        } }
+    }
+}
+
+// == Decoder-to-Encoder Instruction Encoding (RFC 9204 Section 4.4) ============
+
+// Encode a decoder-to-encoder instruction as wire bytes.
+// The decoder sends these instructions TO the encoder to synchronize state.
+//
+// instructionType: one of "section_ack", "stream_cancel", or "insert_count_increment"
+// streamId: the stream ID for section_ack or stream_cancel
+// value: the increment value for insert_count_increment (ignored for other types)
+//
+// Wire formats:
+//   Section Acknowledgment: 1xxxxxxx with 7-bit stream ID
+//   Stream Cancellation:    01xxxxxx with 6-bit stream ID
+//   Insert Count Increment: 00xxxxxx with 6-bit increment value
+fun qpackEncodeDecoderInstruction(instructionType: String, streamId: Int, value: Int): Map {
+    val result = mapCreate()
+    var wireBytes: String = ""
+    if (instructionType == "section_ack") {
+        // Section Acknowledgment: 1xxxxxxx, 7-bit prefix integer for stream ID
+        wireBytes = hpackEncodeInt(streamId, 7, 128)
+        mapPut(result, "type", "section_ack")
+        mapPut(result, "streamId", streamId)
+    } else { if (instructionType == "stream_cancel") {
+        // Stream Cancellation: 01xxxxxx, 6-bit prefix integer for stream ID
+        wireBytes = hpackEncodeInt(streamId, 6, 64)
+        mapPut(result, "type", "stream_cancel")
+        mapPut(result, "streamId", streamId)
+    } else { if (instructionType == "insert_count_increment") {
+        // Insert Count Increment: 00xxxxxx, 6-bit prefix integer for increment
+        wireBytes = hpackEncodeInt(value, 6, 0)
+        mapPut(result, "type", "insert_count_increment")
+        mapPut(result, "value", value)
+    } else {
+        mapPut(result, "type", QPACK_ERROR())
+        mapPut(result, "error", "Unknown instruction type")
+        mapPut(result, "wireBytes", "")
+        return result
+    } } }
+    mapPut(result, "wireBytes", wireBytes)
+    return result
+}
+
+// Convenience: encode a Section Acknowledgment for the given stream ID
+fun qpackEncodeSectionAck(streamId: Int): String {
+    val result = qpackEncodeDecoderInstruction("section_ack", streamId, 0)
+    return toString(mapGet(result, "wireBytes"))
+}
+
+// Convenience: encode a Stream Cancellation for the given stream ID
+fun qpackEncodeStreamCancel(streamId: Int): String {
+    val result = qpackEncodeDecoderInstruction("stream_cancel", streamId, 0)
+    return toString(mapGet(result, "wireBytes"))
+}
+
+// Convenience: encode an Insert Count Increment with the given increment value
+fun qpackEncodeInsertCountIncrement(increment: Int): String {
+    val result = qpackEncodeDecoderInstruction("insert_count_increment", 0, increment)
+    return toString(mapGet(result, "wireBytes"))
+}
+
+// == Max Blocked Streams Enforcement (RFC 9204 Section 2.1.2) =================
+
+// Set the maximum number of streams that may be blocked simultaneously
+fun qpackSetMaxBlockedStreams(dec: Map, maxBlocked: Int): Unit {
+    mapPut(dec, "maxBlockedStreams", maxBlocked)
+}
+
+// == Error Checking ===========================================================
+
+fun qpackError(msg: String): Map {
+    val result = mapCreate()
+    mapPut(result, "type", QPACK_ERROR())
+    mapPut(result, "error", msg)
+    return result
+}
+
+fun qpackIsError(result: Map): Bool {
+    val t = mapGet(result, "type")
+    return t == QPACK_ERROR()
+}

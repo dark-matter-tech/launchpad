@@ -1,0 +1,294 @@
+// rockit.networking.quic — QUIC transport for HTTP/3
+//
+// Provides QUIC variable-length integer encoding (pure Rockit) and thin
+// wrapper functions over extern C builtins for connection and stream
+// management. QUIC is the transport protocol underlying HTTP/3, replacing
+// TCP+TLS with integrated encryption and multiplexed streams.
+//
+// Standards: RFC 9000 — QUIC: A UDP-Based Multiplexed and Secure Transport
+//
+// Usage:
+//   import rockit.networking.quic
+//   val encoded = quicEncodeVarint(16384)
+//   val decoded = quicDecodeVarint(encoded, 0)
+//   val conn = quicConnect("example.com", 443, "h3")
+
+// == Error Constants ==========================================================
+
+fun QUIC_ERROR(): String { return "QUIC_ERROR" }
+
+// == Stream Type Constants (RFC 9000 Section 2.1) =============================
+
+fun QUIC_STREAM_BIDI_CLIENT(): Int  { return 0 }
+fun QUIC_STREAM_BIDI_SERVER(): Int  { return 1 }
+fun QUIC_STREAM_UNI_CLIENT(): Int   { return 2 }
+fun QUIC_STREAM_UNI_SERVER(): Int   { return 3 }
+
+// == Byte Helpers =============================================================
+
+// intToChar only handles 0-127 (ASCII). This helper uses stringFromCharCodes
+// to support the full 0-255 byte range needed for binary protocol encoding.
+fun quicByteToChar(b: Int): String {
+    val codes = listCreate()
+    listAppend(codes, b)
+    return stringFromCharCodes(codes)
+}
+
+// == Bitwise Helpers ==========================================================
+
+fun quicPow2(n: Int): Int {
+    var result: Int = 1
+    var i: Int = 0
+    while (i < n) {
+        result = result * 2
+        i = i + 1
+    }
+    return result
+}
+
+fun quicAnd(a: Int, mask: Int): Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var va: Int = a
+    var vm: Int = mask
+    var n: Int = 0
+    while (n < 8) {
+        val aBit = va - (va / 2) * 2
+        val mBit = vm - (vm / 2) * 2
+        if (aBit == 1) {
+            if (mBit == 1) {
+                result = result + bit
+            }
+        }
+        va = va / 2
+        vm = vm / 2
+        bit = bit * 2
+        n = n + 1
+    }
+    return result
+}
+
+// == Variable-Length Integer Encoding (RFC 9000 Section 16) ====================
+//
+// 2-bit prefix in first byte determines encoding length:
+//   00 -> 1 byte  (values 0-63)
+//   01 -> 2 bytes (values 0-16383)
+//   10 -> 4 bytes (values 0-1073741823)
+//   11 -> 8 bytes (values 0-4611686018427387903, but we limit to Int range)
+
+// Encode a value as a QUIC variable-length integer
+fun quicEncodeVarint(value: Int): String {
+    if (value < 0) {
+        return quicByteToChar(0)
+    }
+    if (value <= 63) {
+        // 1 byte: 00xxxxxx
+        return quicByteToChar(value)
+    }
+    if (value <= 16383) {
+        // 2 bytes: 01xxxxxx xxxxxxxx
+        val b0 = 64 + value / 256
+        val b1 = value - (value / 256) * 256
+        var result: String = quicByteToChar(b0)
+        result = stringConcat(result, quicByteToChar(b1))
+        return result
+    }
+    if (value <= 1073741823) {
+        // 4 bytes: 10xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+        val b0 = 128 + value / 16777216
+        val r1 = value - (value / 16777216) * 16777216
+        val b1 = r1 / 65536
+        val r2 = r1 - b1 * 65536
+        val b2 = r2 / 256
+        val b3 = r2 - b2 * 256
+        var result: String = quicByteToChar(b0)
+        result = stringConcat(result, quicByteToChar(b1))
+        result = stringConcat(result, quicByteToChar(b2))
+        result = stringConcat(result, quicByteToChar(b3))
+        return result
+    }
+    // 8 bytes: 11xxxxxx + 7 more bytes
+    // For values > 1073741823, use 8-byte encoding
+    // We encode the high portion and low portion separately
+    var remaining: Int = value
+    val b7 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b6 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b5 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b4 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b3 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b2 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b1 = remaining - (remaining / 256) * 256
+    remaining = remaining / 256
+    val b0 = 192 + remaining  // 11xxxxxx prefix
+    var result: String = quicByteToChar(b0)
+    result = stringConcat(result, quicByteToChar(b1))
+    result = stringConcat(result, quicByteToChar(b2))
+    result = stringConcat(result, quicByteToChar(b3))
+    result = stringConcat(result, quicByteToChar(b4))
+    result = stringConcat(result, quicByteToChar(b5))
+    result = stringConcat(result, quicByteToChar(b6))
+    result = stringConcat(result, quicByteToChar(b7))
+    return result
+}
+
+// Decode a QUIC variable-length integer from data at offset
+// Returns map with "value" (decoded integer) and "bytesRead" (number of bytes consumed)
+fun quicDecodeVarint(buf: String, offset: Int): Map {
+    val result = mapCreate()
+    val bufLen = stringLength(buf)
+    if (offset >= bufLen) {
+        mapPut(result, "value", 0)
+        mapPut(result, "bytesRead", 0)
+        return result
+    }
+    val firstByte = charCodeAt(buf, offset)
+    val prefix = firstByte / 64  // Top 2 bits
+    if (prefix == 0) {
+        // 1 byte: 00xxxxxx
+        mapPut(result, "value", firstByte)
+        mapPut(result, "bytesRead", 1)
+        return result
+    }
+    if (prefix == 1) {
+        // 2 bytes: 01xxxxxx xxxxxxxx
+        val high = firstByte - 64  // Strip prefix
+        val low = charCodeAt(buf, offset + 1)
+        mapPut(result, "value", high * 256 + low)
+        mapPut(result, "bytesRead", 2)
+        return result
+    }
+    if (prefix == 2) {
+        // 4 bytes: 10xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+        val b0 = firstByte - 128  // Strip prefix
+        val b1 = charCodeAt(buf, offset + 1)
+        val b2 = charCodeAt(buf, offset + 2)
+        val b3 = charCodeAt(buf, offset + 3)
+        mapPut(result, "value", b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
+        mapPut(result, "bytesRead", 4)
+        return result
+    }
+    // prefix == 3: 8 bytes: 11xxxxxx + 7 bytes
+    val b0 = firstByte - 192  // Strip prefix
+    val b1 = charCodeAt(buf, offset + 1)
+    val b2 = charCodeAt(buf, offset + 2)
+    val b3 = charCodeAt(buf, offset + 3)
+    val b4 = charCodeAt(buf, offset + 4)
+    val b5 = charCodeAt(buf, offset + 5)
+    val b6 = charCodeAt(buf, offset + 6)
+    val b7 = charCodeAt(buf, offset + 7)
+    // Reconstruct value (may overflow for very large values, but Int-safe for typical use)
+    var value: Int = b0
+    value = value * 256 + b1
+    value = value * 256 + b2
+    value = value * 256 + b3
+    value = value * 256 + b4
+    value = value * 256 + b5
+    value = value * 256 + b6
+    value = value * 256 + b7
+    mapPut(result, "value", value)
+    mapPut(result, "bytesRead", 8)
+    return result
+}
+
+// Return the number of bytes needed to encode a value as a QUIC varint
+fun quicVarintSize(value: Int): Int {
+    if (value <= 63) { return 1 }
+    if (value <= 16383) { return 2 }
+    if (value <= 1073741823) { return 4 }
+    return 8
+}
+
+// == Connection Management =====================================================
+// Stubs for QUIC transport. These define the API surface; actual transport
+// requires compiler-side builtin registration (like TLS/TCP builtins).
+// Until then, these return error results so framing/encoding code compiles.
+
+// Connect to a QUIC server with the given ALPN protocol
+// Returns map with connection info or error
+fun quicConnect(host: String, port: Int, alpn: String): Map {
+    val result = mapCreate()
+    // TODO: replace with quicClientConnect(host, port, alpn) builtin
+    mapPut(result, "type", QUIC_ERROR())
+    mapPut(result, "error", "QUIC transport not yet available")
+    mapPut(result, "conn", 0 - 1)
+    mapPut(result, "host", host)
+    mapPut(result, "port", port)
+    mapPut(result, "alpn", alpn)
+    return result
+}
+
+// Close a QUIC connection
+fun quicClose(conn: Map): Unit {
+    // TODO: replace with quicClientClose(connId) builtin
+}
+
+// == Stream Management ========================================================
+
+// Open a bidirectional stream, returns stream ID or -1
+fun quicOpenBidiStream(conn: Map): Int {
+    // TODO: replace with quicStreamOpenBidi(connId) builtin
+    return 0 - 1
+}
+
+// Open a unidirectional stream, returns stream ID or -1
+fun quicOpenUniStream(conn: Map): Int {
+    // TODO: replace with quicStreamOpenUni(connId) builtin
+    return 0 - 1
+}
+
+// Send data on a stream. fin=true to signal end of stream.
+// Returns bytes sent or negative on error.
+fun quicSendStream(conn: Map, streamId: Int, payload: String, fin: Bool): Int {
+    // TODO: replace with quicStreamSend(connId, streamId, payload, finFlag) builtin
+    return 0 - 1
+}
+
+// Receive data from a stream.
+// Returns map with "data" and "fin" (true if stream ended).
+fun quicRecvStream(conn: Map, streamId: Int, maxBytes: Int): Map {
+    val result = mapCreate()
+    // TODO: replace with quicStreamRecv(connId, streamId, maxBytes) builtin
+    mapPut(result, "data", "")
+    mapPut(result, "fin", true)
+    return result
+}
+
+// Accept a new peer-initiated unidirectional stream.
+// Returns map with "streamId" (Int, -1 if none available) and "available" (Bool).
+fun quicAcceptUniStream(conn: Map): Map {
+    val result = mapCreate()
+    // TODO: replace with quicStreamAcceptUni(connId) builtin
+    mapPut(result, "streamId", 0 - 1)
+    mapPut(result, "available", false)
+    return result
+}
+
+// Close a stream with an error code
+fun quicCloseStream(conn: Map, streamId: Int, errorCode: Int): Unit {
+    // TODO: replace with quicStreamClose(connId, streamId, errorCode) builtin
+}
+
+// Close the QUIC connection with an application error code and reason string
+fun quicCloseWithError(conn: Map, errorCode: Int, reason: String): Unit {
+    // TODO: replace with quicConnCloseApp(connId, errorCode, reason) builtin
+}
+
+// == Error Checking ===========================================================
+
+fun quicError(msg: String): Map {
+    val result = mapCreate()
+    mapPut(result, "type", QUIC_ERROR())
+    mapPut(result, "error", msg)
+    return result
+}
+
+fun quicIsError(result: Map): Bool {
+    val t = mapGet(result, "type")
+    return t == QUIC_ERROR()
+}

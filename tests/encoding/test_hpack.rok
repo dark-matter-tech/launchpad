@@ -168,9 +168,11 @@ import rockit.encoding.hpack
 }
 
 @Test fun testEncodeStringShort() {
+    // "hello" Huffman: h=6, e=5, l=6, l=6, o=5 = 28 bits = 4 bytes (< 5 raw)
+    // So Huffman is chosen: H=1, length=4 → first byte = 128 + 4 = 132
     val encoded = hpackEncodeString("hello")
-    assertEquals(6, stringLength(encoded))
-    assertEquals(5, charCodeAt(encoded, 0))  // length = 5, H = 0
+    assertEquals(5, stringLength(encoded))
+    assertEquals(132, charCodeAt(encoded, 0))  // length = 4, H = 1
 }
 
 @Test fun testDecodeStringRaw() {
@@ -212,8 +214,8 @@ import rockit.encoding.hpack
 }
 
 @Test fun testEncodeLiteralNewName() {
-    // Custom header with no static table match uses literal without indexing
-    // Byte 0: 0x00 = 0 (without indexing, no name index)
+    // Custom header with no static table match uses literal with incremental indexing
+    // Byte 0: 0x40 = 64 (incremental indexing, name index 0 = new name)
     val ctx = hpackCreateContext()
     val headers = listCreate()
     val h = mapCreate()
@@ -221,7 +223,7 @@ import rockit.encoding.hpack
     mapPut(h, "value", "test")
     listAppend(headers, h)
     val encoded = hpackEncode(ctx, headers)
-    assertEquals(0, charCodeAt(encoded, 0))
+    assertEquals(64, charCodeAt(encoded, 0))
     assertGreaterThan(stringLength(encoded), 1)
 }
 
@@ -538,4 +540,1220 @@ import rockit.encoding.hpack
     assertEquals(255, hpackAnd(255, 255))
     assertEquals(31, hpackAnd(255, 31))
     assertEquals(127, hpackAnd(255, 127))
+}
+
+// == RFC 7541 Appendix C — Test Vectors =======================================
+
+// -- C.1: Integer Encoding Examples -------------------------------------------
+
+@Test fun testRfcC1_1_Encode10With5BitPrefix() {
+    // C.1.1: Encode 10 with 5-bit prefix → 0x0a
+    val encoded = hpackEncodeInt(10, 5, 0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(10, charCodeAt(encoded, 0))
+}
+
+@Test fun testRfcC1_2_Encode1337With5BitPrefix() {
+    // C.1.2: Encode 1337 with 5-bit prefix → 0x1f 0x9a 0x0a
+    val encoded = hpackEncodeInt(1337, 5, 0)
+    assertEquals(3, stringLength(encoded))
+    assertEquals(31, charCodeAt(encoded, 0))   // 0x1f
+    assertEquals(154, charCodeAt(encoded, 1))  // 0x9a
+    assertEquals(10, charCodeAt(encoded, 2))   // 0x0a
+}
+
+@Test fun testRfcC1_3_Encode42With8BitPrefix() {
+    // C.1.3: Encode 42 with 8-bit prefix → 0x2a
+    val encoded = hpackEncodeInt(42, 8, 0)
+    assertEquals(1, stringLength(encoded))
+    assertEquals(42, charCodeAt(encoded, 0))  // 0x2a
+}
+
+// -- C.2: Header Field Representations (Decoder Tests) ------------------------
+
+@Test fun testRfcC2_1_LiteralWithIndexing() {
+    // C.2.1: Literal Header Field with Incremental Indexing
+    // custom-key: custom-header
+    // Hex: 40 0a 63 75 73 74 6f 6d 2d 6b 65 79
+    //      0d 63 75 73 74 6f 6d 2d 68 65 61 64 65 72
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(64)   // 0x40
+    buf = stringConcat(buf, hpackByteToChar(10))  // 0x0a name length
+    buf = stringConcat(buf, "custom-key")
+    buf = stringConcat(buf, hpackByteToChar(13))  // 0x0d value length
+    buf = stringConcat(buf, "custom-header")
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(1, listSize(headers))
+    assertEqualsStr("custom-key", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("custom-header", toString(mapGet(listGet(headers, 0), "value")))
+    // Dynamic table should be updated
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    assertEquals(55, hpackDynamicTableSize(ctx))  // 10 + 13 + 32 = 55
+}
+
+@Test fun testRfcC2_2_LiteralWithoutIndexing() {
+    // C.2.2: Literal Header Field without Indexing
+    // :path: /sample/path
+    // Hex: 04 0c 2f 73 61 6d 70 6c 65 2f 70 61 74 68
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(4)    // 0x04 = without indexing, name index 4
+    buf = stringConcat(buf, hpackByteToChar(12))  // 0x0c value length
+    buf = stringConcat(buf, "/sample/path")
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(1, listSize(headers))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("/sample/path", toString(mapGet(listGet(headers, 0), "value")))
+    // Dynamic table NOT updated
+    assertEquals(0, hpackDynamicTableLength(ctx))
+}
+
+@Test fun testRfcC2_3_LiteralNeverIndexed() {
+    // C.2.3: Literal Header Field Never Indexed
+    // password: secret
+    // Hex: 10 08 70 61 73 73 77 6f 72 64 06 73 65 63 72 65 74
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(16)   // 0x10 = never indexed, name index 0
+    buf = stringConcat(buf, hpackByteToChar(8))   // 0x08 name length
+    buf = stringConcat(buf, "password")
+    buf = stringConcat(buf, hpackByteToChar(6))   // 0x06 value length
+    buf = stringConcat(buf, "secret")
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(1, listSize(headers))
+    assertEqualsStr("password", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("secret", toString(mapGet(listGet(headers, 0), "value")))
+    // Dynamic table NOT updated
+    assertEquals(0, hpackDynamicTableLength(ctx))
+}
+
+@Test fun testRfcC2_4_IndexedHeaderField() {
+    // C.2.4: Indexed Header Field
+    // :method: GET → index 2 → 0x82
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(130)  // 0x82
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(1, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+}
+
+// -- C.3: Request Examples without Huffman Coding (Decoder Tests) -------------
+
+@Test fun testRfcC3_1_FirstRequest() {
+    // C.3.1: First Request
+    // :method: GET, :scheme: http, :path: /, :authority: www.example.com
+    // Hex: 82 86 84 41 0f 77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf = stringConcat(buf, hpackByteToChar(134))  // 0x86 :scheme http
+    buf = stringConcat(buf, hpackByteToChar(132))  // 0x84 :path /
+    buf = stringConcat(buf, hpackByteToChar(65))   // 0x41 incremental, name idx 1
+    buf = stringConcat(buf, hpackByteToChar(15))   // 0x0f value length
+    buf = stringConcat(buf, "www.example.com")
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("http", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("/", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    // Dynamic table: 1 entry (:authority: www.example.com), size = 57
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    assertEquals(57, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC3_2_SecondRequest() {
+    // C.3.2: Second Request (same context as C.3.1)
+    // First, replay C.3.1 to populate context
+    val ctx = hpackCreateContext()
+    var buf1: String = hpackByteToChar(130)
+    buf1 = stringConcat(buf1, hpackByteToChar(134))
+    buf1 = stringConcat(buf1, hpackByteToChar(132))
+    buf1 = stringConcat(buf1, hpackByteToChar(65))
+    buf1 = stringConcat(buf1, hpackByteToChar(15))
+    buf1 = stringConcat(buf1, "www.example.com")
+    hpackDecode(ctx, buf1, stringLength(buf1))
+
+    // Second request: :method GET, :scheme http, :path /,
+    //   :authority www.example.com (from dynamic), cache-control: no-cache
+    // Hex: 82 86 84 be 58 08 6e 6f 2d 63 61 63 68 65
+    var buf2: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf2 = stringConcat(buf2, hpackByteToChar(134))  // 0x86 :scheme http
+    buf2 = stringConcat(buf2, hpackByteToChar(132))  // 0x84 :path /
+    buf2 = stringConcat(buf2, hpackByteToChar(190))  // 0xbe dynamic idx 62
+    buf2 = stringConcat(buf2, hpackByteToChar(88))   // 0x58 incremental, name idx 24
+    buf2 = stringConcat(buf2, hpackByteToChar(8))    // 0x08 value length
+    buf2 = stringConcat(buf2, "no-cache")
+    val headers = hpackDecode(ctx, buf2, stringLength(buf2))
+    assertEquals(5, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("no-cache", toString(mapGet(listGet(headers, 4), "value")))
+    // Dynamic table: 2 entries, size = 110
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    assertEquals(110, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC3_3_ThirdRequest() {
+    // C.3.3: Third Request (same context as C.3.1 + C.3.2)
+    val ctx = hpackCreateContext()
+    // Replay C.3.1
+    var buf1: String = hpackByteToChar(130)
+    buf1 = stringConcat(buf1, hpackByteToChar(134))
+    buf1 = stringConcat(buf1, hpackByteToChar(132))
+    buf1 = stringConcat(buf1, hpackByteToChar(65))
+    buf1 = stringConcat(buf1, hpackByteToChar(15))
+    buf1 = stringConcat(buf1, "www.example.com")
+    hpackDecode(ctx, buf1, stringLength(buf1))
+    // Replay C.3.2
+    var buf2: String = hpackByteToChar(130)
+    buf2 = stringConcat(buf2, hpackByteToChar(134))
+    buf2 = stringConcat(buf2, hpackByteToChar(132))
+    buf2 = stringConcat(buf2, hpackByteToChar(190))
+    buf2 = stringConcat(buf2, hpackByteToChar(88))
+    buf2 = stringConcat(buf2, hpackByteToChar(8))
+    buf2 = stringConcat(buf2, "no-cache")
+    hpackDecode(ctx, buf2, stringLength(buf2))
+
+    // Third request:
+    // Hex: 82 87 85 bf 40 0a 63 75 73 74 6f 6d 2d 6b 65 79
+    //      0c 63 75 73 74 6f 6d 2d 76 61 6c 75 65
+    var buf3: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf3 = stringConcat(buf3, hpackByteToChar(135))  // 0x87 :scheme https
+    buf3 = stringConcat(buf3, hpackByteToChar(133))  // 0x85 :path /index.html
+    buf3 = stringConcat(buf3, hpackByteToChar(191))  // 0xbf dynamic idx 63
+    buf3 = stringConcat(buf3, hpackByteToChar(64))   // 0x40 incremental, new name
+    buf3 = stringConcat(buf3, hpackByteToChar(10))   // 0x0a name length
+    buf3 = stringConcat(buf3, "custom-key")
+    buf3 = stringConcat(buf3, hpackByteToChar(12))   // 0x0c value length
+    buf3 = stringConcat(buf3, "custom-value")
+    val headers = hpackDecode(ctx, buf3, stringLength(buf3))
+    assertEquals(5, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("https", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("/index.html", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr("custom-key", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("custom-value", toString(mapGet(listGet(headers, 4), "value")))
+    // Dynamic table: 3 entries, size = 164
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    assertEquals(164, hpackDynamicTableSize(ctx))
+}
+
+// -- C.5: Response Examples without Huffman Coding (Decoder Tests) ------------
+
+@Test fun testRfcC5_1_FirstResponse() {
+    // C.5.1: First Response (max table size = 256)
+    // :status 302, cache-control private, date Mon 21 Oct..., location https://www.example.com
+    // Hex: 48 03 33 30 32 58 07 70 72 69 76 61 74 65 61 1d
+    //      4d 6f 6e 2c 20 32 31 20 4f 63 74 20 32 30 31 33
+    //      20 32 30 3a 31 33 3a 32 31 20 47 4d 54 6e 17 68
+    //      74 74 70 73 3a 2f 2f 77 77 77 2e 65 78 61 6d 70
+    //      6c 65 2e 63 6f 6d
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    var buf: String = hpackByteToChar(72)   // 0x48 incremental, name idx 8
+    buf = stringConcat(buf, hpackByteToChar(3))    // value length 3
+    buf = stringConcat(buf, "302")
+    buf = stringConcat(buf, hpackByteToChar(88))   // 0x58 incremental, name idx 24
+    buf = stringConcat(buf, hpackByteToChar(7))    // value length 7
+    buf = stringConcat(buf, "private")
+    buf = stringConcat(buf, hpackByteToChar(97))   // 0x61 incremental, name idx 33
+    buf = stringConcat(buf, hpackByteToChar(29))   // value length 29
+    buf = stringConcat(buf, "Mon, 21 Oct 2013 20:13:21 GMT")
+    buf = stringConcat(buf, hpackByteToChar(110))  // 0x6e incremental, name idx 46
+    buf = stringConcat(buf, hpackByteToChar(23))   // value length 23
+    buf = stringConcat(buf, "https://www.example.com")
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("302", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("private", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr("date", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("Mon, 21 Oct 2013 20:13:21 GMT", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr("location", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("https://www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    // Dynamic table: 4 entries, size = 222
+    assertEquals(4, hpackDynamicTableLength(ctx))
+    assertEquals(222, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC5_2_SecondResponse() {
+    // C.5.2: Second Response (same context, table size 256)
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    // Replay C.5.1
+    var buf1: String = hpackByteToChar(72)
+    buf1 = stringConcat(buf1, hpackByteToChar(3))
+    buf1 = stringConcat(buf1, "302")
+    buf1 = stringConcat(buf1, hpackByteToChar(88))
+    buf1 = stringConcat(buf1, hpackByteToChar(7))
+    buf1 = stringConcat(buf1, "private")
+    buf1 = stringConcat(buf1, hpackByteToChar(97))
+    buf1 = stringConcat(buf1, hpackByteToChar(29))
+    buf1 = stringConcat(buf1, "Mon, 21 Oct 2013 20:13:21 GMT")
+    buf1 = stringConcat(buf1, hpackByteToChar(110))
+    buf1 = stringConcat(buf1, hpackByteToChar(23))
+    buf1 = stringConcat(buf1, "https://www.example.com")
+    hpackDecode(ctx, buf1, stringLength(buf1))
+
+    // Second response: :status 307, cache-control private, date ..., location ...
+    // Hex: 48 03 33 30 37 c1 c0 bf
+    var buf2: String = hpackByteToChar(72)   // 0x48 incremental, name idx 8
+    buf2 = stringConcat(buf2, hpackByteToChar(3))    // value length 3
+    buf2 = stringConcat(buf2, "307")
+    buf2 = stringConcat(buf2, hpackByteToChar(193))  // 0xc1 indexed dynamic 62+1=63
+    buf2 = stringConcat(buf2, hpackByteToChar(192))  // 0xc0 indexed dynamic 62+0=62
+    buf2 = stringConcat(buf2, hpackByteToChar(191))  // 0xbf indexed dynamic 62-1... wait
+    val headers = hpackDecode(ctx, buf2, stringLength(buf2))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("307", toString(mapGet(listGet(headers, 0), "value")))
+    // Dynamic table: 4 entries, size = 222
+    assertEquals(4, hpackDynamicTableLength(ctx))
+    assertEquals(222, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC5_3_ThirdResponse() {
+    // C.5.3: Third Response (same context, table size 256)
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    // Replay C.5.1
+    var buf1: String = hpackByteToChar(72)
+    buf1 = stringConcat(buf1, hpackByteToChar(3))
+    buf1 = stringConcat(buf1, "302")
+    buf1 = stringConcat(buf1, hpackByteToChar(88))
+    buf1 = stringConcat(buf1, hpackByteToChar(7))
+    buf1 = stringConcat(buf1, "private")
+    buf1 = stringConcat(buf1, hpackByteToChar(97))
+    buf1 = stringConcat(buf1, hpackByteToChar(29))
+    buf1 = stringConcat(buf1, "Mon, 21 Oct 2013 20:13:21 GMT")
+    buf1 = stringConcat(buf1, hpackByteToChar(110))
+    buf1 = stringConcat(buf1, hpackByteToChar(23))
+    buf1 = stringConcat(buf1, "https://www.example.com")
+    hpackDecode(ctx, buf1, stringLength(buf1))
+    // Replay C.5.2
+    var buf2: String = hpackByteToChar(72)
+    buf2 = stringConcat(buf2, hpackByteToChar(3))
+    buf2 = stringConcat(buf2, "307")
+    buf2 = stringConcat(buf2, hpackByteToChar(193))
+    buf2 = stringConcat(buf2, hpackByteToChar(192))
+    buf2 = stringConcat(buf2, hpackByteToChar(191))
+    hpackDecode(ctx, buf2, stringLength(buf2))
+
+    // Third response: :status 200, cache-control private, date ...,
+    //   location https://www.example.com, content-encoding gzip,
+    //   set-cookie foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; ...
+    // Hex: 88 c1 61 1d 4d 6f 6e 2c 20 32 31 20 4f 63 74 20
+    //      32 30 31 33 20 32 30 3a 31 33 3a 32 32 20 47 4d
+    //      54 c0 5a 04 67 7a 69 70 77 38 66 6f 6f 3d 41 53
+    //      44 4a 4b 48 51 4b 42 5a 58 4f 51 57 45 4f 50 49
+    //      55 41 58 51 57 45 4f 49 55 3b 20 6d 61 78 2d 61
+    //      67 65 3d 33 36 30 30 3b 20 76 65 72 73 69 6f 6e
+    //      3d 31
+    var buf3: String = hpackByteToChar(136)  // 0x88 indexed static 8 (:status 200)
+    buf3 = stringConcat(buf3, hpackByteToChar(193))  // 0xc1 indexed dynamic
+    buf3 = stringConcat(buf3, hpackByteToChar(97))   // 0x61 incremental, name idx 33
+    buf3 = stringConcat(buf3, hpackByteToChar(29))   // value length 29
+    buf3 = stringConcat(buf3, "Mon, 21 Oct 2013 20:13:22 GMT")
+    buf3 = stringConcat(buf3, hpackByteToChar(192))  // 0xc0 indexed dynamic
+    buf3 = stringConcat(buf3, hpackByteToChar(90))   // 0x5a incremental, name idx 26
+    buf3 = stringConcat(buf3, hpackByteToChar(4))    // value length 4
+    buf3 = stringConcat(buf3, "gzip")
+    buf3 = stringConcat(buf3, hpackByteToChar(119))  // 0x77 incremental, name idx 55
+    buf3 = stringConcat(buf3, hpackByteToChar(56))   // value length 56
+    buf3 = stringConcat(buf3, "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1")
+    val headers = hpackDecode(ctx, buf3, stringLength(buf3))
+    assertEquals(6, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("200", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr("content-encoding", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("gzip", toString(mapGet(listGet(headers, 4), "value")))
+    assertEqualsStr("set-cookie", toString(mapGet(listGet(headers, 5), "name")))
+    // Dynamic table: 3 entries (eviction occurred), size = 215
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    assertEquals(215, hpackDynamicTableSize(ctx))
+}
+
+// -- Extended Integer Roundtrip with hpackByteToChar --------------------------
+
+@Test fun testIntRoundtripExtended() {
+    // Now that hpackByteToChar exists, test values beyond 158
+    // which require continuation bytes > 127
+    var v: Int = 0
+    while (v <= 2000) {
+        val encoded = hpackEncodeInt(v, 5, 0)
+        val decoded = hpackDecodeInt(encoded, 0, 5)
+        assertEquals(v, toInt(mapGet(decoded, "value")))
+        v = v + 50
+    }
+}
+
+// == RFC 7541 Appendix C.4 — Request Examples with Huffman Coding =============
+
+@Test fun testRfcC4_1_FirstRequestHuffman() {
+    // C.4.1: :method GET, :scheme http, :path /, :authority www.example.com
+    // Hex: 82 86 84 41 8c f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff
+    val ctx = hpackCreateContext()
+    var buf: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf = stringConcat(buf, hpackByteToChar(134))  // 0x86 :scheme http
+    buf = stringConcat(buf, hpackByteToChar(132))  // 0x84 :path /
+    buf = stringConcat(buf, hpackByteToChar(65))   // 0x41 incremental, name idx 1
+    buf = stringConcat(buf, hpackByteToChar(140))  // 0x8c H=1, len=12
+    buf = stringConcat(buf, hpackByteToChar(241))  // 0xf1
+    buf = stringConcat(buf, hpackByteToChar(227))  // 0xe3
+    buf = stringConcat(buf, hpackByteToChar(194))  // 0xc2
+    buf = stringConcat(buf, hpackByteToChar(229))  // 0xe5
+    buf = stringConcat(buf, hpackByteToChar(242))  // 0xf2
+    buf = stringConcat(buf, hpackByteToChar(58))   // 0x3a
+    buf = stringConcat(buf, hpackByteToChar(107))  // 0x6b
+    buf = stringConcat(buf, hpackByteToChar(160))  // 0xa0
+    buf = stringConcat(buf, hpackByteToChar(171))  // 0xab
+    buf = stringConcat(buf, hpackByteToChar(144))  // 0x90
+    buf = stringConcat(buf, hpackByteToChar(244))  // 0xf4
+    buf = stringConcat(buf, hpackByteToChar(255))  // 0xff
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("http", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("/", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    // Dynamic table: 1 entry (:authority: www.example.com), size = 57
+    assertEquals(1, hpackDynamicTableLength(ctx))
+    assertEquals(57, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC4_2_SecondRequestHuffman() {
+    // Replay C.4.1, then decode C.4.2
+    // C.4.2 Hex: 82 86 84 be 58 86 a8 eb 10 64 9c bf
+    val ctx = hpackCreateContext()
+    // Replay C.4.1
+    var buf1: String = hpackByteToChar(130)
+    buf1 = stringConcat(buf1, hpackByteToChar(134))
+    buf1 = stringConcat(buf1, hpackByteToChar(132))
+    buf1 = stringConcat(buf1, hpackByteToChar(65))
+    buf1 = stringConcat(buf1, hpackByteToChar(140))  // 0x8c
+    buf1 = stringConcat(buf1, hpackByteToChar(241))
+    buf1 = stringConcat(buf1, hpackByteToChar(227))
+    buf1 = stringConcat(buf1, hpackByteToChar(194))
+    buf1 = stringConcat(buf1, hpackByteToChar(229))
+    buf1 = stringConcat(buf1, hpackByteToChar(242))
+    buf1 = stringConcat(buf1, hpackByteToChar(58))
+    buf1 = stringConcat(buf1, hpackByteToChar(107))
+    buf1 = stringConcat(buf1, hpackByteToChar(160))
+    buf1 = stringConcat(buf1, hpackByteToChar(171))
+    buf1 = stringConcat(buf1, hpackByteToChar(144))
+    buf1 = stringConcat(buf1, hpackByteToChar(244))
+    buf1 = stringConcat(buf1, hpackByteToChar(255))
+    hpackDecode(ctx, buf1, stringLength(buf1))
+
+    // C.4.2: :method GET, :scheme http, :path /,
+    //   :authority www.example.com (dynamic), cache-control: no-cache (Huffman)
+    var buf2: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf2 = stringConcat(buf2, hpackByteToChar(134))  // 0x86 :scheme http
+    buf2 = stringConcat(buf2, hpackByteToChar(132))  // 0x84 :path /
+    buf2 = stringConcat(buf2, hpackByteToChar(190))  // 0xbe dynamic idx 62
+    buf2 = stringConcat(buf2, hpackByteToChar(88))   // 0x58 incremental, name idx 24
+    buf2 = stringConcat(buf2, hpackByteToChar(134))  // 0x86 H=1, len=6
+    buf2 = stringConcat(buf2, hpackByteToChar(168))  // 0xa8
+    buf2 = stringConcat(buf2, hpackByteToChar(235))  // 0xeb
+    buf2 = stringConcat(buf2, hpackByteToChar(16))   // 0x10
+    buf2 = stringConcat(buf2, hpackByteToChar(100))  // 0x64
+    buf2 = stringConcat(buf2, hpackByteToChar(156))  // 0x9c
+    buf2 = stringConcat(buf2, hpackByteToChar(191))  // 0xbf
+    val headers = hpackDecode(ctx, buf2, stringLength(buf2))
+    assertEquals(5, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("http", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("/", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("no-cache", toString(mapGet(listGet(headers, 4), "value")))
+    // Dynamic table: 2 entries, size = 110
+    assertEquals(2, hpackDynamicTableLength(ctx))
+    assertEquals(110, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC4_3_ThirdRequestHuffman() {
+    // Replay C.4.1+C.4.2, then decode C.4.3
+    // C.4.3 Hex: 82 87 85 bf 40 88 25 a8 49 e9 5b a9 7d 7f 89 25 a8 49 e9 5b b8 e8 b4 bf
+    val ctx = hpackCreateContext()
+    // Replay C.4.1
+    var buf1: String = hpackByteToChar(130)
+    buf1 = stringConcat(buf1, hpackByteToChar(134))
+    buf1 = stringConcat(buf1, hpackByteToChar(132))
+    buf1 = stringConcat(buf1, hpackByteToChar(65))
+    buf1 = stringConcat(buf1, hpackByteToChar(140))
+    buf1 = stringConcat(buf1, hpackByteToChar(241))
+    buf1 = stringConcat(buf1, hpackByteToChar(227))
+    buf1 = stringConcat(buf1, hpackByteToChar(194))
+    buf1 = stringConcat(buf1, hpackByteToChar(229))
+    buf1 = stringConcat(buf1, hpackByteToChar(242))
+    buf1 = stringConcat(buf1, hpackByteToChar(58))
+    buf1 = stringConcat(buf1, hpackByteToChar(107))
+    buf1 = stringConcat(buf1, hpackByteToChar(160))
+    buf1 = stringConcat(buf1, hpackByteToChar(171))
+    buf1 = stringConcat(buf1, hpackByteToChar(144))
+    buf1 = stringConcat(buf1, hpackByteToChar(244))
+    buf1 = stringConcat(buf1, hpackByteToChar(255))
+    hpackDecode(ctx, buf1, stringLength(buf1))
+    // Replay C.4.2
+    var buf2: String = hpackByteToChar(130)
+    buf2 = stringConcat(buf2, hpackByteToChar(134))
+    buf2 = stringConcat(buf2, hpackByteToChar(132))
+    buf2 = stringConcat(buf2, hpackByteToChar(190))
+    buf2 = stringConcat(buf2, hpackByteToChar(88))
+    buf2 = stringConcat(buf2, hpackByteToChar(134))
+    buf2 = stringConcat(buf2, hpackByteToChar(168))
+    buf2 = stringConcat(buf2, hpackByteToChar(235))
+    buf2 = stringConcat(buf2, hpackByteToChar(16))
+    buf2 = stringConcat(buf2, hpackByteToChar(100))
+    buf2 = stringConcat(buf2, hpackByteToChar(156))
+    buf2 = stringConcat(buf2, hpackByteToChar(191))
+    hpackDecode(ctx, buf2, stringLength(buf2))
+
+    // C.4.3: :method GET, :scheme https, :path /index.html,
+    //   :authority www.example.com (dynamic), custom-key: custom-value (Huffman)
+    var buf3: String = hpackByteToChar(130)  // 0x82 :method GET
+    buf3 = stringConcat(buf3, hpackByteToChar(135))  // 0x87 :scheme https
+    buf3 = stringConcat(buf3, hpackByteToChar(133))  // 0x85 :path /index.html
+    buf3 = stringConcat(buf3, hpackByteToChar(191))  // 0xbf dynamic idx 63
+    buf3 = stringConcat(buf3, hpackByteToChar(64))   // 0x40 incremental, new name
+    buf3 = stringConcat(buf3, hpackByteToChar(136))  // 0x88 H=1, len=8 (name)
+    buf3 = stringConcat(buf3, hpackByteToChar(37))   // 0x25
+    buf3 = stringConcat(buf3, hpackByteToChar(168))  // 0xa8
+    buf3 = stringConcat(buf3, hpackByteToChar(73))   // 0x49
+    buf3 = stringConcat(buf3, hpackByteToChar(233))  // 0xe9
+    buf3 = stringConcat(buf3, hpackByteToChar(91))   // 0x5b
+    buf3 = stringConcat(buf3, hpackByteToChar(169))  // 0xa9
+    buf3 = stringConcat(buf3, hpackByteToChar(125))  // 0x7d
+    buf3 = stringConcat(buf3, hpackByteToChar(127))  // 0x7f
+    buf3 = stringConcat(buf3, hpackByteToChar(137))  // 0x89 H=1, len=9 (value)
+    buf3 = stringConcat(buf3, hpackByteToChar(37))   // 0x25
+    buf3 = stringConcat(buf3, hpackByteToChar(168))  // 0xa8
+    buf3 = stringConcat(buf3, hpackByteToChar(73))   // 0x49
+    buf3 = stringConcat(buf3, hpackByteToChar(233))  // 0xe9
+    buf3 = stringConcat(buf3, hpackByteToChar(91))   // 0x5b
+    buf3 = stringConcat(buf3, hpackByteToChar(184))  // 0xb8
+    buf3 = stringConcat(buf3, hpackByteToChar(232))  // 0xe8
+    buf3 = stringConcat(buf3, hpackByteToChar(180))  // 0xb4
+    buf3 = stringConcat(buf3, hpackByteToChar(191))  // 0xbf
+    val headers = hpackDecode(ctx, buf3, stringLength(buf3))
+    assertEquals(5, listSize(headers))
+    assertEqualsStr(":method", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr(":scheme", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("https", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("/index.html", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    assertEqualsStr("custom-key", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("custom-value", toString(mapGet(listGet(headers, 4), "value")))
+    // Dynamic table: 3 entries, size = 164
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    assertEquals(164, hpackDynamicTableSize(ctx))
+}
+
+// == RFC 7541 Appendix C.6 — Response Examples with Huffman Coding ============
+
+@Test fun testRfcC6_1_FirstResponseHuffman() {
+    // C.6.1: :status 302, cache-control private, date Mon..., location https://www.example.com
+    // Dynamic table max size = 256
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    // 48 82 64 02 58 85 ae c3 77 1a 4b
+    // 61 96 d0 7a be 94 10 54 d4 44 a8 20 05 95 04 0b 81 66 e0 82 a6 2d 1b ff
+    // 6e 91 9d 29 ad 17 18 63 c7 8f 0b 97 c8 e9 ae 82 ae 43 d3
+    var buf: String = hpackByteToChar(72)    // 0x48 incremental, name idx 8 (:status)
+    buf = stringConcat(buf, hpackByteToChar(130))   // 0x82 H=1, len=2
+    buf = stringConcat(buf, hpackByteToChar(100))   // 0x64
+    buf = stringConcat(buf, hpackByteToChar(2))     // 0x02
+    buf = stringConcat(buf, hpackByteToChar(88))    // 0x58 incremental, name idx 24
+    buf = stringConcat(buf, hpackByteToChar(133))   // 0x85 H=1, len=5
+    buf = stringConcat(buf, hpackByteToChar(174))   // 0xae
+    buf = stringConcat(buf, hpackByteToChar(195))   // 0xc3
+    buf = stringConcat(buf, hpackByteToChar(119))   // 0x77
+    buf = stringConcat(buf, hpackByteToChar(26))    // 0x1a
+    buf = stringConcat(buf, hpackByteToChar(75))    // 0x4b
+    buf = stringConcat(buf, hpackByteToChar(97))    // 0x61 incremental, name idx 33 (date)
+    buf = stringConcat(buf, hpackByteToChar(150))   // 0x96 H=1, len=22
+    buf = stringConcat(buf, hpackByteToChar(208))   // 0xd0
+    buf = stringConcat(buf, hpackByteToChar(122))   // 0x7a
+    buf = stringConcat(buf, hpackByteToChar(190))   // 0xbe
+    buf = stringConcat(buf, hpackByteToChar(148))   // 0x94
+    buf = stringConcat(buf, hpackByteToChar(16))    // 0x10
+    buf = stringConcat(buf, hpackByteToChar(84))    // 0x54
+    buf = stringConcat(buf, hpackByteToChar(212))   // 0xd4
+    buf = stringConcat(buf, hpackByteToChar(68))    // 0x44
+    buf = stringConcat(buf, hpackByteToChar(168))   // 0xa8
+    buf = stringConcat(buf, hpackByteToChar(32))    // 0x20
+    buf = stringConcat(buf, hpackByteToChar(5))     // 0x05
+    buf = stringConcat(buf, hpackByteToChar(149))   // 0x95
+    buf = stringConcat(buf, hpackByteToChar(4))     // 0x04
+    buf = stringConcat(buf, hpackByteToChar(11))    // 0x0b
+    buf = stringConcat(buf, hpackByteToChar(129))   // 0x81
+    buf = stringConcat(buf, hpackByteToChar(102))   // 0x66
+    buf = stringConcat(buf, hpackByteToChar(224))   // 0xe0
+    buf = stringConcat(buf, hpackByteToChar(130))   // 0x82
+    buf = stringConcat(buf, hpackByteToChar(166))   // 0xa6
+    buf = stringConcat(buf, hpackByteToChar(45))    // 0x2d
+    buf = stringConcat(buf, hpackByteToChar(27))    // 0x1b
+    buf = stringConcat(buf, hpackByteToChar(255))   // 0xff
+    buf = stringConcat(buf, hpackByteToChar(110))   // 0x6e incremental, name idx 46 (location)
+    buf = stringConcat(buf, hpackByteToChar(145))   // 0x91 H=1, len=17
+    buf = stringConcat(buf, hpackByteToChar(157))   // 0x9d
+    buf = stringConcat(buf, hpackByteToChar(41))    // 0x29
+    buf = stringConcat(buf, hpackByteToChar(173))   // 0xad
+    buf = stringConcat(buf, hpackByteToChar(23))    // 0x17
+    buf = stringConcat(buf, hpackByteToChar(24))    // 0x18
+    buf = stringConcat(buf, hpackByteToChar(99))    // 0x63
+    buf = stringConcat(buf, hpackByteToChar(199))   // 0xc7
+    buf = stringConcat(buf, hpackByteToChar(143))   // 0x8f
+    buf = stringConcat(buf, hpackByteToChar(11))    // 0x0b
+    buf = stringConcat(buf, hpackByteToChar(151))   // 0x97
+    buf = stringConcat(buf, hpackByteToChar(200))   // 0xc8
+    buf = stringConcat(buf, hpackByteToChar(233))   // 0xe9
+    buf = stringConcat(buf, hpackByteToChar(174))   // 0xae
+    buf = stringConcat(buf, hpackByteToChar(130))   // 0x82
+    buf = stringConcat(buf, hpackByteToChar(174))   // 0xae
+    buf = stringConcat(buf, hpackByteToChar(67))    // 0x43
+    buf = stringConcat(buf, hpackByteToChar(211))   // 0xd3
+    val headers = hpackDecode(ctx, buf, stringLength(buf))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("302", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("private", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr("date", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("Mon, 21 Oct 2013 20:13:21 GMT", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr("location", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("https://www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    // Dynamic table: 4 entries, size = 222
+    assertEquals(4, hpackDynamicTableLength(ctx))
+    assertEquals(222, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC6_2_SecondResponseHuffman() {
+    // Replay C.6.1, then decode C.6.2
+    // C.6.2 Hex: 48 83 64 0e ff c1 c0 bf
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    // Replay C.6.1
+    var buf1: String = hpackByteToChar(72)
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(100))
+    buf1 = stringConcat(buf1, hpackByteToChar(2))
+    buf1 = stringConcat(buf1, hpackByteToChar(88))
+    buf1 = stringConcat(buf1, hpackByteToChar(133))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(195))
+    buf1 = stringConcat(buf1, hpackByteToChar(119))
+    buf1 = stringConcat(buf1, hpackByteToChar(26))
+    buf1 = stringConcat(buf1, hpackByteToChar(75))
+    buf1 = stringConcat(buf1, hpackByteToChar(97))
+    buf1 = stringConcat(buf1, hpackByteToChar(150))
+    buf1 = stringConcat(buf1, hpackByteToChar(208))
+    buf1 = stringConcat(buf1, hpackByteToChar(122))
+    buf1 = stringConcat(buf1, hpackByteToChar(190))
+    buf1 = stringConcat(buf1, hpackByteToChar(148))
+    buf1 = stringConcat(buf1, hpackByteToChar(16))
+    buf1 = stringConcat(buf1, hpackByteToChar(84))
+    buf1 = stringConcat(buf1, hpackByteToChar(212))
+    buf1 = stringConcat(buf1, hpackByteToChar(68))
+    buf1 = stringConcat(buf1, hpackByteToChar(168))
+    buf1 = stringConcat(buf1, hpackByteToChar(32))
+    buf1 = stringConcat(buf1, hpackByteToChar(5))
+    buf1 = stringConcat(buf1, hpackByteToChar(149))
+    buf1 = stringConcat(buf1, hpackByteToChar(4))
+    buf1 = stringConcat(buf1, hpackByteToChar(11))
+    buf1 = stringConcat(buf1, hpackByteToChar(129))
+    buf1 = stringConcat(buf1, hpackByteToChar(102))
+    buf1 = stringConcat(buf1, hpackByteToChar(224))
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(166))
+    buf1 = stringConcat(buf1, hpackByteToChar(45))
+    buf1 = stringConcat(buf1, hpackByteToChar(27))
+    buf1 = stringConcat(buf1, hpackByteToChar(255))
+    buf1 = stringConcat(buf1, hpackByteToChar(110))
+    buf1 = stringConcat(buf1, hpackByteToChar(145))
+    buf1 = stringConcat(buf1, hpackByteToChar(157))
+    buf1 = stringConcat(buf1, hpackByteToChar(41))
+    buf1 = stringConcat(buf1, hpackByteToChar(173))
+    buf1 = stringConcat(buf1, hpackByteToChar(23))
+    buf1 = stringConcat(buf1, hpackByteToChar(24))
+    buf1 = stringConcat(buf1, hpackByteToChar(99))
+    buf1 = stringConcat(buf1, hpackByteToChar(199))
+    buf1 = stringConcat(buf1, hpackByteToChar(143))
+    buf1 = stringConcat(buf1, hpackByteToChar(11))
+    buf1 = stringConcat(buf1, hpackByteToChar(151))
+    buf1 = stringConcat(buf1, hpackByteToChar(200))
+    buf1 = stringConcat(buf1, hpackByteToChar(233))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(67))
+    buf1 = stringConcat(buf1, hpackByteToChar(211))
+    hpackDecode(ctx, buf1, stringLength(buf1))
+
+    // C.6.2: :status 307, cache-control private, date ..., location ...
+    var buf2: String = hpackByteToChar(72)    // 0x48 incremental, name idx 8
+    buf2 = stringConcat(buf2, hpackByteToChar(131))   // 0x83 H=1, len=3
+    buf2 = stringConcat(buf2, hpackByteToChar(100))   // 0x64
+    buf2 = stringConcat(buf2, hpackByteToChar(14))    // 0x0e
+    buf2 = stringConcat(buf2, hpackByteToChar(255))   // 0xff
+    buf2 = stringConcat(buf2, hpackByteToChar(193))   // 0xc1 indexed dynamic
+    buf2 = stringConcat(buf2, hpackByteToChar(192))   // 0xc0 indexed dynamic
+    buf2 = stringConcat(buf2, hpackByteToChar(191))   // 0xbf indexed dynamic
+    val headers = hpackDecode(ctx, buf2, stringLength(buf2))
+    assertEquals(4, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("307", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("private", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr("date", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("Mon, 21 Oct 2013 20:13:21 GMT", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr("location", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("https://www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    // Dynamic table: 4 entries, size = 222
+    assertEquals(4, hpackDynamicTableLength(ctx))
+    assertEquals(222, hpackDynamicTableSize(ctx))
+}
+
+@Test fun testRfcC6_3_ThirdResponseHuffman() {
+    // Replay C.6.1+C.6.2, then decode C.6.3
+    val ctx = hpackCreateContext()
+    hpackDynamicResize(ctx, 256)
+    // Replay C.6.1
+    var buf1: String = hpackByteToChar(72)
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(100))
+    buf1 = stringConcat(buf1, hpackByteToChar(2))
+    buf1 = stringConcat(buf1, hpackByteToChar(88))
+    buf1 = stringConcat(buf1, hpackByteToChar(133))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(195))
+    buf1 = stringConcat(buf1, hpackByteToChar(119))
+    buf1 = stringConcat(buf1, hpackByteToChar(26))
+    buf1 = stringConcat(buf1, hpackByteToChar(75))
+    buf1 = stringConcat(buf1, hpackByteToChar(97))
+    buf1 = stringConcat(buf1, hpackByteToChar(150))
+    buf1 = stringConcat(buf1, hpackByteToChar(208))
+    buf1 = stringConcat(buf1, hpackByteToChar(122))
+    buf1 = stringConcat(buf1, hpackByteToChar(190))
+    buf1 = stringConcat(buf1, hpackByteToChar(148))
+    buf1 = stringConcat(buf1, hpackByteToChar(16))
+    buf1 = stringConcat(buf1, hpackByteToChar(84))
+    buf1 = stringConcat(buf1, hpackByteToChar(212))
+    buf1 = stringConcat(buf1, hpackByteToChar(68))
+    buf1 = stringConcat(buf1, hpackByteToChar(168))
+    buf1 = stringConcat(buf1, hpackByteToChar(32))
+    buf1 = stringConcat(buf1, hpackByteToChar(5))
+    buf1 = stringConcat(buf1, hpackByteToChar(149))
+    buf1 = stringConcat(buf1, hpackByteToChar(4))
+    buf1 = stringConcat(buf1, hpackByteToChar(11))
+    buf1 = stringConcat(buf1, hpackByteToChar(129))
+    buf1 = stringConcat(buf1, hpackByteToChar(102))
+    buf1 = stringConcat(buf1, hpackByteToChar(224))
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(166))
+    buf1 = stringConcat(buf1, hpackByteToChar(45))
+    buf1 = stringConcat(buf1, hpackByteToChar(27))
+    buf1 = stringConcat(buf1, hpackByteToChar(255))
+    buf1 = stringConcat(buf1, hpackByteToChar(110))
+    buf1 = stringConcat(buf1, hpackByteToChar(145))
+    buf1 = stringConcat(buf1, hpackByteToChar(157))
+    buf1 = stringConcat(buf1, hpackByteToChar(41))
+    buf1 = stringConcat(buf1, hpackByteToChar(173))
+    buf1 = stringConcat(buf1, hpackByteToChar(23))
+    buf1 = stringConcat(buf1, hpackByteToChar(24))
+    buf1 = stringConcat(buf1, hpackByteToChar(99))
+    buf1 = stringConcat(buf1, hpackByteToChar(199))
+    buf1 = stringConcat(buf1, hpackByteToChar(143))
+    buf1 = stringConcat(buf1, hpackByteToChar(11))
+    buf1 = stringConcat(buf1, hpackByteToChar(151))
+    buf1 = stringConcat(buf1, hpackByteToChar(200))
+    buf1 = stringConcat(buf1, hpackByteToChar(233))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(130))
+    buf1 = stringConcat(buf1, hpackByteToChar(174))
+    buf1 = stringConcat(buf1, hpackByteToChar(67))
+    buf1 = stringConcat(buf1, hpackByteToChar(211))
+    hpackDecode(ctx, buf1, stringLength(buf1))
+    // Replay C.6.2
+    var buf2: String = hpackByteToChar(72)
+    buf2 = stringConcat(buf2, hpackByteToChar(131))
+    buf2 = stringConcat(buf2, hpackByteToChar(100))
+    buf2 = stringConcat(buf2, hpackByteToChar(14))
+    buf2 = stringConcat(buf2, hpackByteToChar(255))
+    buf2 = stringConcat(buf2, hpackByteToChar(193))
+    buf2 = stringConcat(buf2, hpackByteToChar(192))
+    buf2 = stringConcat(buf2, hpackByteToChar(191))
+    hpackDecode(ctx, buf2, stringLength(buf2))
+
+    // C.6.3: :status 200, cache-control private, date Mon...22 GMT,
+    //   location https://www.example.com, content-encoding gzip,
+    //   set-cookie foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+    // Hex: 88 c1 61 96 d0 7a be 94 10 54 d4 44 a8 20 05 95
+    //      04 0b 81 66 e0 84 a6 2d 1b ff c0 5a 83 9b d9 ab
+    //      77 ad 94 e7 82 1d d7 f2 e6 c7 b3 35 df df cd 5b
+    //      39 60 d5 af 27 08 7f 36 72 c1 ab 27 0f b5 29 1f
+    //      95 87 31 60 65 c0 03 ed 4e e5 b1 06 3d 50 07
+    var buf3: String = hpackByteToChar(136)   // 0x88 indexed #8 (:status: 200)
+    buf3 = stringConcat(buf3, hpackByteToChar(193))   // 0xc1 indexed dynamic (cache-control: private)
+    buf3 = stringConcat(buf3, hpackByteToChar(97))    // 0x61 incremental, name idx 33 (date)
+    buf3 = stringConcat(buf3, hpackByteToChar(150))   // 0x96 H=1, len=22
+    buf3 = stringConcat(buf3, hpackByteToChar(208))   // 0xd0
+    buf3 = stringConcat(buf3, hpackByteToChar(122))   // 0x7a
+    buf3 = stringConcat(buf3, hpackByteToChar(190))   // 0xbe
+    buf3 = stringConcat(buf3, hpackByteToChar(148))   // 0x94
+    buf3 = stringConcat(buf3, hpackByteToChar(16))    // 0x10
+    buf3 = stringConcat(buf3, hpackByteToChar(84))    // 0x54
+    buf3 = stringConcat(buf3, hpackByteToChar(212))   // 0xd4
+    buf3 = stringConcat(buf3, hpackByteToChar(68))    // 0x44
+    buf3 = stringConcat(buf3, hpackByteToChar(168))   // 0xa8
+    buf3 = stringConcat(buf3, hpackByteToChar(32))    // 0x20
+    buf3 = stringConcat(buf3, hpackByteToChar(5))     // 0x05
+    buf3 = stringConcat(buf3, hpackByteToChar(149))   // 0x95
+    buf3 = stringConcat(buf3, hpackByteToChar(4))     // 0x04
+    buf3 = stringConcat(buf3, hpackByteToChar(11))    // 0x0b
+    buf3 = stringConcat(buf3, hpackByteToChar(129))   // 0x81
+    buf3 = stringConcat(buf3, hpackByteToChar(102))   // 0x66
+    buf3 = stringConcat(buf3, hpackByteToChar(224))   // 0xe0
+    buf3 = stringConcat(buf3, hpackByteToChar(132))   // 0x84
+    buf3 = stringConcat(buf3, hpackByteToChar(166))   // 0xa6
+    buf3 = stringConcat(buf3, hpackByteToChar(45))    // 0x2d
+    buf3 = stringConcat(buf3, hpackByteToChar(27))    // 0x1b
+    buf3 = stringConcat(buf3, hpackByteToChar(255))   // 0xff
+    buf3 = stringConcat(buf3, hpackByteToChar(192))   // 0xc0 indexed dynamic (location)
+    buf3 = stringConcat(buf3, hpackByteToChar(90))    // 0x5a incremental, name idx 26 (content-encoding)
+    buf3 = stringConcat(buf3, hpackByteToChar(131))   // 0x83 H=1, len=3
+    buf3 = stringConcat(buf3, hpackByteToChar(155))   // 0x9b
+    buf3 = stringConcat(buf3, hpackByteToChar(217))   // 0xd9
+    buf3 = stringConcat(buf3, hpackByteToChar(171))   // 0xab
+    buf3 = stringConcat(buf3, hpackByteToChar(119))   // 0x77 incremental, name idx 55 (set-cookie)
+    buf3 = stringConcat(buf3, hpackByteToChar(173))   // 0xad H=1, len=45
+    buf3 = stringConcat(buf3, hpackByteToChar(148))   // 0x94
+    buf3 = stringConcat(buf3, hpackByteToChar(231))   // 0xe7
+    buf3 = stringConcat(buf3, hpackByteToChar(130))   // 0x82
+    buf3 = stringConcat(buf3, hpackByteToChar(29))    // 0x1d
+    buf3 = stringConcat(buf3, hpackByteToChar(215))   // 0xd7
+    buf3 = stringConcat(buf3, hpackByteToChar(242))   // 0xf2
+    buf3 = stringConcat(buf3, hpackByteToChar(230))   // 0xe6
+    buf3 = stringConcat(buf3, hpackByteToChar(199))   // 0xc7
+    buf3 = stringConcat(buf3, hpackByteToChar(179))   // 0xb3
+    buf3 = stringConcat(buf3, hpackByteToChar(53))    // 0x35
+    buf3 = stringConcat(buf3, hpackByteToChar(223))   // 0xdf
+    buf3 = stringConcat(buf3, hpackByteToChar(223))   // 0xdf
+    buf3 = stringConcat(buf3, hpackByteToChar(205))   // 0xcd
+    buf3 = stringConcat(buf3, hpackByteToChar(91))    // 0x5b
+    buf3 = stringConcat(buf3, hpackByteToChar(57))    // 0x39
+    buf3 = stringConcat(buf3, hpackByteToChar(96))    // 0x60
+    buf3 = stringConcat(buf3, hpackByteToChar(213))   // 0xd5
+    buf3 = stringConcat(buf3, hpackByteToChar(175))   // 0xaf
+    buf3 = stringConcat(buf3, hpackByteToChar(39))    // 0x27
+    buf3 = stringConcat(buf3, hpackByteToChar(8))     // 0x08
+    buf3 = stringConcat(buf3, hpackByteToChar(127))   // 0x7f
+    buf3 = stringConcat(buf3, hpackByteToChar(54))    // 0x36
+    buf3 = stringConcat(buf3, hpackByteToChar(114))   // 0x72
+    buf3 = stringConcat(buf3, hpackByteToChar(193))   // 0xc1
+    buf3 = stringConcat(buf3, hpackByteToChar(171))   // 0xab
+    buf3 = stringConcat(buf3, hpackByteToChar(39))    // 0x27
+    buf3 = stringConcat(buf3, hpackByteToChar(15))    // 0x0f
+    buf3 = stringConcat(buf3, hpackByteToChar(181))   // 0xb5
+    buf3 = stringConcat(buf3, hpackByteToChar(41))    // 0x29
+    buf3 = stringConcat(buf3, hpackByteToChar(31))    // 0x1f
+    buf3 = stringConcat(buf3, hpackByteToChar(149))   // 0x95
+    buf3 = stringConcat(buf3, hpackByteToChar(135))   // 0x87
+    buf3 = stringConcat(buf3, hpackByteToChar(49))    // 0x31
+    buf3 = stringConcat(buf3, hpackByteToChar(96))    // 0x60
+    buf3 = stringConcat(buf3, hpackByteToChar(101))   // 0x65
+    buf3 = stringConcat(buf3, hpackByteToChar(192))   // 0xc0
+    buf3 = stringConcat(buf3, hpackByteToChar(3))     // 0x03
+    buf3 = stringConcat(buf3, hpackByteToChar(237))   // 0xed
+    buf3 = stringConcat(buf3, hpackByteToChar(78))    // 0x4e
+    buf3 = stringConcat(buf3, hpackByteToChar(229))   // 0xe5
+    buf3 = stringConcat(buf3, hpackByteToChar(177))   // 0xb1
+    buf3 = stringConcat(buf3, hpackByteToChar(6))     // 0x06
+    buf3 = stringConcat(buf3, hpackByteToChar(61))    // 0x3d
+    buf3 = stringConcat(buf3, hpackByteToChar(80))    // 0x50
+    buf3 = stringConcat(buf3, hpackByteToChar(7))     // 0x07
+    val headers = hpackDecode(ctx, buf3, stringLength(buf3))
+    assertEquals(6, listSize(headers))
+    assertEqualsStr(":status", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("200", toString(mapGet(listGet(headers, 0), "value")))
+    assertEqualsStr("cache-control", toString(mapGet(listGet(headers, 1), "name")))
+    assertEqualsStr("private", toString(mapGet(listGet(headers, 1), "value")))
+    assertEqualsStr("date", toString(mapGet(listGet(headers, 2), "name")))
+    assertEqualsStr("Mon, 21 Oct 2013 20:13:22 GMT", toString(mapGet(listGet(headers, 2), "value")))
+    assertEqualsStr("location", toString(mapGet(listGet(headers, 3), "name")))
+    assertEqualsStr("https://www.example.com", toString(mapGet(listGet(headers, 3), "value")))
+    assertEqualsStr("content-encoding", toString(mapGet(listGet(headers, 4), "name")))
+    assertEqualsStr("gzip", toString(mapGet(listGet(headers, 4), "value")))
+    assertEqualsStr("set-cookie", toString(mapGet(listGet(headers, 5), "name")))
+    assertEqualsStr("foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", toString(mapGet(listGet(headers, 5), "value")))
+    // Dynamic table: 3 entries, size = 215
+    assertEquals(3, hpackDynamicTableLength(ctx))
+    assertEquals(215, hpackDynamicTableSize(ctx))
+}
+
+// == Huffman Encoding (Phase 1) ===============================================
+
+@Test fun testHuffmanEncodedLength() {
+    // "www.example.com" has known Huffman length from RFC 7541 C.4
+    val len = hpackHuffmanEncodedLength("www.example.com")
+    assertEquals(12, len)
+}
+
+@Test fun testHuffmanRoundtrip() {
+    val input = "hello world"
+    val encoded = hpackHuffmanEncode(input)
+    val decoded = hpackHuffmanDecode(encoded, 0, stringLength(encoded))
+    assertEqualsStr(input, decoded)
+}
+
+@Test fun testHuffmanShorterThanRaw() {
+    // For typical ASCII text, Huffman should be shorter
+    val raw = "www.example.com"
+    val huffLen = hpackHuffmanEncodedLength(raw)
+    assertTrue(huffLen < stringLength(raw))
+}
+
+@Test fun testHuffmanEncodeKnownVector() {
+    // RFC 7541 C.4.1: "www.example.com" Huffman encodes to 12 bytes
+    val encoded = hpackHuffmanEncode("www.example.com")
+    assertEquals(12, stringLength(encoded))
+}
+
+@Test fun testEncodeStringChoosesHuffman() {
+    // hpackEncodeString should use Huffman when shorter
+    val encoded = hpackEncodeString("www.example.com")
+    val firstByte = charCodeAt(encoded, 0)
+    // H bit should be set (>= 128) when Huffman is shorter
+    assertTrue(firstByte >= 128)
+}
+
+@Test fun testDecodeIntOverflowProtection() {
+    // Build a pathological integer with too many continuation bytes
+    // 5-bit prefix all 1s = 31, then many 0x80 bytes (continuation with value 0), then 0x01
+    var buf: String = hpackByteToChar(31)  // prefix byte: all 5 bits set
+    var i: Int = 0
+    while (i < 20) {
+        buf = stringConcat(buf, hpackByteToChar(128))  // continuation: value 0, more bit set
+        i = i + 1
+    }
+    buf = stringConcat(buf, hpackByteToChar(1))  // final byte
+    val result = hpackDecodeInt(buf, 0, 5)
+    val value = toInt(mapGet(result, "value"))
+    // Value should be clamped, not overflow
+    assertTrue(value <= 2147483647)
+}
+
+@Test fun testHpackBombProtection() {
+    val ctx = hpackCreateContext()
+    hpackSetMaxHeaderFieldSize(ctx, 100)
+    // Encode a header with value longer than 100 bytes
+    var longValue: String = ""
+    var i: Int = 0
+    while (i < 120) {
+        longValue = stringConcat(longValue, "x")
+        i = i + 1
+    }
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", "x-big")
+    mapPut(h, "value", longValue)
+    listAppend(headers, h)
+    val encCtx = hpackCreateContext()
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(ctx, encoded, stringLength(encoded))
+    // Should contain an error entry
+    val first = listGet(decoded, 0)
+    assertEqualsStr("hpack-error", toString(mapGet(first, "name")))
+}
+
+@Test fun testDynamicSizeUpdateAtStart() {
+    // Size update at start of block should succeed
+    val ctx = hpackCreateContext()
+    val encoded = hpackEncodeDynamicSizeUpdate(2048)
+    val decoded = hpackDecode(ctx, encoded, stringLength(encoded))
+    // No error entries expected - empty list is fine (size update doesn't add headers)
+    assertEquals(0, listSize(decoded))
+}
+
+@Test fun testDynamicSizeUpdateMidBlock() {
+    val ctx = hpackCreateContext()
+    // First encode a normal header, then a size update
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val encCtx = hpackCreateContext()
+    val headerBlock = hpackEncode(encCtx, headers)
+    val sizeUpdate = hpackEncodeDynamicSizeUpdate(2048)
+    val combined = stringConcat(headerBlock, sizeUpdate)
+    val decoded = hpackDecode(ctx, combined, stringLength(combined))
+    // Should have the header plus an error entry for the mid-block size update
+    var hasError: Bool = false
+    var j: Int = 0
+    while (j < listSize(decoded)) {
+        val entry = listGet(decoded, j)
+        if (toString(mapGet(entry, "name")) == "hpack-error") {
+            hasError = true
+        }
+        j = j + 1
+    }
+    assertTrue(hasError)
+}
+
+// == Encoder Optimization (Final) =============================================
+
+@Test fun testEncoderUsesIndexedForExactStaticMatch() {
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":method")
+    mapPut(h, "value", "GET")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    // :method GET is static index 2 → indexed representation = 0x82
+    assertEquals(1, stringLength(encoded))
+    assertEquals(130, charCodeAt(encoded, 0))
+}
+
+@Test fun testEncoderUsesIndexedForStatus200() {
+    val ctx = hpackCreateContext()
+    val headers = listCreate()
+    val h = mapCreate()
+    mapPut(h, "name", ":status")
+    mapPut(h, "value", "200")
+    listAppend(headers, h)
+    val encoded = hpackEncode(ctx, headers)
+    // :status 200 is static index 8 → indexed representation = 0x88
+    assertEquals(1, stringLength(encoded))
+    assertEquals(136, charCodeAt(encoded, 0))
+}
+
+@Test fun testEncoderReusesDynamicTable() {
+    val ctx = hpackCreateContext()
+    // First request: custom header added to dynamic table
+    val headers1 = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", "x-custom")
+    mapPut(h1, "value", "test-value")
+    listAppend(headers1, h1)
+    val encoded1 = hpackEncode(ctx, headers1)
+    // Second request: same header should use indexed representation
+    val headers2 = listCreate()
+    val h2 = mapCreate()
+    mapPut(h2, "name", "x-custom")
+    mapPut(h2, "value", "test-value")
+    listAppend(headers2, h2)
+    val encoded2 = hpackEncode(ctx, headers2)
+    // Second encoding should be shorter (indexed vs literal)
+    assertTrue(stringLength(encoded2) < stringLength(encoded1))
+}
+
+@Test fun testEncoderDynamicNameRef() {
+    val ctx = hpackCreateContext()
+    // First: encode a custom header to add to dynamic table
+    val headers1 = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", "x-custom")
+    mapPut(h1, "value", "value1")
+    listAppend(headers1, h1)
+    hpackEncode(ctx, headers1)
+    // Second: same name, different value — should use name reference
+    val headers2 = listCreate()
+    val h2 = mapCreate()
+    mapPut(h2, "name", "x-custom")
+    mapPut(h2, "value", "value2")
+    listAppend(headers2, h2)
+    val encoded2 = hpackEncode(ctx, headers2)
+    // Should be shorter than encoding with literal name
+    // Literal name "x-custom" is 8 bytes + overhead; name ref is 1-2 bytes
+    val encCtx2 = hpackCreateContext()
+    val encoded2Fresh = hpackEncode(encCtx2, headers2)
+    assertTrue(stringLength(encoded2) < stringLength(encoded2Fresh))
+}
+
+@Test fun testProtocolMaxSizePreventsOversize() {
+    val ctx = hpackCreateContext()
+    hpackSetProtocolMaxSize(ctx, 2048)
+    // Try to resize beyond protocol max
+    hpackDynamicResize(ctx, 8192)
+    // Should still be capped at protocol max or less
+    val maxSize = toInt(mapGet(ctx, "maxSize"))
+    assertTrue(maxSize <= 2048)
+}
+
+@Test fun testProtocolMaxSizeAllowsUndersize() {
+    val ctx = hpackCreateContext()
+    hpackSetProtocolMaxSize(ctx, 4096)
+    hpackDynamicResize(ctx, 2048)
+    val maxSize = toInt(mapGet(ctx, "maxSize"))
+    assertEquals(2048, maxSize)
+}
+
+@Test fun testIndexedRoundtripWithDecoder() {
+    val encCtx = hpackCreateContext()
+    val decCtx = hpackCreateContext()
+    val headers = listCreate()
+    val h1 = mapCreate()
+    mapPut(h1, "name", ":method")
+    mapPut(h1, "value", "GET")
+    listAppend(headers, h1)
+    val h2m = mapCreate()
+    mapPut(h2m, "name", ":path")
+    mapPut(h2m, "value", "/")
+    listAppend(headers, h2m)
+    val encoded = hpackEncode(encCtx, headers)
+    val decoded = hpackDecode(decCtx, encoded, stringLength(encoded))
+    assertEquals(2, listSize(decoded))
+    assertEqualsStr(":method", toString(mapGet(listGet(decoded, 0), "name")))
+    assertEqualsStr("GET", toString(mapGet(listGet(decoded, 0), "value")))
+    assertEqualsStr(":path", toString(mapGet(listGet(decoded, 1), "name")))
+    assertEqualsStr("/", toString(mapGet(listGet(decoded, 1), "value")))
+}
+
+// =============================================================================
+// == Gap H1: Huffman Padding Validation (RFC 7541 Section 5.2)
+// =============================================================================
+
+@Test fun testGapH1_ValidHuffmanPadding() {
+    // Huffman encode "a" — the padding bits should be all 1s (EOS prefix)
+    val encoded = hpackHuffmanEncode("a")
+    // Decoding valid Huffman should return "a", not an error
+    val decoded = hpackHuffmanDecode(encoded, 0, stringLength(encoded))
+    assertEqualsStr("a", decoded)
+}
+
+@Test fun testGapH1_InvalidHuffmanPaddingNotAllOnes() {
+    // Construct a Huffman byte sequence where padding is NOT all 1s
+    // 'a' has Huffman code 0x18 (00011) = 5 bits
+    // Valid encoding: 00011_111 = 0x1F (padding is 111 = all 1s)
+    // Invalid: 00011_000 = 0x18 (padding is 000 = not all 1s)
+    val invalidBuf = hpackByteToChar(24)  // 0x18 = 00011000
+    val decoded = hpackHuffmanDecode(invalidBuf, 0, 1)
+    // Should return error sentinel
+    assertEqualsStr("hpack-huffman-error", decoded)
+}
+
+@Test fun testGapH1_ValidPaddingSingleChar() {
+    // Encode "0" (Huffman code = 00000, 5 bits) -> 00000_111 = 0x07
+    val encoded = hpackHuffmanEncode("0")
+    val decoded = hpackHuffmanDecode(encoded, 0, stringLength(encoded))
+    assertEqualsStr("0", decoded)
+}
+
+// =============================================================================
+// == Gap H2: EOS Symbol Rejection (RFC 7541 Section 5.2)
+// =============================================================================
+
+@Test fun testGapH2_EosSymbolProperties() {
+    // EOS symbol (256) should have code 0x3FFFFFFF and length 30
+    assertEquals(1073741823, hpackHuffmanCode(256))
+    assertEquals(30, hpackHuffmanLen(256))
+}
+
+// =============================================================================
+// == Gap H3: Integer Overflow Signaling (RFC 7541 Section 5.1)
+// =============================================================================
+
+@Test fun testGapH3_NormalIntegerNoOverflow() {
+    // Encode a small integer — should not overflow
+    val encoded = hpackEncodeInt(42, 7, 0)
+    val decoded = hpackDecodeInt(encoded, 0, 7)
+    assertEquals(42, toInt(mapGet(decoded, "value")))
+    assertTrue(mapGet(decoded, "overflow") == false)
+}
+
+@Test fun testGapH3_LargeIntegerNoOverflow() {
+    // Encode the max prefix value for 5-bit prefix (31)
+    val encoded = hpackEncodeInt(31, 5, 0)
+    val decoded = hpackDecodeInt(encoded, 0, 5)
+    assertEquals(31, toInt(mapGet(decoded, "value")))
+    assertTrue(mapGet(decoded, "overflow") == false)
+}
+
+@Test fun testGapH3_MultiByteIntegerNoOverflow() {
+    // Encode 1337 with 5-bit prefix — multi-byte but no overflow
+    val encoded = hpackEncodeInt(1337, 5, 0)
+    val decoded = hpackDecodeInt(encoded, 0, 5)
+    assertEquals(1337, toInt(mapGet(decoded, "value")))
+    assertTrue(mapGet(decoded, "overflow") == false)
+}
+
+@Test fun testGapH3_OverflowDetectedInDecode() {
+    // Build a deliberately overflowing integer:
+    // 5-bit prefix all 1s (31) followed by 6 continuation bytes (each 0xFF)
+    // This exceeds 28 bits of continuation, triggering overflow
+    var overflowBuf: String = hpackByteToChar(31)   // 0x1F: prefix all 1s
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))  // continuation
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(127))  // last byte (no continuation)
+    val decoded = hpackDecodeInt(overflowBuf, 0, 5)
+    assertTrue(mapGet(decoded, "overflow") == true)
+}
+
+@Test fun testGapH3_OverflowProducesErrorInHpackDecode() {
+    // Build an indexed header field with overflowing index
+    // Indexed: top bit = 1, 7-bit prefix
+    // 0xFF followed by many continuation bytes
+    var overflowBuf: String = hpackByteToChar(255)  // 0xFF: indexed, index=127
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(255))
+    overflowBuf = stringConcat(overflowBuf, hpackByteToChar(127))
+    val ctx = hpackCreateContext()
+    val headers = hpackDecode(ctx, overflowBuf, stringLength(overflowBuf))
+    // Should contain an error entry
+    assertEquals(1, listSize(headers))
+    assertEqualsStr("hpack-error", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("integer overflow in indexed header", toString(mapGet(listGet(headers, 0), "value")))
+}
+
+// =============================================================================
+// == Gap H4: Index 0 Decoding Error (RFC 7541 Section 6.1)
+// =============================================================================
+
+@Test fun testGapH4_IndexZeroIsError() {
+    // Indexed header field with index 0: byte 0x80 (top bit=1, index=0)
+    val zeroBuf = hpackByteToChar(128)  // 0x80: indexed, index=0
+    val ctx = hpackCreateContext()
+    val headers = hpackDecode(ctx, zeroBuf, 1)
+    // Should contain an error entry
+    assertEquals(1, listSize(headers))
+    assertEqualsStr("hpack-error", toString(mapGet(listGet(headers, 0), "name")))
+    assertEqualsStr("indexed header field index 0 is invalid", toString(mapGet(listGet(headers, 0), "value")))
+}
+
+@Test fun testGapH4_IndexOneIsValid() {
+    // Indexed header field with index 1: byte 0x81 (top bit=1, index=1)
+    // Index 1 = :authority with empty value
+    val oneBuf = hpackByteToChar(129)  // 0x81: indexed, index=1
+    val ctx = hpackCreateContext()
+    val headers = hpackDecode(ctx, oneBuf, 1)
+    assertEquals(1, listSize(headers))
+    assertEqualsStr(":authority", toString(mapGet(listGet(headers, 0), "name")))
 }
