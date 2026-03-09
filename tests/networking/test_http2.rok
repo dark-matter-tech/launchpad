@@ -2927,9 +2927,18 @@ import rockit.encoding.base64
 
 @Test fun testPushPromiseOnNonZeroStreamAccepted() {
     // PUSH_PROMISE on non-zero stream should be accepted
+    // Parent stream (1) must exist in OPEN state per RFC 9113 §6.6
     val conn = mapCreate()
     mapPut(conn, "fd", 0 - 1)
-    mapPut(conn, "streams", mapCreate())
+    val streams = mapCreate()
+    val stream1 = mapCreate()
+    mapPut(stream1, "state", H2_STREAM_OPEN())
+    mapPut(stream1, "headers", listCreate())
+    mapPut(stream1, "body", "")
+    mapPut(stream1, "sendWindow", 65535)
+    mapPut(stream1, "recvWindow", 65535)
+    mapPut(streams, "1", stream1)
+    mapPut(conn, "streams", streams)
     mapPut(conn, "expectContinuation", false)
     mapPut(conn, "hpackDecCtx", hpackCreateContext())
     val ps = mapCreate()
@@ -2949,8 +2958,8 @@ import rockit.encoding.base64
     payload = stringConcat(payload, headerBlock)
     h2DispatchFrame(conn, H2_PUSH_PROMISE(), H2_FLAG_END_HEADERS(), 1, payload)
     // Stream 2 should have been created
-    val streams = mapGet(conn, "streams")
-    assertTrue(mapGet(streams, "2") != null)
+    val allStreams = mapGet(conn, "streams")
+    assertTrue(mapGet(allStreams, "2") != null)
 }
 
 // == RFC Conformance Gap 4: Client rejects PUSH_PROMISE when push disabled ====
