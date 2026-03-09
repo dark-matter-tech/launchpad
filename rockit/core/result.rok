@@ -1,57 +1,70 @@
 // rockit.core.result — Result type for error handling
 //
-// A sealed class hierarchy representing the outcome of an operation that
+// A map-based type representing the outcome of an operation that
 // may fail. Use Success to wrap a value and Failure to wrap an error message.
-// Inspired by Kotlin's Result and Rust's Result<T, E>.
+// Follows the same tagged-map pattern as JSON/XML error handling.
 //
 // Usage:
 //   import rockit.core.result
 //   val r = Success(42)
 //   val v = resultOrElse(r, 0)  // 42
 
-// == Types ===================================================================
+// == Type Constants ===========================================================
 
-sealed class Result(val isSuccess: Bool)
+fun RESULT_SUCCESS(): String { return "Success" }
+fun RESULT_FAILURE(): String { return "Failure" }
 
-class Success(val value: Int) : Result(true)
+// == Constructors =============================================================
 
-class Failure(val error: String) : Result(false)
+// Create a Success result wrapping an integer value
+fun Success(value: Int): Map {
+    val r = mapCreate()
+    mapPut(r, "type", RESULT_SUCCESS())
+    mapPut(r, "value", value)
+    return r
+}
+
+// Create a Failure result wrapping an error message
+fun Failure(err: String): Map {
+    val r = mapCreate()
+    mapPut(r, "type", RESULT_FAILURE())
+    mapPut(r, "error", err)
+    return r
+}
 
 // == Operations ==============================================================
 
 // Unwrap a Success value, or return the default if Failure
-fun resultOrElse(r: Result, default: Int): Int {
-    when (r) {
-        is Success -> return r.value
-        is Failure -> return default
+fun resultOrElse(r: Map, default: Int): Int {
+    if (toString(mapGet(r, "type")) == RESULT_SUCCESS()) {
+        return toInt(mapGet(r, "value"))
     }
     return default
 }
 
 // Get the error message from a Failure (or empty string for Success)
-fun resultError(r: Result): String {
-    when (r) {
-        is Failure -> return r.error
-        is Success -> return ""
+fun resultError(r: Map): String {
+    if (toString(mapGet(r, "type")) == RESULT_FAILURE()) {
+        return toString(mapGet(r, "error"))
     }
     return ""
 }
 
 // Map a function over a Success value; pass Failure through unchanged
-fun resultMap(r: Result, transform: (Int) -> Int): Result {
-    when (r) {
-        is Success -> return Success(transform(r.value))
-        is Failure -> return r
+fun resultMap(r: Map, transform: (Int) -> Int): Map {
+    if (toString(mapGet(r, "type")) == RESULT_SUCCESS()) {
+        val value = toInt(mapGet(r, "value"))
+        return Success(transform(value))
     }
     return r
 }
 
 // Return true if the Result is a Success
-fun isSuccess(r: Result): Bool {
-    return r.isSuccess
+fun isSuccess(r: Map): Bool {
+    return toString(mapGet(r, "type")) == RESULT_SUCCESS()
 }
 
 // Return true if the Result is a Failure
-fun isFailure(r: Result): Bool {
-    return !r.isSuccess
+fun isFailure(r: Map): Bool {
+    return toString(mapGet(r, "type")) == RESULT_FAILURE()
 }

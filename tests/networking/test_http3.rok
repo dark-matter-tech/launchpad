@@ -369,7 +369,7 @@ import rockit.testing.probe
     assertEquals(H3_SETTINGS(), toInt(mapGet(frameResult, "type")))
     val settingsResult = h3DecodeSettings(toString(mapGet(frameResult, "payload")))
     val decoded = mapGet(settingsResult, "params")
-    assertEquals(2, listSize(decoded))
+    assertEquals(3, listSize(decoded))  // QPACK_MAX_TABLE_CAPACITY, QPACK_BLOCKED_STREAMS, GREASE
 }
 
 // == GOAWAY Frame =============================================================
@@ -767,7 +767,7 @@ import rockit.testing.probe
 @Test fun testH3GracefulCloseFunction() {
     // Verify the function signature exists by checking constants
     assertEquals(7, H3_GOAWAY())
-    assertEquals(0, H3_NO_ERROR())
+    assertEquals(256, H3_NO_ERROR())  // H3_NO_ERROR = 0x0100 per RFC 9114 §8.1
 }
 
 // == Stream Type Validation ===================================================
@@ -813,9 +813,9 @@ import rockit.testing.probe
     mapPut(conn, "peerDecoderStreamId", 0 - 1)
     // h3MonitorControlStreams should return a map with ok, error, errorCode
     val result = h3MonitorControlStreams(conn)
-    assertTrue(mapContains(result, "ok"))
-    assertTrue(mapContains(result, "error"))
-    assertTrue(mapContains(result, "errorCode"))
+    assertTrue(mapGet(result, "ok") != null)
+    assertTrue(mapGet(result, "error") != null)
+    assertTrue(mapGet(result, "errorCode") != null)
 }
 
 @Test fun testH3MonitorControlStreamsNullQuic() {
@@ -955,9 +955,9 @@ import rockit.testing.probe
     val conn = mapCreate()
     mapPut(conn, "quic", null)
     val result = h3GracefulClose(conn, 5)
-    assertTrue(mapContains(result, "initialGoaway"))
-    assertTrue(mapContains(result, "finalGoaway"))
-    assertTrue(mapContains(result, "drainedIterations"))
+    assertTrue(mapGet(result, "initialGoaway") != null)
+    assertTrue(mapGet(result, "finalGoaway") != null)
+    assertTrue(mapGet(result, "drainedIterations") != null)
 }
 
 @Test fun testH3GracefulCloseNullQuic() {
@@ -1220,10 +1220,10 @@ import rockit.testing.probe
     mapPut(conn, "peerSettingsReceived", false)
     val quicConn = mapCreate()
     val result = h3ReadControlStreamFrame(conn, quicConn)
-    assertTrue(mapContains(result, "ok"))
-    assertTrue(mapContains(result, "error"))
-    assertTrue(mapContains(result, "errorCode"))
-    assertTrue(mapContains(result, "frameType"))
+    assertTrue(mapGet(result, "ok") != null)
+    assertTrue(mapGet(result, "error") != null)
+    assertTrue(mapGet(result, "errorCode") != null)
+    assertTrue(mapGet(result, "frameType") != null)
 }
 
 @Test fun testGap4_ReadControlStreamNoPeerStream() {
@@ -1262,9 +1262,9 @@ import rockit.testing.probe
     mapPut(conn, "peerSettingsReceived", false)
     val quicConn = mapCreate()
     val result = h3ProcessPeerStreams(conn, quicConn)
-    assertTrue(mapContains(result, "ok"))
-    assertTrue(mapContains(result, "error"))
-    assertTrue(mapContains(result, "errorCode"))
+    assertTrue(mapGet(result, "ok") != null)
+    assertTrue(mapGet(result, "error") != null)
+    assertTrue(mapGet(result, "errorCode") != null)
 }
 
 @Test fun testGap5_ProcessPeerStreamsNoPeers() {

@@ -2,6 +2,9 @@
 // NOTE: Tests focus on frame encoding and helpers, not live connections
 import rockit.testing.probe
 import rockit.networking.websocket
+import rockit.networking.url
+import rockit.encoding.base64
+import rockit.security.tls
 
 // == Frame Type Constants ====================================================
 
@@ -43,8 +46,8 @@ import rockit.networking.websocket
 @Test fun testWsUnmask() {
     // Create a simple masked payload and verify unmasking
     val maskKey = stringConcat(intToChar(0), stringConcat(intToChar(0), stringConcat(intToChar(0), intToChar(0))))
-    val data = "HELLO"
-    val unmasked = wsUnmask(data, maskKey)
+    val payload = "HELLO"
+    val unmasked = wsUnmask(payload, maskKey)
     // XOR with zero mask should return original
     assertEqualsStr("HELLO", unmasked)
 }

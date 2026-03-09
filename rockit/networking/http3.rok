@@ -531,7 +531,7 @@ fun h3ValidatePushPromise(conn: Map, pushId: Int): Map {
     mapPut(result, "valid", true)
     mapPut(result, "error", "")
     // Check if MAX_PUSH_ID has been sent
-    if (mapContains(conn, "maxPushIdSent") == false) {
+    if (mapGet(conn, "maxPushIdSent") == null) {
         mapPut(result, "valid", false)
         mapPut(result, "error", "PUSH_PROMISE received before MAX_PUSH_ID sent")
         return result
@@ -550,7 +550,7 @@ fun h3ValidatePushPromise(conn: Map, pushId: Int): Map {
         return result
     }
     // Check push ID is not already used
-    if (mapContains(conn, "usedPushIds")) {
+    if (mapGet(conn, "usedPushIds") != null) {
         val usedPushIds = mapGet(conn, "usedPushIds")
         if (listContains(usedPushIds, pushId)) {
             mapPut(result, "valid", false)
@@ -563,7 +563,7 @@ fun h3ValidatePushPromise(conn: Map, pushId: Int): Map {
 
 // Record a used push ID
 fun h3RecordPushId(conn: Map, pushId: Int): Unit {
-    if (mapContains(conn, "usedPushIds") == false) {
+    if (mapGet(conn, "usedPushIds") == null) {
         mapPut(conn, "usedPushIds", listCreate())
     }
     val usedPushIds = mapGet(conn, "usedPushIds")
@@ -955,7 +955,7 @@ fun h3ProcessPeerStreams(conn: Map, quicConn: Map): Map {
                     h3SetPeerDecoderStream(conn, newStreamId)
                 } else { if (streamType == H3_STREAM_PUSH()) {
                     // Push streams — store but do not process here
-                    if (mapContains(conn, "pushStreams") == false) {
+                    if (mapGet(conn, "pushStreams") == null) {
                         mapPut(conn, "pushStreams", listCreate())
                     }
                     val pushStreams = mapGet(conn, "pushStreams")
@@ -1369,7 +1369,7 @@ fun h3ReadResponse(conn: Map, streamId: Int): Map {
                             bodyLength = bodyLength + stringLength(payload)
                         } else { if (frameType == H3_PUSH_PROMISE()) {
                             val pushPromise = h3DecodePushPromise(payload)
-                            if (mapContains(resp, "pushPromises") == false) {
+                            if (mapGet(resp, "pushPromises") == null) {
                                 mapPut(resp, "pushPromises", listCreate())
                             }
                             val pushPromises = mapGet(resp, "pushPromises")

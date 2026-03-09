@@ -586,8 +586,9 @@ import rockit.encoding.hpack
     val encoded = toString(mapGet(result, "encoded"))
     // After 2-byte prefix, name ref byte should be 81
     assertEquals(81, charCodeAt(encoded, 2))
-    // Following bytes: string length (11) + "/index.html"
-    assertEquals(11, charCodeAt(encoded, 3))
+    // Following byte: Huffman-encoded string length with H=1 flag
+    // "/index.html" Huffman-encodes to 8 bytes → 0x88 (128 + 8 = 136)
+    assertEquals(136, charCodeAt(encoded, 3))
 }
 
 @Test fun testQpackEmptyEncode() {
@@ -1209,7 +1210,7 @@ import rockit.encoding.hpack
     // knownReceived should be incremented by 1
     assertEquals(1, toInt(mapGet(enc, "knownReceived")))
     // No error should be set
-    assertTrue(mapContains(enc, "decoderStreamError") == false)
+    assertTrue(mapGet(enc, "decoderStreamError") == null)
 }
 
 @Test fun testGapQ2_IncrementMultiple() {

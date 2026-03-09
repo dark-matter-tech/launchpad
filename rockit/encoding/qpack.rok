@@ -906,8 +906,8 @@ fun qpackProcessEncoderStream(dec: Map, streamBuf: String): Unit {
 // enough dynamic table inserts to satisfy the Required Insert Count
 fun qpackIsBlocked(dec: Map, reqInsertCount: Int): Bool {
     if (reqInsertCount == 0) { return false }
-    val knownReceivedCount = toInt(mapGet(dec, "knownReceivedCount"))
-    return reqInsertCount > knownReceivedCount
+    val insertCount = toInt(mapGet(dec, "insertCount"))
+    return reqInsertCount > insertCount
 }
 
 // Count the number of currently blocked streams

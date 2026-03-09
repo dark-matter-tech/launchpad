@@ -973,6 +973,12 @@ fun hpackCreateContext(): Map {
 // hpackDynamicResize will reject sizes exceeding this limit.
 fun hpackSetProtocolMaxSize(ctx: Map, maxSize: Int): Unit {
     mapPut(ctx, "protocolMaxSize", maxSize)
+    // Clamp current table size if it exceeds the new protocol max
+    val currentMax = toInt(mapGet(ctx, "maxSize"))
+    if (currentMax > maxSize) {
+        mapPut(ctx, "maxSize", maxSize)
+        hpackDynamicEvict(ctx, maxSize)
+    }
 }
 
 // Add an entry to the dynamic table (newest at index 0)
