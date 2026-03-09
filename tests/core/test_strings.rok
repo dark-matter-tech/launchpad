@@ -84,7 +84,7 @@ import rockit.core.strings
 @Test fun testCountOccurrences() {
     assertEquals(3, countOccurrences("abcabcabc", "abc"))
     assertEquals(0, countOccurrences("hello", "xyz"))
-    assertEquals(2, countOccurrences("aaa", "a"))
+    assertEquals(3, countOccurrences("aaa", "a"))
 }
 
 // == Transformation ==========================================================
@@ -95,7 +95,7 @@ import rockit.core.strings
 }
 
 @Test fun testReplace() {
-    assertEqualsStr("h-e-l-l-o", replace("hello", "e", "-e-"))
+    assertEqualsStr("h-e-llo", replace("hello", "e", "-e-"))
 }
 
 @Test fun testReversed() {
