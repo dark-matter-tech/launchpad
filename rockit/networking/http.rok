@@ -622,7 +622,7 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
                             // Incomplete 1xx, cannot skip
                             skip1xx = false
                         } else {
-                            resp = substring(resp, interimEnd + 4, stringLength(resp))
+                            resp = substring(resp, interimEnd + 2, stringLength(resp))
                             len = stringLength(resp)
                             if (len == 0) {
                                 mapPut(result, "status", 0)
@@ -685,9 +685,11 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
         return
     }
 
-    // Parse headers
-    val headerBlock = substring(resp, firstNewline + 2, headerEnd)
-    httpParseHeaders(headerBlock, respHeaders)
+    // Parse headers (guard: when no headers exist, firstNewline == headerEnd)
+    if (firstNewline + 1 < headerEnd) {
+        val headerBlock = substring(resp, firstNewline + 1, headerEnd)
+        httpParseHeaders(headerBlock, respHeaders)
+    }
 
     // == Gap 1: HEAD responses have no body ==================================
     if (reqMethod == "HEAD") {
@@ -710,7 +712,7 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
     }
 
     // Body is everything after \r\n\r\n
-    val bodyStart = headerEnd + 4
+    val bodyStart = headerEnd + 2
     var rawBody: String = ""
     if (bodyStart < len) {
         rawBody = substring(resp, bodyStart, len)
@@ -785,8 +787,10 @@ fun httpParseResponse(response: String, result: Map, respHeaders: Map): Unit {
                     mapPut(result, "error", "Conflicting Content-Length values")
                     return
                 }
+                // Use the deduplicated value
+                mapPut(respHeaders, "Content-Length", firstClVal)
             }
-            val expectedLen = toInt(toString(clHeader))
+            val expectedLen = toInt(toString(mapGet(respHeaders, "Content-Length")))
             val actualLen = stringLength(rawBody)
             if (actualLen != expectedLen) {
                 mapPut(result, "error", stringConcat("Content-Length mismatch: expected ", stringConcat(toString(expectedLen), stringConcat(", got ", toString(actualLen)))))
@@ -808,17 +812,12 @@ fun httpParseHeaders(block: String, headers: Map): Unit {
     var lastKey: String = ""
 
     while (pos < len) {
+        // Find next \r\n using stringIndexOf (safe for grapheme clusters)
+        val remaining = substring(block, pos, len)
+        val crlfPos = stringIndexOf(remaining, "\r\n")
         var lineEnd: Int = len
-        var i: Int = pos
-        while (i < len - 1) {
-            if (lineEnd == len) {
-                if (charCodeAt(block, i) == 13) {
-                    if (charCodeAt(block, i + 1) == 10) {
-                        lineEnd = i
-                    }
-                }
-            }
-            i = i + 1
+        if (crlfPos >= 0) {
+            lineEnd = pos + crlfPos
         }
 
         val lineLen = lineEnd - pos
@@ -893,7 +892,7 @@ fun httpParseHeaders(block: String, headers: Map): Unit {
         }
 
         if (lineEnd < len) {
-            pos = lineEnd + 2  // skip \r\n
+            pos = lineEnd + 1  // skip \r\n (1 grapheme cluster)
         } else {
             pos = len
         }
@@ -983,18 +982,16 @@ fun httpDecodeChunkedBodyWithTrailers(raw: String): Map {
                 if (chunkSize == 0) {
                     // Terminal chunk found — parse optional trailer headers
                     // Position is right after "0\r\n"
-                    val trailerStart = crlfIdx + 2
+                    val trailerStart = crlfIdx + 1
                     if (trailerStart < len) {
                         // Check if there are trailer headers before the final CRLF
                         // Trailers end with a CRLF (empty line)
                         val remaining = substring(raw, trailerStart, len)
                         // If remaining starts with \r\n, no trailers
                         val remainLen = stringLength(remaining)
-                        if (remainLen >= 2) {
-                            if (charCodeAt(remaining, 0) == 13) {
-                                if (charCodeAt(remaining, 1) == 10) {
-                                    // No trailers, just the final CRLF
-                                }
+                        if (remainLen >= 1) {
+                            if (stringIndexOf(remaining, "\r\n") == 0) {
+                                // No trailers, just the final CRLF
                             } else {
                                 // Parse trailer headers
                                 // Find the end of trailers (empty line: \r\n\r\n or end of string)
@@ -1009,14 +1006,14 @@ fun httpDecodeChunkedBodyWithTrailers(raw: String): Map {
                     }
                     done = true
                 } else {
-                    val chunkStart = crlfIdx + 2
+                    val chunkStart = crlfIdx + 1
                     val chunkEnd = chunkStart + chunkSize
                     if (chunkEnd > len) {
                         done = true
                     } else {
                         decoded = stringConcat(decoded, substring(raw, chunkStart, chunkEnd))
                         // Skip past chunk data and trailing CRLF
-                        pos = chunkEnd + 2
+                        pos = chunkEnd + 1
                     }
                 }
             }
@@ -1028,18 +1025,14 @@ fun httpDecodeChunkedBodyWithTrailers(raw: String): Map {
 }
 
 // Find the index of CRLF (\r\n) in a string starting from a given position
+// Uses stringIndexOf instead of charCodeAt because \r\n is 1 grapheme cluster
 fun httpIndexOfCrlf(str: String, start: Int): Int {
     val len = stringLength(str)
-    var i: Int = start
-    while (i < len - 1) {
-        if (charCodeAt(str, i) == 13) {
-            if (charCodeAt(str, i + 1) == 10) {
-                return i
-            }
-        }
-        i = i + 1
-    }
-    return -1
+    if (start >= len) { return -1 }
+    val tail = substring(str, start, len)
+    val idx = stringIndexOf(tail, "\r\n")
+    if (idx < 0) { return -1 }
+    return start + idx
 }
 
 // Find the last index of a character (by char code) in a string, or -1 if not found
@@ -1287,16 +1280,18 @@ fun httpIsResponseComplete(response: String): Bool {
         return false
     }
 
-    val bodyStart = headerEnd + 4
+    val bodyStart = headerEnd + 2
     val respLen = stringLength(response)
 
     // Parse headers to determine body length
     val firstNewline = stringIndexOf(response, "\r\n")
     if (firstNewline < 0) { return false }
 
-    val headerBlock = substring(response, firstNewline + 2, headerEnd)
     val tmpHeaders = mapCreate()
-    httpParseHeaders(headerBlock, tmpHeaders)
+    if (firstNewline + 1 < headerEnd) {
+        val headerBlock = substring(response, firstNewline + 1, headerEnd)
+        httpParseHeaders(headerBlock, tmpHeaders)
+    }
 
     // Check for chunked encoding
     val teHeader = mapGet(tmpHeaders, "Transfer-Encoding")
@@ -1305,9 +1300,9 @@ fun httpIsResponseComplete(response: String): Bool {
             // == Gap 9: Check that response ends with terminal chunk pattern ==
             // The response must end with \r\n\r\n after the 0-size chunk
             // Check if the raw response ends with "\r\n\r\n"
-            if (respLen >= 5) {
-                val lastFour = substring(response, respLen - 4, respLen)
-                if (lastFour == "\r\n\r\n") {
+            if (respLen >= 3) {
+                val lastTwo = substring(response, respLen - 2, respLen)
+                if (lastTwo == "\r\n\r\n") {
                     // Verify there's a "0\r\n" somewhere before the final \r\n
                     val bodyPart = substring(response, bodyStart, respLen)
                     return stringContains(bodyPart, "0\r\n")

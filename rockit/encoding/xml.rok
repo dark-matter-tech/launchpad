@@ -54,11 +54,11 @@ fun xmlComment(value: String): Map {
     return m
 }
 
-fun xmlPI(target: String, data: String): Map {
+fun xmlPI(target: String, content: String): Map {
     val m = mapCreate()
     mapPut(m, "type", XML_PI())
     mapPut(m, "target", target)
-    mapPut(m, "data", data)
+    mapPut(m, "data", content)
     return m
 }
 

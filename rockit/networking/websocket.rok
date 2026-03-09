@@ -35,14 +35,14 @@ fun WS_PONG(): Int     { return 10 }
 // == Transport Abstraction (TLS-aware) ========================================
 
 // Send raw data over the WebSocket transport (TLS or TCP)
-fun wsSendRaw(ws: Map, data: String): Int {
+fun wsSendRaw(ws: Map, buf: String): Int {
     val useTls = mapGet(ws, "tls")
     if (useTls == true) {
         val tlsConn = toInt(mapGet(ws, "tlsConn"))
-        return tlsSend(tlsConn, data)
+        return tlsSend(tlsConn, buf)
     }
     val fd = toInt(mapGet(ws, "fd"))
-    return tcpSend(fd, data)
+    return tcpSend(fd, buf)
 }
 
 // Receive raw data from the WebSocket transport (TLS or TCP)
@@ -185,10 +185,10 @@ fun wsSend(ws: Map, message: String): Bool {
 }
 
 // Send a binary message
-fun wsSendBinary(ws: Map, data: String): Bool {
+fun wsSendBinary(ws: Map, payload: String): Bool {
     val fd = toInt(mapGet(ws, "fd"))
     if (fd < 0) { return false }
-    return wsSendFrame(ws, WS_BINARY(), data)
+    return wsSendFrame(ws, WS_BINARY(), payload)
 }
 
 // Receive a message (returns Map with "type" and "data" keys)
@@ -330,12 +330,12 @@ fun wsSendFrame(ws: Map, opcode: Int, payload: String): Bool {
 // == Helpers =================================================================
 
 // Unmask a payload using a 4-byte masking key
-fun wsUnmask(data: String, maskKey: String): String {
-    val len = stringLength(data)
+fun wsUnmask(masked: String, maskKey: String): String {
+    val len = stringLength(masked)
     var result: String = ""
     var i: Int = 0
     while (i < len) {
-        val b = charCodeAt(data, i)
+        val b = charCodeAt(masked, i)
         val m = charCodeAt(maskKey, i - (i / 4) * 4)
         result = stringConcat(result, intToChar(wsXor(b, m)))
         i = i + 1
