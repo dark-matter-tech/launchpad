@@ -1,7 +1,7 @@
 // Tests for rockit.security.tls
-// NOTE: TLS operations require the LLVM-compiled binary with OpenSSL.
-// The Swift interpreter used by `rockit test` does not link OpenSSL,
-// so only non-OpenSSL tests can run here.
+// TLS context creation and connection tests
+// NOTE: These tests require native compilation (LLVM backend + OpenSSL).
+// They will fail under the bytecode interpreter until probe supports native test execution.
 import rockit.testing.probe
 import rockit.security.tls
 
@@ -23,11 +23,47 @@ import rockit.security.tls
     assertFalse(tlsIsError(m))
 }
 
-// == OpenSSL-dependent tests ==================================================
-// These require the LLVM-compiled binary and are skipped in interpreter mode.
-//
-// @Test fun testTlsDefaultContextCreation()
-// @Test fun testTlsServerContextNoFiles()
-// @Test fun testTlsConnectToExample()
-// @Test fun testTlsConnectBadHost()
-// @Test fun testTlsSendRecv()
+// == Context Creation =========================================================
+
+@Test fun testTlsDefaultContextCreation() {
+    val ctx = tlsDefaultContext()
+    assertGreaterThanOrEqual(ctx, 0)
+}
+
+@Test fun testTlsServerContextNoFiles() {
+    // Server context with non-existent cert/key should fail
+    val ctx = tlsServerContext("/nonexistent/cert.pem", "/nonexistent/key.pem")
+    assertEquals(-1, ctx)
+}
+
+// == Connection ===============================================================
+
+@Test fun testTlsConnectToExample() {
+    // Live test: connect to example.com:443
+    val ctx = tlsDefaultContext()
+    val result = tlsConnectTo(ctx, "example.com", 443)
+    assertFalse(tlsIsError(result))
+    val conn = toInt(mapGet(result, "conn"))
+    assertGreaterThanOrEqual(conn, 0)
+    tlsDisconnect(conn)
+}
+
+@Test fun testTlsConnectBadHost() {
+    val ctx = tlsDefaultContext()
+    val result = tlsConnectTo(ctx, "nonexistent.invalid", 443)
+    assertTrue(tlsIsError(result))
+}
+
+@Test fun testTlsSendRecv() {
+    // Live test: send HTTP request over TLS to example.com
+    val ctx = tlsDefaultContext()
+    val result = tlsConnectTo(ctx, "example.com", 443)
+    if (tlsIsError(result)) { return }  // skip if no network
+    val conn = toInt(mapGet(result, "conn"))
+    val req = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    val sent = tlsSendData(conn, req)
+    assertGreaterThan(sent, 0)
+    val resp = tlsRecvData(conn, 4096)
+    assertStringContains(resp, "HTTP/1.1")
+    tlsDisconnect(conn)
+}
