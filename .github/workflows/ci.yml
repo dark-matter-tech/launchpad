@@ -1,0 +1,239 @@
+name: Validate stdlib modules
+
+on:
+  push:
+  pull_request:
+    branches: [develop, beta, master, staging]
+
+jobs:
+  validate:
+    name: Build & Test
+    runs-on: ubuntu-22.04
+    container: swift:5.10.1-jammy
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install dependencies
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Rockit Standard Library — CI Pipeline"
+          echo "  24 modules · 6 domains · RFC conformance"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          apt-get update && apt-get install -y --no-install-recommends git libssl-dev pkg-config
+          if command -v clang > /dev/null 2>&1; then
+            echo "  clang available: $(clang --version | head -1)"
+          else
+            apt-get install -y --no-install-recommends clang-15
+            ln -sf /usr/bin/clang-15 /usr/bin/clang
+          fi
+          apt-get clean && rm -rf /var/lib/apt/lists/*
+          echo ""
+
+      - name: Checkout stdlib
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          git clone --depth 1 --branch "${BRANCH}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          echo "  Checked out: ${BRANCH} ($(git rev-parse --short HEAD))"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build compiler
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│  Stage 1 — Build Rockit Compiler             │"
+          echo "└─────────────────────────────────────────────┘"
+          echo ""
+          echo "  Building Stage 0 (rockit-booster)..."
+          git clone --depth 1 https://github.com/dark-matter-tech/rockit-booster.git /tmp/stage0
+          START=$(date +%s)
+          cd /tmp/stage0 && swift build -c release 2>&1
+          END=$(date +%s)
+          echo "  Stage 0 built in $((END - START))s"
+          echo ""
+          echo "  Building Stage 1 (rockit-compiler)..."
+          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit-compiler.git /tmp/compiler
+          cd /tmp/compiler
+          ROCKIT=/tmp/stage0/.build/release/rockit
+          bash src/build.sh
+          $ROCKIT build-native src/command.rok
+          bash runtime/rockit/build.sh
+          cd -
+          # Make rockit available on PATH
+          cp /tmp/compiler/src/command /usr/local/bin/rockit
+          chmod +x /usr/local/bin/rockit
+          echo "  rockit installed: $(rockit version 2>&1 || echo 'ready')"
+          echo ""
+
+      - name: Validate module structure
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│  Stage 2 — Validate Module Structure         │"
+          echo "└─────────────────────────────────────────────┘"
+          echo ""
+          PASS=0; FAIL=0
+          MODULES=(
+            "rockit/core/collections.rok"
+            "rockit/core/math.rok"
+            "rockit/core/strings.rok"
+            "rockit/core/result.rok"
+            "rockit/core/uuid.rok"
+            "rockit/encoding/base64.rok"
+            "rockit/encoding/hpack.rok"
+            "rockit/encoding/json.rok"
+            "rockit/encoding/qpack.rok"
+            "rockit/encoding/xml.rok"
+            "rockit/filesystem/file.rok"
+            "rockit/filesystem/path.rok"
+            "rockit/networking/http.rok"
+            "rockit/networking/http2.rok"
+            "rockit/networking/http3.rok"
+            "rockit/networking/quic.rok"
+            "rockit/networking/url.rok"
+            "rockit/networking/websocket.rok"
+            "rockit/security/tls.rok"
+            "rockit/security/crypto.rok"
+            "rockit/security/x509.rok"
+            "rockit/security/pem.rok"
+            "rockit/testing/probe.rok"
+            "rockit/time/datetime.rok"
+          )
+          for mod in "${MODULES[@]}"; do
+            if [ -f "$mod" ]; then
+              printf "    %-45s %s\n" "$mod" "present"
+              PASS=$((PASS + 1))
+            else
+              printf "    %-45s %s\n" "$mod" "MISSING"
+              FAIL=$((FAIL + 1))
+            fi
+          done
+          echo ""
+          echo "  Modules: $PASS present, $FAIL missing (${#MODULES[@]} expected)"
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo ""
+
+      - name: Validate test coverage
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│  Stage 3 — Validate Test Files               │"
+          echo "└─────────────────────────────────────────────┘"
+          echo ""
+          PASS=0; FAIL=0
+          TESTS=(
+            "tests/core/test_collections.rok"
+            "tests/core/test_math.rok"
+            "tests/core/test_strings.rok"
+            "tests/core/test_result.rok"
+            "tests/core/test_uuid.rok"
+            "tests/encoding/test_base64.rok"
+            "tests/encoding/test_hpack.rok"
+            "tests/encoding/test_json.rok"
+            "tests/encoding/test_qpack.rok"
+            "tests/encoding/test_xml.rok"
+            "tests/filesystem/test_file.rok"
+            "tests/filesystem/test_path.rok"
+            "tests/networking/test_http.rok"
+            "tests/networking/test_http2.rok"
+            "tests/networking/test_http3.rok"
+            "tests/networking/test_quic.rok"
+            "tests/networking/test_url.rok"
+            "tests/networking/test_websocket.rok"
+            "tests/security/test_tls.rok"
+            "tests/security/test_crypto.rok"
+            "tests/security/test_x509.rok"
+            "tests/security/test_pem.rok"
+            "tests/testing/test_probe.rok"
+            "tests/time/test_datetime.rok"
+          )
+          for t in "${TESTS[@]}"; do
+            if [ -f "$t" ]; then
+              printf "    %-45s %s\n" "$t" "present"
+              PASS=$((PASS + 1))
+            else
+              printf "    %-45s %s\n" "$t" "MISSING"
+              FAIL=$((FAIL + 1))
+            fi
+          done
+          echo ""
+          echo "  Tests: $PASS present, $FAIL missing (${#TESTS[@]} expected)"
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo ""
+
+      - name: Run test suites
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│  Stage 4 — Run Test Suites                   │"
+          echo "└─────────────────────────────────────────────┘"
+          echo ""
+          TOTAL_START=$(date +%s)
+          SCHEMES=("core" "encoding" "networking" "security" "time")
+          SCHEME_PASS=0; SCHEME_FAIL=0
+
+          for scheme in "${SCHEMES[@]}"; do
+            echo "  ── $scheme ──────────────────────────────────"
+            START=$(date +%s)
+            if rockit test --scheme "$scheme" 2>&1; then
+              END=$(date +%s)
+              echo "    $scheme passed ($((END - START))s)"
+              SCHEME_PASS=$((SCHEME_PASS + 1))
+            else
+              END=$(date +%s)
+              echo "    $scheme FAILED ($((END - START))s)"
+              SCHEME_FAIL=$((SCHEME_FAIL + 1))
+            fi
+            echo ""
+          done
+
+          TOTAL_END=$(date +%s)
+          TOTAL_ELAPSED=$((TOTAL_END - TOTAL_START))
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          if [ "$SCHEME_FAIL" -eq 0 ]; then
+            echo "  All ${SCHEME_PASS} test schemes passed (${TOTAL_ELAPSED}s)"
+          else
+            echo "  ${SCHEME_FAIL}/${#SCHEMES[@]} schemes FAILED (${TOTAL_ELAPSED}s)"
+            exit 1
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+      - name: Run RFC conformance tests
+        run: |
+          echo ""
+          echo "┌─────────────────────────────────────────────┐"
+          echo "│  Stage 5 — RFC Conformance Vectors            │"
+          echo "└─────────────────────────────────────────────┘"
+          echo ""
+          PASS=0; FAIL=0
+          RFC_TESTS=(
+            "tests/encoding/test_hpack.rok:RFC 7541 (HPACK)"
+            "tests/encoding/test_qpack.rok:RFC 9204 (QPACK)"
+            "tests/networking/test_quic.rok:RFC 9000 (QUIC)"
+          )
+          for entry in "${RFC_TESTS[@]}"; do
+            file="${entry%%:*}"
+            label="${entry##*:}"
+            printf "    %-30s " "$label"
+            if rockit test "$file" 2>&1 | tail -1; then
+              PASS=$((PASS + 1))
+            else
+              FAIL=$((FAIL + 1))
+            fi
+          done
+          echo ""
+          if [ "$FAIL" -eq 0 ]; then
+            echo "  All RFC vector suites passed"
+          else
+            echo "  $FAIL RFC vector suite(s) FAILED"
+            exit 1
+          fi
+          echo ""

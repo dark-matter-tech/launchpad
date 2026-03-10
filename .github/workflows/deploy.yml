@@ -1,0 +1,205 @@
+name: Deploy stdlib
+
+on:
+  push:
+    branches: [master, staging]
+  workflow_dispatch:
+
+jobs:
+  deploy-wiki:
+    name: Deploy Wiki
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          echo "  Checked out: ${GITHUB_REF_NAME} ($(git rev-parse --short HEAD))"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Deploy wiki pages
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Deploying Wiki Pages"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+          if [ ! -d "wiki" ]; then
+            echo "  No wiki/ directory found — skipping"
+            exit 0
+          fi
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone or initialize the wiki repo
+          WIKI_URL="https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.wiki.git"
+          if git clone --depth 1 "$WIKI_URL" /tmp/wiki 2>/dev/null; then
+            echo "  Cloned existing wiki"
+          else
+            echo "  Initializing new wiki repo"
+            mkdir -p /tmp/wiki
+            cd /tmp/wiki && git init && cd -
+          fi
+
+          # Sync wiki/ contents to wiki repo
+          cp wiki/*.md /tmp/wiki/
+          cd /tmp/wiki
+
+          # Check for changes
+          git add -A
+          if git diff --cached --quiet; then
+            echo "  Wiki is up to date — no changes"
+          else
+            CHANGED=$(git diff --cached --name-only | wc -l)
+            git commit -m "Update wiki pages (${CHANGED} files changed)"
+            git push "$WIKI_URL" HEAD:master
+            echo "  Deployed ${CHANGED} wiki page(s)"
+          fi
+          echo ""
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  sync-compiler:
+    name: Sync Compiler Submodule
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Update compiler submodule reference
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Sync stdlib → Compiler Submodule"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+          STDLIB_SHA=$(git rev-parse HEAD)
+          echo "  Stdlib commit: ${STDLIB_SHA}"
+
+          # Clone the compiler repo
+          git clone --depth 1 --recurse-submodules \
+            "https://github.com/dark-matter-tech/rockit-compiler.git" \
+            /tmp/compiler
+
+          cd /tmp/compiler
+
+          # Check if submodule is already at this commit
+          SUBMODULE_PATH="launchpad"
+          if [ -d "$SUBMODULE_PATH" ]; then
+            CURRENT_SHA=$(cd "$SUBMODULE_PATH" && git rev-parse HEAD 2>/dev/null || echo "none")
+            if [ "$CURRENT_SHA" = "$STDLIB_SHA" ]; then
+              echo "  Compiler submodule already at ${STDLIB_SHA:0:8} — no update needed"
+              exit 0
+            fi
+            echo "  Submodule: ${CURRENT_SHA:0:8} → ${STDLIB_SHA:0:8}"
+          else
+            echo "  Submodule path not found — skipping"
+            exit 0
+          fi
+
+          # Update submodule to latest stdlib commit
+          cd "$SUBMODULE_PATH"
+          git fetch origin master
+          git checkout "$STDLIB_SHA"
+          cd /tmp/compiler
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$SUBMODULE_PATH"
+          if git diff --cached --quiet; then
+            echo "  No submodule change to commit"
+          else
+            git commit -m "Update stdlib submodule to ${STDLIB_SHA:0:8}"
+            git push origin HEAD
+            echo "  Compiler submodule updated"
+          fi
+          echo ""
+
+  copy-stdlib:
+    name: Sync Compiler Stdlib Copy
+    runs-on: ubuntu-22.04
+    needs: [sync-compiler]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Sync self-hosted-rockit/stdlib
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Sync stdlib → Compiler stdlib copy"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+          STDLIB_SHA=$(git rev-parse HEAD)
+
+          git clone --depth 1 \
+            "https://github.com/dark-matter-tech/rockit-compiler.git" \
+            /tmp/compiler
+
+          STDLIB_COPY="/tmp/compiler/launchpad"
+
+          if [ ! -d "$STDLIB_COPY" ]; then
+            echo "  stdlib copy directory not found — skipping"
+            exit 0
+          fi
+
+          # Sync rockit/ source files
+          echo "  Syncing module source files..."
+          rsync -av --delete \
+            rockit/ "$STDLIB_COPY/rockit/" \
+            --exclude='.git'
+
+          # Sync tests/
+          echo "  Syncing test files..."
+          rsync -av --delete \
+            tests/ "$STDLIB_COPY/tests/" \
+            --exclude='.git'
+
+          # Sync fuel.toml if present
+          [ -f fuel.toml ] && cp fuel.toml "$STDLIB_COPY/fuel.toml"
+
+          cd /tmp/compiler
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "  Compiler stdlib copy already up to date"
+          else
+            CHANGED=$(git diff --cached --stat | tail -1)
+            git commit -m "Sync stdlib copy from launchpad@${STDLIB_SHA:0:8}"
+            git push origin HEAD
+            echo "  Compiler stdlib copy updated"
+          fi
+          echo ""
