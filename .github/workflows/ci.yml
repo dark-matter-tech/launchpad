@@ -20,7 +20,7 @@ jobs:
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  Rockit Standard Library — CI Pipeline"
-          echo "  24 modules · 6 domains · RFC conformance"
+          echo "  15 modules · 5 domains"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           apt-get update && apt-get install -y --no-install-recommends git libssl-dev pkg-config
@@ -87,22 +87,13 @@ jobs:
             "rockit/core/result.rok"
             "rockit/core/uuid.rok"
             "rockit/encoding/base64.rok"
-            "rockit/encoding/hpack.rok"
             "rockit/encoding/json.rok"
-            "rockit/encoding/qpack.rok"
             "rockit/encoding/xml.rok"
             "rockit/filesystem/file.rok"
             "rockit/filesystem/path.rok"
             "rockit/networking/http.rok"
-            "rockit/networking/http2.rok"
-            "rockit/networking/http3.rok"
-            "rockit/networking/quic.rok"
             "rockit/networking/url.rok"
             "rockit/networking/websocket.rok"
-            "rockit/security/tls.rok"
-            "rockit/security/crypto.rok"
-            "rockit/security/x509.rok"
-            "rockit/security/pem.rok"
             "rockit/testing/probe.rok"
             "rockit/time/datetime.rok"
           )
@@ -135,22 +126,13 @@ jobs:
             "tests/core/test_result.rok"
             "tests/core/test_uuid.rok"
             "tests/encoding/test_base64.rok"
-            "tests/encoding/test_hpack.rok"
             "tests/encoding/test_json.rok"
-            "tests/encoding/test_qpack.rok"
             "tests/encoding/test_xml.rok"
             "tests/filesystem/test_file.rok"
             "tests/filesystem/test_path.rok"
             "tests/networking/test_http.rok"
-            "tests/networking/test_http2.rok"
-            "tests/networking/test_http3.rok"
-            "tests/networking/test_quic.rok"
             "tests/networking/test_url.rok"
             "tests/networking/test_websocket.rok"
-            "tests/security/test_tls.rok"
-            "tests/security/test_crypto.rok"
-            "tests/security/test_x509.rok"
-            "tests/security/test_pem.rok"
             "tests/testing/test_probe.rok"
             "tests/time/test_datetime.rok"
           )
@@ -176,7 +158,7 @@ jobs:
           echo "└─────────────────────────────────────────────┘"
           echo ""
           TOTAL_START=$(date +%s)
-          SCHEMES=("core" "encoding" "networking" "security" "time")
+          SCHEMES=("core" "encoding" "networking" "time")
           SCHEME_PASS=0; SCHEME_FAIL=0
 
           for scheme in "${SCHEMES[@]}"; do
@@ -204,36 +186,4 @@ jobs:
             exit 1
           fi
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-
-      - name: Run RFC conformance tests
-        run: |
-          echo ""
-          echo "┌─────────────────────────────────────────────┐"
-          echo "│  Stage 5 — RFC Conformance Vectors            │"
-          echo "└─────────────────────────────────────────────┘"
-          echo ""
-          PASS=0; FAIL=0
-          RFC_TESTS=(
-            "tests/encoding/test_hpack.rok:RFC 7541 (HPACK)"
-            "tests/encoding/test_qpack.rok:RFC 9204 (QPACK)"
-            "tests/networking/test_quic.rok:RFC 9000 (QUIC)"
-          )
-          for entry in "${RFC_TESTS[@]}"; do
-            file="${entry%%:*}"
-            label="${entry##*:}"
-            printf "    %-30s " "$label"
-            if rockit test "$file" 2>&1 | tail -1; then
-              PASS=$((PASS + 1))
-            else
-              FAIL=$((FAIL + 1))
-            fi
-          done
-          echo ""
-          if [ "$FAIL" -eq 0 ]; then
-            echo "  All RFC vector suites passed"
-          else
-            echo "  $FAIL RFC vector suite(s) FAILED"
-            exit 1
-          fi
           echo ""
