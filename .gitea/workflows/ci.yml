@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [develop, beta, master, staging]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate stdlib modules
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          git clone --depth 1 --branch "${BRANCH}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+
+      - name: Check all modules present
+        run: |
+          EXPECTED="collections math strings result uuid file path http websocket url base64 xml json datetime probe"
+          MISSING=0
+          for mod in $EXPECTED; do
+            FOUND=$(find rockit -name "${mod}.rok" | head -1)
+            if [ -z "$FOUND" ]; then
+              echo "MISSING: ${mod}.rok"
+              MISSING=$((MISSING + 1))
+            else
+              echo "OK: $FOUND"
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+
+      - name: Check for syntax errors (basic)
+        run: |
+          ERRORS=0
+          for f in $(find rockit -name "*.rok"); do
+            if ! head -1 "$f" > /dev/null 2>&1; then
+              echo "ERROR: $f is not readable"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          echo "Checked $(find rockit -name '*.rok' | wc -l) files"
+          [ "$ERRORS" -eq 0 ] || exit 1
+
+  mirror:
+    name: Mirror to GitHub
+    runs-on: ubuntu-22.04
+    needs: [validate]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/staging')
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --bare "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+      - name: Push to GitHub
+        run: |
+          git remote add github "https://x-access-token:${GH_MIRROR_PAT}@github.com/dark-matter-tech/launchpad.git"
+          git push github --all --force
+          git push github --tags --force
+          echo "Mirrored to GitHub"
+        env:
+          GH_MIRROR_PAT: ${{ secrets.GH_MIRROR_PAT }}
