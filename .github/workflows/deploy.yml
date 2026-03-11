@@ -61,9 +61,9 @@ jobs:
   notify-compiler:
     name: Notify Compiler
     runs-on: ubuntu-22.04
-    if: vars.GH_PAT != '' || secrets.GH_PAT != ''
     steps:
       - name: Dispatch submodule update to rockit-compiler
+        if: env.GH_PAT != ''
         run: |
           curl -s -X POST \
             -H "Authorization: token ${GH_PAT}" \
